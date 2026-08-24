@@ -38,7 +38,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(table_count, 4);
+        assert_eq!(table_count, 8);
     }
 
     #[test]

@@ -65,3 +65,60 @@ CREATE INDEX IF NOT EXISTS idx_file_key_shares_hardware_key
 
 CREATE INDEX IF NOT EXISTS idx_unlock_events_file
     ON unlock_events (file_id);
+
+-- Password manager: each entry is encrypted independently with a key
+-- derived (Argon2id) from the vault master password and this row's own
+-- salt, so nonces and salts never need to be coordinated across rows.
+CREATE TABLE IF NOT EXISTS credentials (
+    id            INTEGER PRIMARY KEY,
+    label         TEXT NOT NULL,
+    username      TEXT,
+    kdf_salt      BLOB NOT NULL,
+    nonce         BLOB NOT NULL,
+    ciphertext    BLOB NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- A file locked with a single password rather than a hardware-key quorum:
+-- a lighter-weight protection tier, independent of the `files` /
+-- `file_key_shares` quorum mechanism above.
+CREATE TABLE IF NOT EXISTS password_locked_files (
+    id                INTEGER PRIMARY KEY,
+    name              TEXT NOT NULL,
+    encrypted_path    TEXT NOT NULL UNIQUE,
+    content_hash      TEXT NOT NULL,
+    kdf_salt          BLOB NOT NULL,
+    nonce             BLOB NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Time-limited, revocable share links. Only a hash of each share's bearer
+-- token is stored, matching how the token is looked up on redemption; the
+-- raw token itself is never persisted, only handed to the caller once.
+CREATE TABLE IF NOT EXISTS credential_shares (
+    id              INTEGER PRIMARY KEY,
+    credential_id   INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+    token_hash      TEXT NOT NULL UNIQUE,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at      TEXT NOT NULL,
+    max_uses        INTEGER CHECK (max_uses IS NULL OR max_uses > 0),
+    use_count       INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+    revoked_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS file_shares (
+    id              INTEGER PRIMARY KEY,
+    file_id         INTEGER NOT NULL REFERENCES password_locked_files(id) ON DELETE CASCADE,
+    token_hash      TEXT NOT NULL UNIQUE,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at      TEXT NOT NULL,
+    max_uses        INTEGER CHECK (max_uses IS NULL OR max_uses > 0),
+    use_count       INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+    revoked_at      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_shares_credential
+    ON credential_shares (credential_id);
+
+CREATE INDEX IF NOT EXISTS idx_file_shares_file
+    ON file_shares (file_id);
