@@ -14,7 +14,24 @@ Early scaffolding. Core architecture, encryption scheme, and hardware-key protoc
 
 ## Getting Started
 
-Build and usage instructions will be added here once the initial implementation lands.
+Build the CLI with `cargo build --release`; the binary is `target/release/keyquorum`.
+
+The hardware-key quorum flow isn't implemented yet, but the CLI already covers what's
+built so far — the password vault, password-locked files, and share links:
+
+```sh
+keyquorum lock ./secret.txt ./secret.txt.kqenc
+keyquorum unlock 1 --output ./secret.txt
+
+keyquorum vault add "Email" --username alice
+keyquorum vault get 1
+
+keyquorum share create-file 1 --ttl-seconds 3600
+keyquorum share redeem-file <token>
+```
+
+Passwords are always prompted for interactively rather than taken as arguments. Run
+`keyquorum --help` for the full command list.
 
 ## Security
 
