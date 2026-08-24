@@ -1,0 +1,12 @@
+[package]
+name = "keyquorum"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "keyquorum"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
