@@ -18,8 +18,9 @@ present; check before running them.
 
 - Keep changes minimal and scoped to what's requested — don't scaffold unrelated
   modules, abstractions, or tooling ahead of need.
-- Once a Cargo workspace exists, run `cargo fmt`, `cargo clippy`, and `cargo test`
-  before considering a change complete.
+- Once a Cargo workspace exists, run `cargo build`, `cargo fmt`,
+  `cargo clippy --all-targets --all-features`, and `cargo test` before considering a
+  change complete.
 - Match existing code style; this repo has no established style guide yet, so follow
   standard Rust conventions (`rustfmt` defaults) unless told otherwise.
 

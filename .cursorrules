@@ -12,8 +12,9 @@ Rules:
 
 - Keep changes minimal and scoped to what's asked. Don't add speculative abstractions,
   unrelated tooling, or unfinished scaffolding.
-- Once a Cargo workspace exists, run `cargo fmt`, `cargo clippy`, and `cargo test`
-  before treating a change as done. Follow standard `rustfmt` conventions.
+- Once a Cargo workspace exists, run `cargo build`, `cargo fmt`,
+  `cargo clippy --all-targets --all-features`, and `cargo test` before treating a
+  change as done. Follow standard `rustfmt` conventions.
 - This project is security-sensitive: it deals with cryptographic key material,
   hardware tokens, and encrypted user files.
   - Never commit private keys, tokens, `.env` files, secrets, or plaintext copies of
