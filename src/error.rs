@@ -34,12 +34,30 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<rusqlite::Error> for Error {
+    /// Converts a SQLite error into an application error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let error = Error::from(rusqlite::Error::InvalidQuery);
+    /// assert!(matches!(error, Error::Db(_)));
+    /// ```
     fn from(e: rusqlite::Error) -> Self {
         Error::Db(e)
     }
 }
 
 impl From<std::io::Error> for Error {
+    /// Converts an I/O error into the corresponding application error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let io_error = std::io::Error::other("read failed");
+    /// let error: Error = io_error.into();
+    ///
+    /// assert!(matches!(error, Error::Io(_)));
+    /// ```
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
     }

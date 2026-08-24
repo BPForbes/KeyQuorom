@@ -3,22 +3,45 @@ use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-/// Opens (creating if needed) a KeyQuorum SQLite database at `path` and
-/// applies the schema. Safe to call repeatedly; every statement is
-/// idempotent.
+/// Opens or creates a KeyQuorum SQLite database at `path` and initializes its schema.
+///
+/// Schema initialization is safe to repeat.
+///
+/// # Examples
+///
+/// ```
+/// let conn = open(":memory:")?;
+/// # Ok::<(), rusqlite::Error>(())
+/// ```
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     init(&conn)?;
     Ok(conn)
 }
 
-/// Opens an in-memory database with the schema applied. Intended for tests.
+/// Opens an in-memory SQLite database and applies the database schema.
+///
+/// # Examples
+///
+/// ```
+/// let connection = open_in_memory().unwrap();
+/// ```
+pub fn open_in_memory() -> Result<Connection>
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     init(&conn)?;
     Ok(conn)
 }
 
+/// Configures a SQLite connection and initializes the database schema.
+///
+/// # Examples
+///
+/// ```
+/// let conn = rusqlite::Connection::open_in_memory()?;
+/// init(&conn)?;
+/// # Ok::<(), rusqlite::Error>(())
+/// ```
 fn init(conn: &Connection) -> Result<()> {
     // Block briefly on lock contention instead of failing immediately with
     // SQLITE_BUSY, so concurrent access from multiple connections (e.g. a

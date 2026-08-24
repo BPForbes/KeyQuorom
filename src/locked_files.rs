@@ -8,16 +8,22 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-/// Encrypts the file at `source_path` with a key derived from `password`
-/// and writes the ciphertext to `encrypted_path`, then records it.
+/// Encrypts a file with a password-derived key and records the encrypted file's metadata.
 ///
-/// The ciphertext is written first, outside any database transaction:
-/// `create_new` fails atomically if `encrypted_path` is already in use, so
-/// we never overwrite data we don't own, and this keeps the database write
-/// lock held for only the short INSERT that follows rather than for the
-/// file I/O. If that INSERT then fails for any reason (most likely a
-/// duplicate `encrypted_path` already tracked by another row), the file we
-/// just wrote is removed so it isn't left behind untracked.
+/// The encrypted file is created exclusively and is removed if recording its metadata fails.
+/// Returns the database row ID for the recorded file.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let id = lock_file(&mut conn, source_path, encrypted_path, "password")?;
+/// assert!(id > 0);
+/// # Ok::<(), crate::Error>(())
+/// ```
+///
+/// * `source_path` — Path to the plaintext file.
+/// * `encrypted_path` — Destination path for the ciphertext.
+/// * `password` — Password used to derive the encryption key.
 pub fn lock_file(
     conn: &Connection,
     source_path: &Path,
@@ -55,10 +61,23 @@ pub fn lock_file(
     }
 }
 
-/// Decrypts the password-locked file `id` with `password` and returns its
-/// plaintext bytes. AES-256-GCM's authentication tag is what verifies the
-/// result is intact — a wrong password or a tampered ciphertext both
-/// surface as `Error::InvalidPassword`.
+/// Decrypts a password-locked file and provides its plaintext bytes.
+///
+/// Authentication failures, including incorrect passwords and tampered ciphertext,
+/// are reported as [`Error::InvalidPassword`]. Invalid nonce data is reported as
+/// [`Error::IntegrityCheckFailed`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # let conn = todo!();
+/// # let id = todo!();
+/// # let password = todo!();
+/// let plaintext = unlock_file(&conn, id, password)?;
+/// # let _ = plaintext;
+/// # Ok::<(), crate::Error>(())
+/// ```
+pub fn unlock_file(conn: &Connection, id: i64, password: &str) -> Result<Vec<u8>> {
 pub fn unlock_file(conn: &Connection, id: i64, password: &str) -> Result<Vec<u8>> {
     let (encrypted_path, salt, nonce): (String, Vec<u8>, Vec<u8>) = conn.query_row(
         "SELECT encrypted_path, kdf_salt, nonce
@@ -76,11 +95,32 @@ pub fn unlock_file(conn: &Connection, id: i64, password: &str) -> Result<Vec<u8>
     Ok(plaintext)
 }
 
-/// Writes `contents` to a newly created file at `path`, owner-only (0600)
-/// on Unix. Refuses to touch a pre-existing file (`create_new`), and
-/// cleans up its own partial write if anything after creation fails —
-/// but only ever removes a file it created itself.
-#[cfg(unix)]
+/// Writes contents to a newly created owner-only file on Unix.
+///
+/// The file is created with permissions `0600`, and existing files are left
+/// untouched. If writing or synchronization fails, the newly created file is
+/// removed.
+///
+/// # Examples
+///
+/// ```
+/// use std::fs;
+///
+/// let path = std::env::temp_dir().join(format!(
+///     "write-owner-only-{}",
+///     std::process::id()
+/// ));
+///
+/// write_owner_only(&path, b"secret")?;
+/// assert_eq!(fs::read(&path)?, b"secret");
+/// fs::remove_file(path)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Parameters
+///
+/// * `path` - Destination path for the new file.
+/// * `contents` - Bytes to write to the file.
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -110,6 +150,22 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Creates a new file with the provided contents and synchronizes it to storage.
+///
+/// The operation fails if the path already exists. If writing or synchronization
+/// fails, the newly created file is removed.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(not(unix))]
+/// # fn example() -> std::io::Result<()> {
+/// let path = std::env::temp_dir().join("owner-only-example");
+/// write_owner_only(&path, b"secret")?;
+/// std::fs::remove_file(path)?;
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(not(unix))]
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()

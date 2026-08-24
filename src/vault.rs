@@ -12,6 +12,81 @@ pub struct Credential {
     pub password: String,
 }
 
+/// Encrypts and stores a credential, returning its database ID.
+
+///
+
+/// # Arguments
+
+///
+
+/// * `label` - Display label for the credential.
+
+/// * `username` - Optional username associated with the credential.
+
+/// * `password` - Plaintext password to encrypt and store.
+
+/// * `master_password` - Password used to derive the encryption key.
+
+///
+
+/// # Examples
+
+///
+
+/// ```
+
+/// # use rusqlite::Connection;
+
+/// # let conn = Connection::open_in_memory().unwrap();
+
+/// # conn.execute(
+
+/// #     "CREATE TABLE credentials (
+
+/// #         id INTEGER PRIMARY KEY,
+
+/// #         label TEXT NOT NULL,
+
+/// #         username TEXT,
+
+/// #         kdf_salt BLOB NOT NULL,
+
+/// #         nonce BLOB NOT NULL,
+
+/// #         ciphertext BLOB NOT NULL
+
+/// #     )",
+
+/// #     [],
+
+/// # ).unwrap();
+
+/// let id = add_credential(
+
+///     &conn,
+
+///     "Email",
+
+///     Some("alice@example.com"),
+
+///     "secret",
+
+///     "master password",
+
+/// ).unwrap();
+
+/// assert_eq!(id, 1);
+
+/// ```
+
+///
+
+/// # Errors
+
+///
+
+/// Returns an error if key derivation or database insertion fails.
 pub fn add_credential(
     conn: &Connection,
     label: &str,
@@ -32,6 +107,43 @@ pub fn add_credential(
     Ok(conn.last_insert_rowid())
 }
 
+/// Retrieves and decrypts a credential using the supplied master password.
+///
+/// # Parameters
+///
+/// * `id` — Identifier of the credential to retrieve.
+/// * `master_password` — Password used to derive the decryption key.
+///
+/// # Errors
+///
+/// Returns an error if the credential cannot be retrieved, the stored data fails
+/// integrity checks, or the master password is incorrect.
+///
+/// # Examples
+///
+/// ```
+/// # use rusqlite::Connection;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let conn = Connection::open_in_memory()?;
+/// # conn.execute_batch("
+/// #     CREATE TABLE credentials (
+/// #         id INTEGER PRIMARY KEY,
+/// #         label TEXT NOT NULL,
+/// #         username TEXT,
+/// #         kdf_salt BLOB NOT NULL,
+/// #         nonce BLOB NOT NULL,
+/// #         ciphertext BLOB NOT NULL
+/// #     )
+/// # ")?;
+/// let id = add_credential(&conn, "Email", Some("alice"), "secret", "master")?;
+/// let credential = get_credential(&conn, id, "master")?;
+///
+/// assert_eq!(credential.password, "secret");
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Returns the decrypted credential.
 pub fn get_credential(conn: &Connection, id: i64, master_password: &str) -> Result<Credential> {
     let (label, username, salt, nonce, ciphertext): (
         String,

@@ -22,6 +22,15 @@ pub struct Share {
     pub expires_at: String,
 }
 
+/// Generates a URL-safe bearer token and its SHA-256 hash.
+///
+/// # Examples
+///
+/// ```
+/// let (token, token_hash) = generate_token();
+/// assert!(!token.is_empty());
+/// assert_eq!(token_hash.len(), 64);
+/// ```
 fn generate_token() -> (String, String) {
     let mut raw = [0u8; TOKEN_LEN];
     OsRng.fill_bytes(&mut raw);
@@ -30,6 +39,19 @@ fn generate_token() -> (String, String) {
     (token, token_hash)
 }
 
+/// Hashes a URL-safe, unpadded Base64-encoded share token with SHA-256.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidShareToken` when `token` is not valid URL-safe,
+/// unpadded Base64.
+///
+/// # Examples
+///
+/// ```
+/// let hash = hash_token("AQ").unwrap();
+/// assert_eq!(hash.len(), 64);
+/// ```
 fn hash_token(token: &str) -> Result<String> {
     let raw = URL_SAFE_NO_PAD
         .decode(token)
@@ -37,6 +59,41 @@ fn hash_token(token: &str) -> Result<String> {
     Ok(hex::encode(Sha256::digest(raw)))
 }
 
+/// Creates a time-limited share for a resource.
+///
+/// The generated bearer token is included in the returned share and should be
+/// provided to the recipient.
+///
+/// # Examples
+///
+/// ```
+/// conn.execute_batch(
+///     "CREATE TABLE shares (
+///         id INTEGER PRIMARY KEY,
+///         resource_id INTEGER NOT NULL,
+///         token_hash TEXT NOT NULL,
+///         expires_at TEXT NOT NULL,
+///         max_uses INTEGER
+///     )",
+/// )?;
+///
+/// let share = create_share(&conn, "shares", "resource_id", 42, 3600, Some(1))?;
+/// assert_eq!(share.id, 1);
+/// assert!(!share.token.is_empty());
+/// # Ok::<(), rusqlite::Error>(())
+/// ```
+///
+/// # Parameters
+///
+/// * `table` - The share table into which the record is inserted.
+/// * `id_column` - The column containing the shared resource identifier.
+/// * `resource_id` - The identifier of the resource being shared.
+/// * `ttl_seconds` - The number of seconds until the share expires.
+/// * `max_uses` - The maximum number of redemptions, or unlimited when `None`.
+///
+/// # Returns
+///
+/// The created share, including its bearer token and expiration timestamp.
 fn create_share(
     conn: &Connection,
     table: &str,
@@ -74,6 +131,44 @@ fn create_share(
     })
 }
 
+/// Redeems an eligible share token and returns the associated resource ID.
+///
+/// A share can be redeemed only while it is active, unexpired, and within its
+/// usage limit. Each successful redemption consumes one permitted use.
+///
+/// # Examples
+///
+/// ```
+/// # use rusqlite::Connection;
+/// # let conn = Connection::open_in_memory().unwrap();
+/// # conn.execute(
+/// #     "CREATE TABLE shares (
+/// #          resource_id INTEGER NOT NULL,
+/// #          token_hash TEXT NOT NULL,
+/// #          revoked_at TEXT,
+/// #          expires_at TEXT NOT NULL,
+/// #          max_uses INTEGER,
+/// #          use_count INTEGER NOT NULL
+/// #      )",
+/// #     [],
+/// # ).unwrap();
+/// # let token = "example-token";
+/// # let hash = hash_token(token).unwrap();
+/// # conn.execute(
+/// #     "INSERT INTO shares
+/// #      (resource_id, token_hash, expires_at, use_count)
+/// #      VALUES (42, ?1, datetime('now', '+1 hour'), 0)",
+/// #     [&hash],
+/// # ).unwrap();
+/// let resource_id = redeem_share(&conn, "shares", "resource_id", token).unwrap();
+/// assert_eq!(resource_id, 42);
+/// ```
+///
+/// # Errors
+///
+/// Returns an error when the token is invalid, the share is revoked or
+/// expired, or its usage limit has been reached.
+fn redeem_share(conn: &Connection, table: &str, id_column: &str, token: &str) -> Result<i64> {
 fn redeem_share(conn: &Connection, table: &str, id_column: &str, token: &str) -> Result<i64> {
     let token_hash = hash_token(token)?;
 
@@ -135,6 +230,45 @@ fn redeem_share(conn: &Connection, table: &str, id_column: &str, token: &str) ->
     }
 }
 
+/// Revokes a share by recording its revocation time.
+
+///
+
+/// # Parameters
+
+///
+
+/// * `table` - Name of the share table containing the share.
+
+/// * `share_id` - Identifier of the share to revoke.
+
+///
+
+/// # Examples
+
+///
+
+/// ```
+
+/// let conn = rusqlite::Connection::open_in_memory()?;
+
+/// conn.execute(
+
+///     "CREATE TABLE shares (id INTEGER PRIMARY KEY, revoked_at TEXT)",
+
+///     [],
+
+/// )?;
+
+/// conn.execute("INSERT INTO shares (id) VALUES (1)", [])?;
+
+///
+
+/// revoke_share(&conn, "shares", 1)?;
+
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+
+/// ```
 fn revoke_share(conn: &Connection, table: &str, share_id: i64) -> Result<()> {
     conn.execute(
         &format!("UPDATE {table} SET revoked_at = datetime('now') WHERE id = ?1"),
@@ -143,6 +277,32 @@ fn revoke_share(conn: &Connection, table: &str, share_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Creates a time-limited share link for a credential.
+///
+/// The returned token is needed to redeem the share and is available only when
+/// the share is created. An optional maximum-use limit can restrict the number
+/// of successful redemptions.
+///
+/// # Arguments
+///
+/// * `credential_id` - The identifier of the credential to share.
+/// * `ttl_seconds` - The number of seconds until the share expires.
+/// * `max_uses` - The maximum number of successful redemptions, or `None` for
+///   unlimited use.
+///
+/// # Returns
+///
+/// The newly created share, including its identifier, bearer token, and
+/// expiration timestamp.
+///
+/// # Examples
+///
+/// ```no_run
+/// let conn = rusqlite::Connection::open_in_memory()?;
+/// let share = create_credential_share(&conn, 42, 3600, Some(1))?;
+/// println!("Share token: {}", share.token);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn create_credential_share(
     conn: &Connection,
     credential_id: i64,
@@ -159,14 +319,76 @@ pub fn create_credential_share(
     )
 }
 
+/// Redeems a credential share token and returns the associated credential ID.
+///
+/// A share can be redeemed only while it is valid, unrevoked, unexpired, and below its usage limit.
+///
+/// # Examples
+///
+/// ```no_run
+/// # fn example(conn: &rusqlite::Connection, token: &str) -> crate::Result<()> {
+/// let credential_id = redeem_credential_share(conn, token)?;
+/// # let _ = credential_id;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Returns the credential ID associated with the share.
 pub fn redeem_credential_share(conn: &Connection, token: &str) -> Result<i64> {
     redeem_share(conn, "credential_shares", "credential_id", token)
 }
 
+/// Revokes a credential share so it can no longer be redeemed.
+///
+/// # Examples
+///
+/// ```no_run
+/// let conn = rusqlite::Connection::open_in_memory().unwrap();
+/// revoke_credential_share(&conn, 1).unwrap();
+/// ```
 pub fn revoke_credential_share(conn: &Connection, share_id: i64) -> Result<()> {
     revoke_share(conn, "credential_shares", share_id)
 }
 
+/// Creates a time-limited share link for a file.
+
+///
+
+/// # Parameters
+
+///
+
+/// * `file_id` identifies the file to share.
+
+/// * `ttl_seconds` specifies how long the share remains valid.
+
+/// * `max_uses` optionally limits the number of successful redemptions.
+
+///
+
+/// # Examples
+
+///
+
+/// ```no_run
+
+/// # use rusqlite::Connection;
+
+/// # use crate::sharing::create_file_share;
+
+/// let conn = Connection::open("app.db")?;
+
+/// let share = create_file_share(&conn, 42, 3600, Some(1))?;
+
+/// println!("{}", share.token);
+
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+
+/// ```
+
+///
+
+/// Returns the generated share, including its token and expiration time.
 pub fn create_file_share(
     conn: &Connection,
     file_id: i64,
@@ -183,10 +405,47 @@ pub fn create_file_share(
     )
 }
 
+/// Redeems a file share token and returns the associated file ID.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rusqlite::Connection;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let conn = Connection::open("app.db")?;
+/// let file_id = redeem_file_share(&conn, token)?;
+/// # let _ = file_id;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// `token` must be an unexpired, unrevoked share token with available uses.
+///
+/// # Errors
+///
+/// Returns an error if the token is invalid or the share cannot be redeemed.
 pub fn redeem_file_share(conn: &Connection, token: &str) -> Result<i64> {
     redeem_share(conn, "file_shares", "file_id", token)
 }
 
+/// Revokes a file share so it can no longer be redeemed.
+
+///
+
+/// # Examples
+
+///
+
+/// ```no_run
+
+/// # use rusqlite::Connection;
+
+/// # let conn = Connection::open_in_memory().unwrap();
+
+/// revoke_file_share(&conn, 1).unwrap();
+
+/// ```
 pub fn revoke_file_share(conn: &Connection, share_id: i64) -> Result<()> {
     revoke_share(conn, "file_shares", share_id)
 }
