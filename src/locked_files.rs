@@ -8,12 +8,28 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-/// Encrypts the file at `source_path` with a key derived from `password`
-/// and writes the ciphertext to `encrypted_path`. The database row is
-/// inserted first, inside a transaction, and the transaction is only
-/// committed once the ciphertext has actually landed on disk — so a
-/// failure either way (a duplicate `encrypted_path`, or a write error)
-/// leaves neither an orphaned file nor an orphaned row behind.
+/// Encrypts a source file with a key derived from a password and stores the ciphertext at the target path.
+///
+/// Database metadata and the encrypted file are committed together, so a database insertion or file-write
+/// failure does not commit the new lock record.
+///
+/// # Arguments
+///
+/// * `source_path` - Path to the plaintext file.
+/// * `encrypted_path` - Path where the ciphertext is written.
+/// * `password` - Password used to derive the encryption key.
+///
+/// # Returns
+///
+/// The database ID assigned to the new locked-file record.
+///
+/// # Examples
+///
+/// ```no_run
+/// let id = lock_file(&mut conn, source_path, encrypted_path, "correct horse battery staple")?;
+/// assert!(id > 0);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn lock_file(
     conn: &mut Connection,
     source_path: &Path,
@@ -51,10 +67,23 @@ pub fn lock_file(
     Ok(id)
 }
 
-/// Decrypts the password-locked file `id` with `password` and returns its
-/// plaintext bytes. AES-256-GCM's authentication tag is what verifies the
-/// result is intact — a wrong password or a tampered ciphertext both
-/// surface as `Error::InvalidPassword`.
+/// Decrypts a password-locked file and returns its plaintext.
+///
+/// Authentication failures, including an incorrect password or tampered
+/// ciphertext, are reported as [`Error::InvalidPassword`]. Malformed nonce
+/// data is reported as an integrity-check failure.
+///
+/// # Examples
+///
+/// ```
+/// # let conn = rusqlite::Connection::open_in_memory().unwrap();
+/// # let id = 1;
+/// let plaintext = unlock_file(&conn, id, "password");
+/// ```
+///
+/// # Returns
+///
+/// The decrypted plaintext bytes.
 pub fn unlock_file(conn: &Connection, id: i64, password: &str) -> Result<Vec<u8>> {
     let (encrypted_path, salt, nonce): (String, Vec<u8>, Vec<u8>) = conn.query_row(
         "SELECT encrypted_path, kdf_salt, nonce
@@ -72,7 +101,19 @@ pub fn unlock_file(conn: &Connection, id: i64, password: &str) -> Result<Vec<u8>
     Ok(plaintext)
 }
 
-#[cfg(unix)]
+/// Writes file contents with owner-only permissions.
+///
+/// On Unix, the file is created or truncated with permissions `0600`.
+///
+/// # Examples
+///
+/// ```
+/// let path = std::env::temp_dir().join("write_owner_only_example");
+/// write_owner_only(&path, b"secret")?;
+/// assert_eq!(std::fs::read(&path)?, b"secret");
+/// std::fs::remove_file(path)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
@@ -85,7 +126,18 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// Writes file contents using the standard filesystem operations available on non-Unix systems.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # #[cfg(not(unix))]
+/// # {
+/// use std::path::Path;
+///
+/// write_owner_only(Path::new("output.dat"), b"file contents").unwrap();
+/// # }
+/// ```
 fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     fs::write(path, contents)?;
     Ok(())

@@ -3,22 +3,56 @@ use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-/// Opens (creating if needed) a KeyQuorum SQLite database at `path` and
-/// applies the schema. Safe to call repeatedly; every statement is
-/// idempotent.
+/// Opens or creates a KeyQuorum SQLite database at the specified path and applies its schema.
+///
+/// # Examples
+///
+/// ```
+/// let connection = open(":memory:")?;
+/// # Ok::<(), rusqlite::Error>(())
+/// ```
+///
+/// Repeated calls safely reapply the schema.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or initialized.
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     init(&conn)?;
     Ok(conn)
 }
 
-/// Opens an in-memory database with the schema applied. Intended for tests.
+/// Opens an in-memory SQLite database and applies the database schema.
+///
+/// # Returns
+///
+/// A connection to the initialized in-memory database.
+///
+/// # Examples
+///
+/// ```
+/// let connection = keyquorum::db::open_in_memory().unwrap();
+/// assert!(connection.is_autocommit());
+/// ```
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     init(&conn)?;
     Ok(conn)
 }
 
+/// Initializes a SQLite connection for KeyQuorum use.
+///
+/// Configures lock contention handling, enables foreign-key enforcement, and
+/// applies the database schema.
+///
+/// # Examples
+///
+/// ```
+/// # use rusqlite::Connection;
+/// # let conn = Connection::open_in_memory().unwrap();
+/// init(&conn).unwrap();
+/// ```
 fn init(conn: &Connection) -> Result<()> {
     // Block briefly on lock contention instead of failing immediately with
     // SQLITE_BUSY, so concurrent access from multiple connections (e.g. a
@@ -108,8 +142,19 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Seeds a 2-of-2 file: both registered hardware keys are required to
-    /// meet the quorum, so neither backing share has any slack.
+    /// Seeds a database with two hardware keys and a file whose quorum requires both corresponding shares.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let conn = rusqlite::Connection::open_in_memory().unwrap();
+    /// # conn.execute_batch(include_str!("schema.sql")).unwrap();
+    /// seed_two_of_two_file(&conn);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if any seed row cannot be inserted.
     fn seed_two_of_two_file(conn: &Connection) {
         conn.execute(
             "INSERT INTO hardware_keys (id, label, fingerprint, public_key) VALUES

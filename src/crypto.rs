@@ -27,29 +27,63 @@ impl fmt::Display for DecryptError {
 
 impl std::error::Error for DecryptError {}
 
+/// Generates a cryptographically secure random salt.
+///
+/// # Examples
+///
+/// ```
+/// let salt = random_salt();
+/// assert_eq!(salt.len(), SALT_LEN);
+/// ```
 pub fn random_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     salt
 }
 
+/// Generates a cryptographically secure random nonce.
+///
+/// # Examples
+///
+/// ```
+/// let nonce = random_nonce();
+/// assert_eq!(nonce.len(), NONCE_LEN);
+/// ```
 pub fn random_nonce() -> [u8; NONCE_LEN] {
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
     nonce
 }
 
-/// Argon2id parameters, pinned explicitly rather than via `Argon2::default()`
-/// (they currently match that default) so a future upgrade of the `argon2`
-/// crate can't silently change the parameters out from under
-/// already-encrypted records.
+/// Constructs the pinned Argon2id configuration used for key derivation.
+///
+/// The parameters are specified explicitly to keep them stable across upgrades of
+/// the `argon2` crate.
+///
+/// # Examples
+///
+/// ```
+/// let _argon2 = argon2id();
+/// ```
 fn argon2id() -> Argon2<'static> {
     let params = Params::new(19_456, 2, 1, None).expect("hard-coded Argon2id parameters are valid");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-/// Derives a 256-bit key from `password` and `salt` using Argon2id. The
-/// returned buffer is zeroed on drop.
+/// Derives a 256-bit encryption key from a password and salt using Argon2id.
+///
+/// The returned key is securely zeroed when dropped.
+///
+/// # Errors
+///
+/// Returns `Error::KeyDerivationFailed` if key derivation fails.
+///
+/// # Examples
+///
+/// ```
+/// let key = derive_key("password", &[0u8; 16]).unwrap();
+/// assert_eq!(key.len(), 32);
+/// ```
 pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, Error> {
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     argon2id()
@@ -58,10 +92,39 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]
     Ok(key)
 }
 
-/// Encrypts `plaintext` with AES-256-GCM under `key`/`nonce`. Infallible in
-/// practice: with a correctly sized key and nonce the only failure mode is
-/// a plaintext exceeding AES-GCM's ~64GiB limit, far beyond anything this
-/// project encrypts in one call.
+/// Encrypts plaintext with AES-256-GCM using the provided key and nonce.
+
+///
+
+/// The resulting ciphertext includes the authentication tag.
+
+///
+
+/// # Examples
+
+///
+
+/// ```
+
+/// let key = [0u8; KEY_LEN];
+
+/// let nonce = [0u8; NONCE_LEN];
+
+/// let ciphertext = encrypt(&key, &nonce, b"secret");
+
+///
+
+/// assert!(!ciphertext.is_empty());
+
+/// ```
+
+///
+
+/// # Panics
+
+///
+
+/// Panics if AES-GCM encryption fails.
 pub fn encrypt(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     cipher
@@ -69,10 +132,20 @@ pub fn encrypt(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -
         .expect("AES-256-GCM encryption should not fail for in-memory plaintext")
 }
 
-/// Decrypts `ciphertext` with AES-256-GCM under `key`/`nonce`. Fails (and
-/// must be allowed to fail) whenever the key is wrong or the ciphertext
-/// has been tampered with — the AEAD authentication tag is what actually
-/// detects an incorrect password.
+/// Authenticates and decrypts AES-256-GCM ciphertext.
+///
+/// # Examples
+///
+/// ```
+/// let key = [0u8; KEY_LEN];
+/// let nonce = [0u8; NONCE_LEN];
+/// let ciphertext = encrypt(&key, &nonce, b"secret");
+///
+/// let plaintext = decrypt(&key, &nonce, &ciphertext).unwrap();
+/// assert_eq!(plaintext, b"secret");
+/// ```
+///
+/// Returns [`DecryptError`] when authentication or decryption fails.
 pub fn decrypt(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],

@@ -12,6 +12,39 @@ pub struct Credential {
     pub password: String,
 }
 
+/// Stores a credential encrypted with a key derived from the master password.
+///
+/// # Returns
+///
+/// The SQLite row ID assigned to the new credential.
+///
+/// # Examples
+///
+/// ```
+/// use rusqlite::Connection;
+///
+/// let conn = Connection::open_in_memory().unwrap();
+/// conn.execute_batch(
+///     "CREATE TABLE credentials (
+///         id INTEGER PRIMARY KEY,
+///         label TEXT NOT NULL,
+///         username TEXT,
+///         kdf_salt BLOB NOT NULL,
+///         nonce BLOB NOT NULL,
+///         ciphertext BLOB NOT NULL
+///     )",
+/// ).unwrap();
+///
+/// let id = add_credential(
+///     &conn,
+///     "Email",
+///     Some("user@example.com"),
+///     "secret",
+///     "master password",
+/// ).unwrap();
+///
+/// assert!(id > 0);
+/// ```
 pub fn add_credential(
     conn: &Connection,
     label: &str,
@@ -32,6 +65,22 @@ pub fn add_credential(
     Ok(conn.last_insert_rowid())
 }
 
+/// Retrieves and decrypts a credential by its identifier.
+///
+/// # Errors
+///
+/// Returns an error if the credential cannot be queried, the master password
+/// is invalid, or the stored nonce or password data fails integrity checks.
+///
+/// # Examples
+///
+/// ```no_run
+/// let conn = rusqlite::Connection::open_in_memory()?;
+/// let credential = get_credential(&conn, 1, "master password")?;
+/// println!("{}", credential.label);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn get_credential(conn: &Connection, id: i64, master_password: &str) -> Result<Credential> {
 pub fn get_credential(conn: &Connection, id: i64, master_password: &str) -> Result<Credential> {
     let (label, username, salt, nonce, ciphertext): (
         String,
