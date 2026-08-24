@@ -1,0 +1,32 @@
+# CodeRabbit configuration
+# https://docs.coderabbit.ai/guides/configure-coderabbit
+
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!**/target/**"
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/*.lock"
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: >
+        This is a security-sensitive Rust project dealing with cryptographic key
+        material, hardware tokens, and encrypted files. Pay close attention to key
+        derivation, encryption/decryption, and quorum/threshold logic. Flag any
+        hardcoded secrets, weak crypto primitives, or missing input validation.
+
+chat:
+  auto_reply: true

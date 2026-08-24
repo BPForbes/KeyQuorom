@@ -1,0 +1,41 @@
+# CLAUDE.md
+
+Guidance for Claude Code (and other Claude-based agents) working in this repository.
+
+## Project overview
+
+KeyQuorum is a secure file-sharing system centered on hardware key sharing. Files are
+encrypted and bound to registered physical tokens (e.g. USB devices). Unlocking a
+protected file requires presenting a quorum of the registered hardware keys, providing
+layered, hardware-backed access control.
+
+The project is Rust-based (see `.gitignore` for Cargo-related patterns). It is in an
+early scaffolding stage — no source tree, build manifest, or CI exists yet. Do not
+assume commands like `cargo build`/`cargo test` work until a `Cargo.toml` is actually
+present; check before running them.
+
+## Working conventions
+
+- Keep changes minimal and scoped to what's requested — don't scaffold unrelated
+  modules, abstractions, or tooling ahead of need.
+- Once a Cargo workspace exists, run `cargo fmt`, `cargo clippy`, and `cargo test`
+  before considering a change complete.
+- Match existing code style; this repo has no established style guide yet, so follow
+  standard Rust conventions (`rustfmt` defaults) unless told otherwise.
+
+## Security
+
+This project deals directly with cryptographic key material, hardware tokens, and
+encrypted user files. Treat it as security-sensitive:
+
+- Never commit private keys, tokens, `.env` files, secrets, or plaintext copies of
+  protected/test files. See `.gitignore` for patterns already excluded (`*.key`,
+  `*.pem`, `*.secret`, `*.token`, `*.kqkey`, `secrets/`, `keys/`, `test-keys/`, etc.).
+- Be extra careful with any code touching key derivation, encryption/decryption, or
+  quorum/threshold logic — correctness bugs here are security bugs.
+- Flag anything that looks like a hardcoded secret or credential before committing.
+
+## Other agent instruction files
+
+This repo also carries `AGENTS.md` (Codex and other agent tooling) and `.cursorrules`
+(Cursor). Keep guidance consistent across these files when updating one.
