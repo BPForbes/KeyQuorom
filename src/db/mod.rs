@@ -1,4 +1,5 @@
 use rusqlite::{Connection, Result};
+use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
@@ -19,6 +20,10 @@ pub fn open_in_memory() -> Result<Connection> {
 }
 
 fn init(conn: &Connection) -> Result<()> {
+    // Block briefly on lock contention instead of failing immediately with
+    // SQLITE_BUSY, so concurrent access from multiple connections (e.g. a
+    // share redemption race) resolves in commit order rather than erroring.
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.execute_batch(SCHEMA)
 }
@@ -175,6 +180,74 @@ mod tests {
 
         let result = conn.execute(
             "DELETE FROM file_key_shares WHERE file_id = 1 AND hardware_key_id = 1",
+            [],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn raising_quorum_threshold_above_share_count_is_blocked() {
+        let conn = open_in_memory().expect("schema should apply");
+        seed_two_of_two_file(&conn);
+        let result = conn.execute("UPDATE files SET quorum_threshold = 3 WHERE id = 1", []);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lowering_quorum_threshold_is_allowed() {
+        let conn = open_in_memory().expect("schema should apply");
+        seed_two_of_two_file(&conn);
+        let result = conn.execute("UPDATE files SET quorum_threshold = 1 WHERE id = 1", []);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn moving_a_required_share_to_another_file_is_blocked() {
+        let conn = open_in_memory().expect("schema should apply");
+        seed_two_of_two_file(&conn);
+        conn.execute(
+            "INSERT INTO files (id, name, encrypted_path, content_hash, quorum_threshold)
+             VALUES (2, 'other.txt', '/data/other.txt.enc', 'beefdead', 1)",
+            [],
+        )
+        .expect("seed second file");
+
+        let result = conn.execute(
+            "UPDATE file_key_shares SET file_id = 2 WHERE file_id = 1 AND hardware_key_id = 1",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn moving_a_surplus_share_to_another_file_is_allowed() {
+        let conn = open_in_memory().expect("schema should apply");
+        conn.execute(
+            "INSERT INTO hardware_keys (id, label, fingerprint, public_key) VALUES
+             (1, 'key-a', 'fp-a', x'01'),
+             (2, 'key-b', 'fp-b', x'02')",
+            [],
+        )
+        .expect("seed hardware_keys");
+        conn.execute(
+            "INSERT INTO files (id, name, encrypted_path, content_hash, quorum_threshold) VALUES
+             (1, 'secret.txt', '/data/secret.txt.enc', 'deadbeef', 1),
+             (2, 'other.txt', '/data/other.txt.enc', 'beefdead', 1)",
+            [],
+        )
+        .expect("seed files");
+        conn.execute(
+            "INSERT INTO file_key_shares (file_id, hardware_key_id, wrapped_share) VALUES
+             (1, 1, x'aa'),
+             (1, 2, x'bb')",
+            [],
+        )
+        .expect("seed file_key_shares");
+
+        // File 1 is 1-of-2, so moving key 1's share to file 2 still leaves
+        // file 1 with one share, satisfying its threshold.
+        let result = conn.execute(
+            "UPDATE file_key_shares SET file_id = 2 WHERE file_id = 1 AND hardware_key_id = 1",
             [],
         );
         assert!(result.is_ok());

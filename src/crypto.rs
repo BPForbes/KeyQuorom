@@ -4,10 +4,11 @@
 use crate::error::Error;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::fmt;
+use zeroize::Zeroizing;
 
 pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
@@ -38,11 +39,21 @@ pub fn random_nonce() -> [u8; NONCE_LEN] {
     nonce
 }
 
-/// Derives a 256-bit key from `password` and `salt` using Argon2id.
-pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], Error> {
-    let mut key = [0u8; KEY_LEN];
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+/// Argon2id parameters, pinned explicitly rather than via `Argon2::default()`
+/// (they currently match that default) so a future upgrade of the `argon2`
+/// crate can't silently change the parameters out from under
+/// already-encrypted records.
+fn argon2id() -> Argon2<'static> {
+    let params = Params::new(19_456, 2, 1, None).expect("hard-coded Argon2id parameters are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// Derives a 256-bit key from `password` and `salt` using Argon2id. The
+/// returned buffer is zeroed on drop.
+pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, Error> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    argon2id()
+        .hash_password_into(password.as_bytes(), salt, &mut key[..])
         .map_err(|_| Error::KeyDerivationFailed)?;
     Ok(key)
 }

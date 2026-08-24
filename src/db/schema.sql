@@ -51,6 +51,35 @@ BEGIN
     SELECT RAISE(ABORT, 'cannot remove key share: file would fall below its quorum threshold');
 END;
 
+-- Also guard against raising a file's quorum_threshold above its current
+-- number of registered shares, which would make it unrecoverable without
+-- ever deleting a share.
+CREATE TRIGGER IF NOT EXISTS trg_files_guard_quorum_threshold_increase
+BEFORE UPDATE OF quorum_threshold ON files
+FOR EACH ROW
+WHEN NEW.quorum_threshold > (
+    SELECT count(*) FROM file_key_shares WHERE file_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cannot raise quorum_threshold above the number of registered shares');
+END;
+
+-- Also guard against reassigning a share to a different file, which would
+-- silently drop it from its original file's count the same way a delete
+-- would.
+CREATE TRIGGER IF NOT EXISTS trg_file_key_shares_guard_quorum_on_move
+BEFORE UPDATE OF file_id ON file_key_shares
+FOR EACH ROW
+WHEN NEW.file_id != OLD.file_id
+AND (
+    SELECT count(*) FROM file_key_shares WHERE file_id = OLD.file_id
+) - 1 < (
+    SELECT quorum_threshold FROM files WHERE id = OLD.file_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cannot move key share: file would fall below its quorum threshold');
+END;
+
 -- Audit log of unlock attempts, successful or not.
 CREATE TABLE IF NOT EXISTS unlock_events (
     id              INTEGER PRIMARY KEY,
@@ -81,12 +110,14 @@ CREATE TABLE IF NOT EXISTS credentials (
 
 -- A file locked with a single password rather than a hardware-key quorum:
 -- a lighter-weight protection tier, independent of the `files` /
--- `file_key_shares` quorum mechanism above.
+-- `file_key_shares` quorum mechanism above. No separate content hash is
+-- stored: AES-256-GCM's own authentication tag already proves the
+-- decrypted plaintext is intact, and an unkeyed hash of the plaintext
+-- would otherwise leak a password-independent fingerprint of it.
 CREATE TABLE IF NOT EXISTS password_locked_files (
     id                INTEGER PRIMARY KEY,
     name              TEXT NOT NULL,
     encrypted_path    TEXT NOT NULL UNIQUE,
-    content_hash      TEXT NOT NULL,
     kdf_salt          BLOB NOT NULL,
     nonce             BLOB NOT NULL,
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))

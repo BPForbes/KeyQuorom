@@ -77,50 +77,62 @@ fn create_share(
 fn redeem_share(conn: &Connection, table: &str, id_column: &str, token: &str) -> Result<i64> {
     let token_hash = hash_token(token)?;
 
-    let row: Option<(i64, i64, bool, bool, Option<i64>, i64)> = conn
+    // Eligibility check and use_count increment happen in one statement, so
+    // two concurrent redemptions of a max_uses = 1 share can't both read
+    // "not yet exhausted" before either writes — only one UPDATE can ever
+    // match and claim the row.
+    let claimed = conn.execute(
+        &format!(
+            "UPDATE {table}
+             SET use_count = use_count + 1
+             WHERE token_hash = ?1
+               AND revoked_at IS NULL
+               AND datetime(expires_at) > datetime('now')
+               AND (max_uses IS NULL OR use_count < max_uses)"
+        ),
+        params![token_hash],
+    )?;
+
+    if claimed == 1 {
+        let resource_id: i64 = conn.query_row(
+            &format!("SELECT {id_column} FROM {table} WHERE token_hash = ?1"),
+            params![token_hash],
+            |row| row.get(0),
+        )?;
+        return Ok(resource_id);
+    }
+
+    // The update above is what actually enforces access control; this is a
+    // read-only follow-up purely to report why it didn't match.
+    let row: Option<(bool, bool, Option<i64>, i64)> = conn
         .query_row(
             &format!(
-                "SELECT id, {id_column},
+                "SELECT revoked_at IS NOT NULL,
                         datetime(expires_at) <= datetime('now'),
-                        revoked_at IS NOT NULL,
                         max_uses, use_count
                  FROM {table} WHERE token_hash = ?1"
             ),
             params![token_hash],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
 
-    let (share_id, resource_id, expired, revoked, max_uses, use_count) =
-        row.ok_or(Error::InvalidShareToken)?;
+    let Some((revoked, expired, max_uses, use_count)) = row else {
+        return Err(Error::InvalidShareToken);
+    };
 
     if revoked {
-        return Err(Error::ShareRevoked);
+        Err(Error::ShareRevoked)
+    } else if expired {
+        Err(Error::ShareExpired)
+    } else if max_uses.is_some_and(|limit| use_count >= limit) {
+        Err(Error::ShareExhausted)
+    } else {
+        // State moved between the update and this read (another caller
+        // claimed the share in between); it's exhausted from this caller's
+        // point of view either way.
+        Err(Error::ShareExhausted)
     }
-    if expired {
-        return Err(Error::ShareExpired);
-    }
-    if let Some(limit) = max_uses {
-        if use_count >= limit {
-            return Err(Error::ShareExhausted);
-        }
-    }
-
-    conn.execute(
-        &format!("UPDATE {table} SET use_count = use_count + 1 WHERE id = ?1"),
-        params![share_id],
-    )?;
-
-    Ok(resource_id)
 }
 
 fn revoke_share(conn: &Connection, table: &str, share_id: i64) -> Result<()> {
@@ -247,5 +259,53 @@ mod tests {
         let second = redeem_credential_share(&conn, &share.token);
 
         assert!(matches!(second, Err(Error::ShareExhausted)));
+    }
+
+    #[test]
+    fn concurrent_redemption_allows_exactly_one_success() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let db_path = dir
+            .path()
+            .join("keyquorum.sqlite")
+            .to_str()
+            .expect("path should be valid UTF-8")
+            .to_string();
+
+        let setup_conn = db::open(&db_path).expect("schema should apply");
+        let credential_id = seed_credential(&setup_conn);
+        let share = create_credential_share(&setup_conn, credential_id, 3600, Some(1))
+            .expect("create_credential_share should succeed");
+        drop(setup_conn);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let token = share.token.clone();
+                let db_path = db_path.clone();
+                thread::spawn(move || {
+                    let conn = db::open(&db_path).expect("schema should apply");
+                    barrier.wait();
+                    redeem_credential_share(&conn, &token)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread should not panic"))
+            .collect();
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let rejections = results
+            .iter()
+            .filter(|r| matches!(r, Err(Error::ShareExhausted)))
+            .count();
+
+        assert_eq!(successes, 1);
+        assert_eq!(rejections, 1);
     }
 }
