@@ -51,6 +51,14 @@ tmp/
 temp/
 scratch/
 
+# Local SQLite databases (may contain decrypted key/file metadata)
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Editor backups
 *~
 *.bak

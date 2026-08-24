@@ -1,0 +1,22 @@
+[package]
+name = "keyquorum"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "keyquorum"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+argon2 = "0.5"
+aes-gcm = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
