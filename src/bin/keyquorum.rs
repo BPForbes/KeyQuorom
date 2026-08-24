@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use keyquorum::error::{Error, Result};
 use keyquorum::{db, locked_files, sharing, vault};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -80,10 +80,10 @@ enum ShareCommand {
         #[arg(long)]
         max_uses: Option<i64>,
     },
-    /// Redeem a credential share token
-    RedeemCredential { token: String },
-    /// Redeem a file share token
-    RedeemFile { token: String },
+    /// Redeem a credential share token (prompted interactively, never as an argument)
+    RedeemCredential,
+    /// Redeem a file share token (prompted interactively, never as an argument)
+    RedeemFile,
     /// Revoke a credential share
     RevokeCredential { share_id: i64 },
     /// Revoke a file share
@@ -92,9 +92,8 @@ enum ShareCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let db_path = cli.db.to_string_lossy().into_owned();
 
-    match run(&db_path, cli.command) {
+    match run(&cli.db, cli.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
@@ -103,14 +102,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(db_path: &str, command: Command) -> Result<()> {
+fn run(db_path: &Path, command: Command) -> Result<()> {
+    let db_path = db_path.to_str().ok_or(Error::InvalidPath)?;
     let conn = db::open(db_path)?;
 
     match command {
         Command::Vault { command } => match command {
             VaultCommand::Add { label, username } => {
-                let password = prompt_password("Credential password: ")?;
-                let master_password = prompt_password("Master password: ")?;
+                let password = prompt_secret("Credential password: ")?;
+                let master_password = prompt_secret("Master password: ")?;
                 let id = vault::add_credential(
                     &conn,
                     &label,
@@ -121,7 +121,7 @@ fn run(db_path: &str, command: Command) -> Result<()> {
                 println!("Stored credential {id}");
             }
             VaultCommand::Get { id } => {
-                let master_password = prompt_password("Master password: ")?;
+                let master_password = prompt_secret("Master password: ")?;
                 let credential = vault::get_credential(&conn, id, &master_password)?;
                 println!("Label:    {}", credential.label);
                 println!(
@@ -135,15 +135,15 @@ fn run(db_path: &str, command: Command) -> Result<()> {
             source,
             encrypted_path,
         } => {
-            let password = prompt_password("Lock password: ")?;
+            let password = prompt_secret("Lock password: ")?;
             let id = locked_files::lock_file(&conn, &source, &encrypted_path, &password)?;
             println!("Locked file {id}");
         }
         Command::Unlock { id, output } => {
-            let password = prompt_password("Unlock password: ")?;
+            let password = prompt_secret("Unlock password: ")?;
             let plaintext = locked_files::unlock_file(&conn, id, &password)?;
             match output {
-                Some(path) => std::fs::write(&path, &plaintext)?,
+                Some(path) => locked_files::write_owner_only(&path, &plaintext)?,
                 None => io::stdout().write_all(&plaintext)?,
             }
         }
@@ -165,11 +165,13 @@ fn run(db_path: &str, command: Command) -> Result<()> {
                 let share = sharing::create_file_share(&conn, file_id, ttl_seconds, max_uses)?;
                 print_share(&share);
             }
-            ShareCommand::RedeemCredential { token } => {
+            ShareCommand::RedeemCredential => {
+                let token = prompt_secret("Credential share token: ")?;
                 let credential_id = sharing::redeem_credential_share(&conn, &token)?;
                 println!("Redeemed credential {credential_id}");
             }
-            ShareCommand::RedeemFile { token } => {
+            ShareCommand::RedeemFile => {
+                let token = prompt_secret("File share token: ")?;
                 let file_id = sharing::redeem_file_share(&conn, &token)?;
                 println!("Redeemed file {file_id}");
             }
@@ -193,6 +195,6 @@ fn print_share(share: &sharing::Share) {
     println!("Expires at: {}", share.expires_at);
 }
 
-fn prompt_password(prompt: &str) -> Result<String> {
+fn prompt_secret(prompt: &str) -> Result<String> {
     rpassword::prompt_password(prompt).map_err(Error::from)
 }

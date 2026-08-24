@@ -81,7 +81,7 @@ pub fn unlock_file(conn: &Connection, id: i64, password: &str) -> Result<Vec<u8>
 /// cleans up its own partial write if anything after creation fails —
 /// but only ever removes a file it created itself.
 #[cfg(unix)]
-fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut file = fs::OpenOptions::new()
@@ -111,7 +111,7 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

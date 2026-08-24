@@ -27,11 +27,11 @@ keyquorum vault add "Email" --username alice
 keyquorum vault get 1
 
 keyquorum share create-file 1 --ttl-seconds 3600
-keyquorum share redeem-file <token>
+keyquorum share redeem-file
 ```
 
-Passwords are always prompted for interactively rather than taken as arguments. Run
-`keyquorum --help` for the full command list.
+Passwords and share tokens are always prompted for interactively rather than taken as
+arguments. Run `keyquorum --help` for the full command list.
 
 ## Security
 
