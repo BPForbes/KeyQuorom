@@ -57,8 +57,8 @@ mod tests {
     fn quorum_threshold_must_be_positive() {
         let conn = open_in_memory().expect("schema should apply");
         let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, content_hash, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', 'deadbeef', 0)",
+            "INSERT INTO files (name, encrypted_path, quorum_threshold)
+             VALUES ('secret.txt', '/data/secret.txt.enc', 0)",
             [],
         );
         assert!(result.is_err());
@@ -79,8 +79,8 @@ mod tests {
     fn quorum_threshold_accepts_valid_integer() {
         let conn = open_in_memory().expect("schema should apply");
         let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, content_hash, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', 'deadbeef', 2)",
+            "INSERT INTO files (name, encrypted_path, quorum_threshold)
+             VALUES ('secret.txt', '/data/secret.txt.enc', 2)",
             [],
         );
         assert!(result.is_ok());
@@ -90,8 +90,8 @@ mod tests {
     fn quorum_threshold_rejects_non_integer_numeric_value() {
         let conn = open_in_memory().expect("schema should apply");
         let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, content_hash, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', 'deadbeef', ?1)",
+            "INSERT INTO files (name, encrypted_path, quorum_threshold)
+             VALUES ('secret.txt', '/data/secret.txt.enc', ?1)",
             params![0.5_f64],
         );
         assert!(result.is_err());
@@ -101,8 +101,8 @@ mod tests {
     fn quorum_threshold_rejects_non_numeric_text() {
         let conn = open_in_memory().expect("schema should apply");
         let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, content_hash, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', 'deadbeef', ?1)",
+            "INSERT INTO files (name, encrypted_path, quorum_threshold)
+             VALUES ('secret.txt', '/data/secret.txt.enc', ?1)",
             params!["abc"],
         );
         assert!(result.is_err());
@@ -119,8 +119,8 @@ mod tests {
         )
         .expect("seed hardware_keys");
         conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, content_hash, quorum_threshold)
-             VALUES (1, 'secret.txt', '/data/secret.txt.enc', 'deadbeef', 2)",
+            "INSERT INTO files (id, name, encrypted_path, quorum_threshold)
+             VALUES (1, 'secret.txt', '/data/secret.txt.enc', 2)",
             [],
         )
         .expect("seed files");
@@ -165,8 +165,8 @@ mod tests {
         // 1-of-2: quorum only needs one key, so two registered shares
         // leaves one to spare.
         conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, content_hash, quorum_threshold)
-             VALUES (1, 'secret.txt', '/data/secret.txt.enc', 'deadbeef', 1)",
+            "INSERT INTO files (id, name, encrypted_path, quorum_threshold)
+             VALUES (1, 'secret.txt', '/data/secret.txt.enc', 1)",
             [],
         )
         .expect("seed files");
@@ -206,8 +206,8 @@ mod tests {
         let conn = open_in_memory().expect("schema should apply");
         seed_two_of_two_file(&conn);
         conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, content_hash, quorum_threshold)
-             VALUES (2, 'other.txt', '/data/other.txt.enc', 'beefdead', 1)",
+            "INSERT INTO files (id, name, encrypted_path, quorum_threshold)
+             VALUES (2, 'other.txt', '/data/other.txt.enc', 1)",
             [],
         )
         .expect("seed second file");
@@ -230,9 +230,9 @@ mod tests {
         )
         .expect("seed hardware_keys");
         conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, content_hash, quorum_threshold) VALUES
-             (1, 'secret.txt', '/data/secret.txt.enc', 'deadbeef', 1),
-             (2, 'other.txt', '/data/other.txt.enc', 'beefdead', 1)",
+            "INSERT INTO files (id, name, encrypted_path, quorum_threshold) VALUES
+             (1, 'secret.txt', '/data/secret.txt.enc', 1),
+             (2, 'other.txt', '/data/other.txt.enc', 1)",
             [],
         )
         .expect("seed files");

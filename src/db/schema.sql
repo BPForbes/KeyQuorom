@@ -13,11 +13,15 @@ CREATE TABLE IF NOT EXISTS hardware_keys (
     revoked_at    TEXT
 );
 
+-- No content hash is stored here either, for the same reason as
+-- `password_locked_files` below: an unkeyed hash of the plaintext would
+-- leak a fingerprint of it independent of whatever protects the file.
+-- Once this table's file encryption is wired up, its own AEAD
+-- authentication tag is what should verify integrity.
 CREATE TABLE IF NOT EXISTS files (
     id                INTEGER PRIMARY KEY,
     name              TEXT NOT NULL,
     encrypted_path    TEXT NOT NULL UNIQUE,
-    content_hash      TEXT NOT NULL,
     quorum_threshold  INTEGER NOT NULL CHECK (
         quorum_threshold > 0 AND typeof(quorum_threshold) = 'integer'
     ),
