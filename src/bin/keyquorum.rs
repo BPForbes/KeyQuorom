@@ -367,14 +367,7 @@ fn run_vault(conn: &Connection, command: VaultCommand) -> Result<()> {
             )?;
             if set_pin_flag {
                 let pin_value = prompt_secret("Set a 4-digit PIN: ")?;
-                pin::set_pin(
-                    conn,
-                    ResourceType::Credential,
-                    id,
-                    &pin_value,
-                    true,
-                    PIN_TTL_SECONDS,
-                )?;
+                set_default_pin(conn, ResourceType::Credential, id, &pin_value)?;
             }
             println!("Stored credential {id}");
         }
@@ -485,14 +478,7 @@ fn run_access_password(conn: &Connection, args: AccessPasswordArgs) -> Result<()
             let id = locked_files::lock_file(conn, &source, &encrypted_path, &password)?;
             if args.pin {
                 let pin_value = prompt_secret("Set a 4-digit PIN: ")?;
-                pin::set_pin(
-                    conn,
-                    ResourceType::LockedFile,
-                    id,
-                    &pin_value,
-                    true,
-                    PIN_TTL_SECONDS,
-                )?;
+                set_default_pin(conn, ResourceType::LockedFile, id, &pin_value)?;
             }
             println!("Locked file {id}");
         }
@@ -807,6 +793,22 @@ fn prompt_secret(prompt: &str) -> Result<String> {
     rpassword::prompt_password(prompt).map_err(Error::from)
 }
 
+fn set_default_pin(
+    conn: &Connection,
+    resource_type: ResourceType,
+    resource_id: i64,
+    pin_value: &str,
+) -> Result<()> {
+    pin::set_pin(
+        conn,
+        resource_type,
+        resource_id,
+        pin_value,
+        false,
+        PIN_TTL_SECONDS,
+    )
+}
+
 fn parse_positive_i64(value: &str) -> std::result::Result<i64, String> {
     let value = value
         .parse::<i64>()
@@ -908,5 +910,18 @@ mod tests {
             "plaintext",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn default_cli_pins_cache_successful_verification() {
+        let conn = db::open_in_memory().expect("schema should apply");
+        set_default_pin(&conn, ResourceType::Credential, 1, "1234")
+            .expect("setting a default CLI PIN should succeed");
+
+        pin::verify_pin(&conn, ResourceType::Credential, 1, "1234").expect("PIN should verify");
+        assert!(
+            !pin::verification_required(&conn, ResourceType::Credential, 1)
+                .expect("verification state should be readable")
+        );
     }
 }
