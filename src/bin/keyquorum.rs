@@ -76,6 +76,11 @@ enum Command {
         #[command(subcommand)]
         command: ShareCommand,
     },
+    /// Manage PIN unlock windows
+    Pin {
+        #[command(subcommand)]
+        command: PinCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -163,55 +168,55 @@ enum AccessCommand {
 #[derive(Args)]
 struct AccessPasswordArgs {
     /// 0 = lock (encrypt), 1 = unlock (decrypt)
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
     state: u8,
     /// state 0 only: file to encrypt
-    #[arg(long)]
+    #[arg(long, required_if_eq("state", "0"), conflicts_with_all = ["id", "output"])]
     source: Option<PathBuf>,
     /// state 0 only: where to write the ciphertext
-    #[arg(long)]
+    #[arg(long, required_if_eq("state", "0"), conflicts_with_all = ["id", "output"])]
     encrypted_path: Option<PathBuf>,
     /// state 1 only: which locked file
-    #[arg(long)]
+    #[arg(long, required_if_eq("state", "1"), conflicts_with_all = ["source", "encrypted_path", "pin"])]
     id: Option<i64>,
     /// state 1 only: write plaintext here instead of stdout
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["source", "encrypted_path", "pin"])]
     output: Option<PathBuf>,
     /// state 0: also protect with a 4-digit PIN. state 1: this file has a
     /// PIN and it's prompted for automatically — this flag is unused there.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["id", "output"])]
     pin: bool,
 }
 
 #[derive(Args)]
 struct AccessQuorumArgs {
     /// 0 = lock (encrypt + split), 1 = unlock (reconstruct + decrypt)
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1), conflicts_with = "status")]
     state: Option<u8>,
     /// Print the file's row and key-tree summary instead of locking/unlocking
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["source", "encrypted_path", "tree_spec", "name", "share_files", "output"])]
     status: bool,
     /// state 0 only: file to encrypt
-    #[arg(long)]
+    #[arg(long, required_if_eq("state", "0"), conflicts_with_all = ["id", "share_files", "output"])]
     source: Option<PathBuf>,
     /// state 0 only: where to write the ciphertext
-    #[arg(long)]
+    #[arg(long, required_if_eq("state", "0"), conflicts_with_all = ["id", "share_files", "output"])]
     encrypted_path: Option<PathBuf>,
     /// state 0 only: tree-spec JSON describing how to split the data key
-    #[arg(long)]
+    #[arg(long, required_if_eq("state", "0"), conflicts_with_all = ["id", "share_files", "output"])]
     tree_spec: Option<PathBuf>,
     /// state 0 only: override the stored file name (defaults to source's file name)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["id", "share_files", "output"])]
     name: Option<String>,
     /// state 1 / --status: which quorum-protected file
-    #[arg(long)]
+    #[arg(long, required_if_eq("state", "1"), conflicts_with_all = ["source", "encrypted_path", "tree_spec", "name"])]
     id: Option<i64>,
     /// state 1 only: node_id=path-to-hex-encoded-raw-share (repeatable;
     /// node_id is a leaf's id as shown by `--status`)
-    #[arg(long = "share-file")]
+    #[arg(long = "share-file", conflicts_with_all = ["source", "encrypted_path", "tree_spec", "name"])]
     share_files: Vec<String>,
     /// state 1 only: write plaintext here instead of stdout
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["source", "encrypted_path", "tree_spec", "name"])]
     output: Option<PathBuf>,
 }
 
@@ -240,27 +245,27 @@ enum ShareCommand {
     /// Create a share link for a vault credential
     CreateCredential {
         credential_id: i64,
-        #[arg(long, default_value_t = 3600)]
+        #[arg(long, default_value_t = 3600, value_parser = parse_positive_i64)]
         ttl_seconds: i64,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_positive_i64)]
         max_uses: Option<i64>,
         /// Also require a 4-digit PIN to redeem this share
         #[arg(long)]
         pin: bool,
         /// Require the PIN on every redemption rather than once per TTL window
-        #[arg(long)]
+        #[arg(long, requires = "pin")]
         pin_required_every_use: bool,
     },
     /// Create a share link for a password-locked file
     CreateFile {
         file_id: i64,
-        #[arg(long, default_value_t = 3600)]
+        #[arg(long, default_value_t = 3600, value_parser = parse_positive_i64)]
         ttl_seconds: i64,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_positive_i64)]
         max_uses: Option<i64>,
         #[arg(long)]
         pin: bool,
-        #[arg(long)]
+        #[arg(long, requires = "pin")]
         pin_required_every_use: bool,
     },
     /// Redeem a credential share token (prompted interactively, never as an argument)
@@ -271,6 +276,38 @@ enum ShareCommand {
     RevokeCredential { share_id: i64 },
     /// Revoke a file share
     RevokeFile { share_id: i64 },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliResourceType {
+    Credential,
+    LockedFile,
+    QuorumFile,
+    CredentialShare,
+    FileShare,
+}
+
+impl From<CliResourceType> for ResourceType {
+    fn from(value: CliResourceType) -> Self {
+        match value {
+            CliResourceType::Credential => ResourceType::Credential,
+            CliResourceType::LockedFile => ResourceType::LockedFile,
+            CliResourceType::QuorumFile => ResourceType::QuorumFile,
+            CliResourceType::CredentialShare => ResourceType::CredentialShare,
+            CliResourceType::FileShare => ResourceType::FileShare,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PinCommand {
+    /// End a cached one-time PIN unlock window immediately
+    Relock {
+        #[arg(long, value_enum)]
+        resource: CliResourceType,
+        #[arg(long)]
+        id: i64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -306,6 +343,7 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         }
         Command::Export { command } => run_export(&conn, command)?,
         Command::Share { command } => run_share(&conn, command)?,
+        Command::Pin { command } => run_pin(&conn, command)?,
     }
 
     Ok(())
@@ -341,7 +379,7 @@ fn run_vault(conn: &Connection, command: VaultCommand) -> Result<()> {
             println!("Stored credential {id}");
         }
         VaultCommand::Get { id } => {
-            if pin::has_pin(conn, ResourceType::Credential, id)? {
+            if pin::verification_required(conn, ResourceType::Credential, id)? {
                 let pin_value = prompt_secret("PIN: ")?;
                 pin::verify_pin(conn, ResourceType::Credential, id, &pin_value)?;
             }
@@ -460,7 +498,7 @@ fn run_access_password(conn: &Connection, args: AccessPasswordArgs) -> Result<()
         }
         1 => {
             let id = require(args.id, "id");
-            if pin::has_pin(conn, ResourceType::LockedFile, id)? {
+            if pin::verification_required(conn, ResourceType::LockedFile, id)? {
                 let pin_value = prompt_secret("PIN: ")?;
                 pin::verify_pin(conn, ResourceType::LockedFile, id, &pin_value)?;
             }
@@ -523,7 +561,7 @@ fn run_export(conn: &Connection, command: ExportCommand) -> Result<()> {
             let master_password = prompt_secret("Master password: ")?;
             let bundle =
                 export::export_credential(conn, id, &master_password, &recipient_public_key)?;
-            fs::write(&output, bundle)?;
+            locked_files::write_owner_only(&output, &bundle)?;
             println!("Exported credential {id} to {}", output.display());
         }
         ExportCommand::File {
@@ -534,7 +572,7 @@ fn run_export(conn: &Connection, command: ExportCommand) -> Result<()> {
             let recipient_public_key = read_hex_array_32(&recipient_key_file)?;
             let password = prompt_secret("Unlock password: ")?;
             let bundle = export::export_file(conn, id, &password, &recipient_public_key)?;
-            fs::write(&output, bundle)?;
+            locked_files::write_owner_only(&output, &bundle)?;
             println!("Exported file {id} to {}", output.display());
         }
     }
@@ -589,7 +627,7 @@ fn run_share(conn: &Connection, command: ShareCommand) -> Result<()> {
         ShareCommand::RedeemCredential => {
             let token = prompt_secret("Credential share token: ")?;
             let share_id = sharing::credential_share_id_for_token(conn, &token)?;
-            if pin::has_pin(conn, ResourceType::CredentialShare, share_id)? {
+            if pin::verification_required(conn, ResourceType::CredentialShare, share_id)? {
                 let pin_value = prompt_secret("PIN: ")?;
                 pin::verify_pin(conn, ResourceType::CredentialShare, share_id, &pin_value)?;
             }
@@ -599,7 +637,7 @@ fn run_share(conn: &Connection, command: ShareCommand) -> Result<()> {
         ShareCommand::RedeemFile => {
             let token = prompt_secret("File share token: ")?;
             let share_id = sharing::file_share_id_for_token(conn, &token)?;
-            if pin::has_pin(conn, ResourceType::FileShare, share_id)? {
+            if pin::verification_required(conn, ResourceType::FileShare, share_id)? {
                 let pin_value = prompt_secret("PIN: ")?;
                 pin::verify_pin(conn, ResourceType::FileShare, share_id, &pin_value)?;
             }
@@ -613,6 +651,16 @@ fn run_share(conn: &Connection, command: ShareCommand) -> Result<()> {
         ShareCommand::RevokeFile { share_id } => {
             sharing::revoke_file_share(conn, share_id)?;
             println!("Revoked file share {share_id}");
+        }
+    }
+    Ok(())
+}
+
+fn run_pin(conn: &Connection, command: PinCommand) -> Result<()> {
+    match command {
+        PinCommand::Relock { resource, id } => {
+            pin::relock(conn, resource.into(), id)?;
+            println!("Relocked PIN for resource {id}");
         }
     }
     Ok(())
@@ -757,4 +805,108 @@ fn require<T>(value: Option<T>, flag: &str) -> T {
 
 fn prompt_secret(prompt: &str) -> Result<String> {
     rpassword::prompt_password(prompt).map_err(Error::from)
+}
+
+fn parse_positive_i64(value: &str) -> std::result::Result<i64, String> {
+    let value = value
+        .parse::<i64>()
+        .map_err(|_| "must be a positive integer".to_owned())?;
+    if value > 0 {
+        Ok(value)
+    } else {
+        Err("must be greater than zero".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_options_reject_unusable_limits() {
+        for args in [
+            [
+                "keyquorum",
+                "share",
+                "create-file",
+                "1",
+                "--ttl-seconds",
+                "0",
+            ],
+            ["keyquorum", "share", "create-file", "1", "--max-uses", "-1"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn pin_every_use_requires_enabling_a_pin() {
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "share",
+            "create-credential",
+            "1",
+            "--pin-required-every-use",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn quorum_status_rejects_mutating_options() {
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "access",
+            "quorum",
+            "--status",
+            "--id",
+            "1",
+            "--output",
+            "plaintext",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn access_modes_require_and_reject_mode_specific_options() {
+        for args in [
+            vec!["keyquorum", "access", "password", "--state", "0"],
+            vec![
+                "keyquorum",
+                "access",
+                "password",
+                "--state",
+                "1",
+                "--id",
+                "1",
+                "--source",
+                "plaintext",
+            ],
+            vec![
+                "keyquorum",
+                "access",
+                "quorum",
+                "--state",
+                "0",
+                "--source",
+                "plaintext",
+                "--encrypted-path",
+                "ciphertext",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "access",
+            "password",
+            "--state",
+            "1",
+            "--id",
+            "1",
+            "--output",
+            "plaintext",
+        ])
+        .is_ok());
+    }
 }

@@ -84,7 +84,8 @@ keyquorum vault get 1
 ```
 
 Either can also take `--pin` to require a 4-digit PIN (attempt-limited, FIDO2-PIN-style)
-alongside the password.
+alongside the password. A successful one-time PIN check is cached for one hour; end that
+window early with, for example, `keyquorum pin relock --resource credential --id 1`.
 
 ### Signature verification, export, and sharing
 
