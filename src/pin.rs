@@ -126,6 +126,35 @@ pub fn has_pin(conn: &Connection, resource_type: ResourceType, resource_id: i64)
     }
 }
 
+/// Reports whether the caller must prompt for and verify a PIN now.
+/// Resources without a PIN, and resources still inside a successful
+/// one-time verification window, do not require another prompt.
+pub fn verification_required(
+    conn: &Connection,
+    resource_type: ResourceType,
+    resource_id: i64,
+) -> Result<bool> {
+    let row = match get_pin_row(conn, resource_type, resource_id) {
+        Ok(row) => row,
+        Err(Error::PinNotSet) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+
+    if row.require_every_use || row.locked_at.is_some() {
+        return Ok(true);
+    }
+
+    let Some(unlocked_until) = row.unlocked_until else {
+        return Ok(true);
+    };
+    conn.query_row(
+        "SELECT datetime(?1) <= datetime('now')",
+        params![unlocked_until],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 pub fn verify_pin(
     conn: &Connection,
     resource_type: ResourceType,
@@ -220,6 +249,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt_count, 0);
+    }
+
+    #[test]
+    fn successful_one_time_verification_suppresses_prompts_until_relocked() {
+        let conn = db::open_in_memory().expect("schema should apply");
+        set_pin(&conn, ResourceType::Credential, 1, "1234", false, 300)
+            .expect("set_pin should succeed");
+
+        assert!(verification_required(&conn, ResourceType::Credential, 1).unwrap());
+        verify_pin(&conn, ResourceType::Credential, 1, "1234").unwrap();
+        assert!(!verification_required(&conn, ResourceType::Credential, 1).unwrap());
+
+        relock(&conn, ResourceType::Credential, 1).unwrap();
+        assert!(verification_required(&conn, ResourceType::Credential, 1).unwrap());
     }
 
     #[test]
