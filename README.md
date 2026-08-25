@@ -57,17 +57,21 @@ A key's split tree is described as a JSON file, e.g. `tree.json`:
 
 ```sh
 keyquorum key split --tree-spec tree.json --label "escrow demo"
-keyquorum key tree 1
-keyquorum key reconstruct 1 --share-file 1=alice_share.hex --share-file 2=bob_share.hex
+keyquorum key tree <key-id>
+keyquorum key reconstruct <key-id> --share-file <alice-node-id>=alice_share.hex --share-file <bob-node-id>=bob_share.hex
 
 keyquorum access quorum --state 0 --source ./secret.txt --encrypted-path ./secret.txt.kqenc --tree-spec tree.json
-keyquorum access quorum --status --id 1
-keyquorum access quorum --state 1 --id 1 --share-file 1=alice_share.hex --share-file 2=bob_share.hex
+keyquorum access quorum --status --id <file-id>
+keyquorum access quorum --state 1 --id <file-id> --share-file <alice-node-id>=alice_share.hex --share-file <bob-node-id>=bob_share.hex
 ```
 
-`--share-file` is keyed by each leaf's own node id (shown by `key tree`/
-`--status`), not its hardware key id — the same hardware key can back more
-than one leaf, so only the node id is guaranteed unique.
+`<key-id>` and `<file-id>` are printed by `key split`/`access quorum
+--state 0` ("Split key 1" / "Locked file 1"). `<alice-node-id>` and
+`<bob-node-id>` are each leaf's own node id, printed by `key tree`/
+`access quorum --status` — copy them from there. `--share-file` is keyed
+by that node id, not the `hardware_key_id` values from the tree-spec JSON
+above (a different, unrelated set of ids) — the same hardware key can
+back more than one leaf, so only the node id is guaranteed unique.
 
 ### Password-protected files and credentials
 

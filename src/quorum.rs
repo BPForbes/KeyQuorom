@@ -54,8 +54,8 @@ pub fn lock_file(
 
     locked_files::write_owner_only(encrypted_path, &ciphertext)?;
 
-    let tx = conn.transaction()?;
     let result = (|| -> Result<i64> {
+        let tx = conn.transaction()?;
         let key_id = key_tree::build_tree(&tx, &name, &data_key[..], tree_spec)?;
         tx.execute(
             "INSERT INTO files (name, encrypted_path, key_id, nonce) VALUES (?1, ?2, ?3, ?4)",
@@ -66,10 +66,11 @@ pub fn lock_file(
         Ok(file_id)
     })();
 
-    // Commit failure goes through this same arm as every other failure in
-    // the closure above, so the just-written ciphertext is always cleaned
-    // up on any failure — including one that happens after a successful
-    // insert, at commit time itself.
+    // Everything that can fail — starting the transaction, building the
+    // key tree, the insert, the commit — lives inside the closure above
+    // and flows through this one `result`, so the just-written ciphertext
+    // is always cleaned up on any failure, including one that happens
+    // before a transaction ever opens (e.g. `conn` already has one active).
     if result.is_err() {
         let _ = fs::remove_file(encrypted_path);
     }
@@ -303,6 +304,38 @@ mod tests {
         let result = lock_file(&mut conn, &source_path, &encrypted_path, None, &spec);
         assert!(matches!(result, Err(Error::InvalidQuorumThreshold)));
         assert!(!encrypted_path.exists());
+    }
+
+    #[test]
+    fn lock_cleans_up_ciphertext_when_starting_the_transaction_fails() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_a, _sk_a) = register_encryption_key(&conn, "a");
+
+        let spec = NodeSpec::Leaf {
+            label: "a".into(),
+            hardware_key_id: id_a,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source_path = dir.path().join("secret.txt");
+        let encrypted_path = dir.path().join("secret.txt.kqenc");
+        fs::write(&source_path, b"the quorum has been reached").unwrap();
+
+        // Force conn.transaction() to fail inside lock_file: open a
+        // transaction on this same connection first, via raw SQL rather
+        // than rusqlite's Transaction guard (which would hold a Rust-level
+        // borrow on `conn` and conflict with passing `&mut conn` below).
+        conn.execute_batch("BEGIN").expect("BEGIN should succeed");
+
+        let result = lock_file(&mut conn, &source_path, &encrypted_path, None, &spec);
+        assert!(result.is_err());
+        assert!(
+            !encrypted_path.exists(),
+            "ciphertext should be cleaned up even when the transaction never opens"
+        );
+
+        conn.execute_batch("ROLLBACK")
+            .expect("ROLLBACK should succeed");
     }
 
     #[test]

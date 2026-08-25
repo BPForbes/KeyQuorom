@@ -85,11 +85,28 @@ fn encode_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// A handful of X25519 curve points have small order and, under
+/// Diffie-Hellman with *any* scalar, always yield an all-zero shared
+/// secret (RFC 7748) — the trivial case is 32 zero bytes. Sealing to one
+/// of these would produce a bundle anyone could open without any private
+/// key at all. Detecting this needs only one clamped scalar (clamping
+/// forces it to be a multiple of the curve's cofactor, so every low-order
+/// point collapses to zero the same way regardless of which one is used);
+/// the probe scalar's value is otherwise irrelevant and is never used for
+/// real encryption.
+fn is_weak_x25519_public_key(public_key: &[u8; 32]) -> bool {
+    x25519_dalek::x25519([1u8; 32], *public_key) == [0u8; 32]
+}
+
 fn encode_bundle(
     bundle_type: u8,
     recipient_public_key: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
+    if is_weak_x25519_public_key(recipient_public_key) {
+        return Err(Error::InvalidPublicKey);
+    }
+
     let public_key = crypto_box::PublicKey::from_bytes(*recipient_public_key);
     let sealed_payload = public_key
         .seal(&mut rand::rngs::OsRng, plaintext)
@@ -266,5 +283,15 @@ mod tests {
 
         let result = export_credential(&conn, credential_id, "master-pw", &public_key);
         assert!(matches!(result, Err(Error::BundleFieldTooLarge)));
+    }
+
+    #[test]
+    fn export_rejects_an_all_zero_recipient_public_key() {
+        let conn = db::open_in_memory().expect("schema should apply");
+        let credential_id = vault::add_credential(&conn, "Email", None, "s3cr3t", "master-pw")
+            .expect("add_credential should succeed");
+
+        let result = export_credential(&conn, credential_id, "master-pw", &[0u8; 32]);
+        assert!(matches!(result, Err(Error::InvalidPublicKey)));
     }
 }

@@ -15,7 +15,7 @@ use keyquorum::keys::KeyType;
 use keyquorum::pin::ResourceType;
 use keyquorum::{db, export, key_tree, keys, locked_files, pin, quorum, sharing, signing, vault};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -658,6 +658,7 @@ fn print_tree_node(node: &TreeNodeSummary, depth: usize) {
 fn collect_shares(root: &TreeNodeSummary, share_files: &[String]) -> Result<HashMap<i64, Vec<u8>>> {
     let mut leaves = Vec::new();
     collect_leaves(root, &mut leaves);
+    let leaf_ids: HashSet<i64> = leaves.iter().map(|(node_id, _, _)| *node_id).collect();
 
     let mut by_node_id: HashMap<i64, Vec<u8>> = HashMap::new();
     for entry in share_files {
@@ -667,6 +668,17 @@ fn collect_shares(root: &TreeNodeSummary, share_files: &[String]) -> Result<Hash
         let node_id: i64 = node_id_str
             .parse()
             .unwrap_or_else(|_| fatal_usage_error("--share-file's node_id must be an integer"));
+        if !leaf_ids.contains(&node_id) {
+            fatal_usage_error(&format!(
+                "--share-file references node {node_id}, which isn't a leaf in this tree \
+                 (see `key tree`/`--status` for valid leaf node ids)"
+            ));
+        }
+        if by_node_id.contains_key(&node_id) {
+            fatal_usage_error(&format!(
+                "--share-file for node {node_id} was given more than once"
+            ));
+        }
         let bytes = read_hex_bytes(Path::new(path))?;
         by_node_id.insert(node_id, bytes);
     }
