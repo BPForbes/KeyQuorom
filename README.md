@@ -4,34 +4,105 @@ KeyQuorum is a secure file-sharing system centered on hardware key sharing. File
 
 ## Status
 
-Early scaffolding. Core architecture, encryption scheme, and hardware-key protocol are still being designed and implemented.
+Early scaffolding, though the CLI now covers most of what the concept below describes.
+Hardware-key quorum splitting/reconstruction is implemented in software (keys are
+software keypairs today, not real hardware tokens yet — see Roadmap). No real
+hardware/USB integration exists.
 
 ## Concept
 
-- Files are encrypted at rest and bound to one or more registered hardware tokens.
-- Unlocking a protected file requires presenting a quorum of the registered keys, rather than a single token or password.
-- The goal is layered, hardware-backed access control that resists single-point compromise (a lost or stolen token alone should not be enough to unlock protected data).
+- A key — the data key protecting a file, or a secret split for its own sake — can be
+  divided recursively: split into parts, any of which can itself be split further,
+  forming a tree (e.g. a company master key splits across departments, and one
+  department's own share splits again across its team). A flat "M-of-N hardware keys"
+  quorum is just the simplest one-level tree.
+- Unlocking a protected file means reconstructing its key's tree: presenting a quorum of
+  the registered keys, rather than a single token or password.
+- The goal is layered, hardware-backed access control that resists single-point
+  compromise (a lost or stolen key alone should not be enough to unlock protected data).
 
 ## Getting Started
 
 Build the CLI with `cargo build --release`; the binary is `target/release/keyquorum`.
+Passwords, PINs, and raw quorum shares are always prompted for interactively (or read
+from a `--share-file`) rather than taken as plain arguments. Run `keyquorum --help` for
+the full command list.
 
-The hardware-key quorum flow isn't implemented yet, but the CLI already covers what's
-built so far — the password vault, password-locked files, and share links:
+### Keys
 
 ```sh
-keyquorum lock ./secret.txt ./secret.txt.kqenc
-keyquorum unlock 1 --output ./secret.txt
+# Generate a keypair. The private key is printed to stdout ONCE and never
+# written to disk by this tool — redirect it yourself.
+keyquorum key generate --type encryption --public-key-out alice.pub > alice.key
+keyquorum key register --type encryption --label alice --public-key-file alice.pub
+keyquorum key list
+```
+
+### Splitting a key (standalone escrow, or protecting a file)
+
+A key's split tree is described as a JSON file, e.g. `tree.json`:
+
+```json
+{
+  "label": "root", "threshold": 2,
+  "children": [
+    { "label": "alice", "hardware_key_id": 1 },
+    { "label": "dept", "threshold": 1, "children": [
+        { "label": "bob", "hardware_key_id": 2 },
+        { "label": "carol", "hardware_key_id": 3 }
+    ]}
+  ]
+}
+```
+
+```sh
+keyquorum key split --tree-spec tree.json --label "escrow demo"
+keyquorum key tree 1
+keyquorum key reconstruct 1 --share-file 1=alice_share.hex --share-file 2=bob_share.hex
+
+keyquorum access quorum --state 0 ./secret.txt ./secret.txt.kqenc --tree-spec tree.json
+keyquorum access quorum --status --id 1
+keyquorum access quorum --state 1 --id 1 --share-file 1=alice_share.hex --share-file 2=bob_share.hex
+```
+
+### Password-protected files and credentials
+
+```sh
+keyquorum access password --state 0 --source ./secret.txt --encrypted-path ./secret.txt.kqenc
+keyquorum access password --state 1 --id 1 --output ./secret.txt
 
 keyquorum vault add "Email" --username alice
 keyquorum vault get 1
+```
 
-keyquorum share create-file 1 --ttl-seconds 3600
+Either can also take `--pin` to require a 4-digit PIN (attempt-limited, FIDO2-PIN-style)
+alongside the password.
+
+### Signature verification, export, and sharing
+
+```sh
+keyquorum verify --public-key-file signer.pub --message-file msg.txt --signature-file msg.sig
+
+keyquorum export credential 1 --recipient-key-file bob.pub --output cred.kqxb
+keyquorum export file 1 --recipient-key-file bob.pub --output file.kqxb
+
+keyquorum share create-file 1 --ttl-seconds 3600 --pin
 keyquorum share redeem-file
 ```
 
-Passwords and share tokens are always prompted for interactively rather than taken as
-arguments. Run `keyquorum --help` for the full command list.
+## Roadmap
+
+These are deliberately not implemented — not stubbed, just not yet built — because they
+all need a private-key custody model (a software file? the OS keychain? real hardware?)
+that hasn't been decided:
+
+- **Persisted private-key custody** for `key generate` (today the private key only ever
+  goes to stdout).
+- **`key unwrap-share`** — turning a stored, sealed quorum share back into the raw share
+  a hardware key's own private key would produce.
+- **`sign`** — producing a signature (`verify` is implemented).
+- **`import`** — opening an `export` bundle on the receiving end (the bundle format and
+  encoder are already final).
 
 ## Security
 

@@ -43,7 +43,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("query should succeed");
-        assert_eq!(table_count, 8);
+        assert_eq!(table_count, 10);
     }
 
     #[test]
@@ -53,201 +53,119 @@ mod tests {
             .expect("re-applying schema should not error");
     }
 
+    fn seed_encryption_key(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO hardware_keys (id, label, key_type, fingerprint, public_key)
+             VALUES (?1, 'enc-key', 'encryption', ?2, x'01')",
+            params![id, format!("fp-enc-{id}")],
+        )
+        .expect("seed encryption hardware_keys row");
+    }
+
+    fn seed_signing_key(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO hardware_keys (id, label, key_type, fingerprint, public_key)
+             VALUES (?1, 'sign-key', 'signing', ?2, x'02')",
+            params![id, format!("fp-sign-{id}")],
+        )
+        .expect("seed signing hardware_keys row");
+    }
+
+    fn seed_key(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO keys (id, label) VALUES (?1, 'test-key')",
+            params![id],
+        )
+        .expect("seed keys row");
+    }
+
     #[test]
-    fn quorum_threshold_must_be_positive() {
+    fn key_node_leaf_backed_by_signing_key_is_blocked() {
         let conn = open_in_memory().expect("schema should apply");
+        seed_signing_key(&conn, 1);
+        seed_key(&conn, 1);
+
         let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', 0)",
+            "INSERT INTO key_nodes (key_id, label, hardware_key_id, wrapped_share)
+             VALUES (1, 'leaf', 1, x'aa')",
             [],
         );
         assert!(result.is_err());
     }
 
     #[test]
-    fn file_key_share_requires_known_file_and_key() {
+    fn key_node_leaf_backed_by_encryption_key_is_allowed() {
         let conn = open_in_memory().expect("schema should apply");
-        let result = conn.execute(
-            "INSERT INTO file_key_shares (file_id, hardware_key_id, wrapped_share)
-             VALUES (1, 1, x'00')",
-            [],
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn quorum_threshold_accepts_valid_integer() {
-        let conn = open_in_memory().expect("schema should apply");
-        let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', 2)",
-            [],
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn quorum_threshold_rejects_non_integer_numeric_value() {
-        let conn = open_in_memory().expect("schema should apply");
-        let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', ?1)",
-            params![0.5_f64],
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn quorum_threshold_rejects_non_numeric_text() {
-        let conn = open_in_memory().expect("schema should apply");
-        let result = conn.execute(
-            "INSERT INTO files (name, encrypted_path, quorum_threshold)
-             VALUES ('secret.txt', '/data/secret.txt.enc', ?1)",
-            params!["abc"],
-        );
-        assert!(result.is_err());
-    }
-
-    /// Seeds a 2-of-2 file: both registered hardware keys are required to
-    /// meet the quorum, so neither backing share has any slack.
-    fn seed_two_of_two_file(conn: &Connection) {
-        conn.execute(
-            "INSERT INTO hardware_keys (id, label, fingerprint, public_key) VALUES
-             (1, 'key-a', 'fp-a', x'01'),
-             (2, 'key-b', 'fp-b', x'02')",
-            [],
-        )
-        .expect("seed hardware_keys");
-        conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, quorum_threshold)
-             VALUES (1, 'secret.txt', '/data/secret.txt.enc', 2)",
-            [],
-        )
-        .expect("seed files");
-        conn.execute(
-            "INSERT INTO file_key_shares (file_id, hardware_key_id, wrapped_share) VALUES
-             (1, 1, x'aa'),
-             (1, 2, x'bb')",
-            [],
-        )
-        .expect("seed file_key_shares");
-    }
-
-    #[test]
-    fn deleting_hardware_key_backing_a_share_is_blocked() {
-        let conn = open_in_memory().expect("schema should apply");
-        seed_two_of_two_file(&conn);
-        let result = conn.execute("DELETE FROM hardware_keys WHERE id = 1", []);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn removing_last_required_share_is_blocked() {
-        let conn = open_in_memory().expect("schema should apply");
-        seed_two_of_two_file(&conn);
-        let result = conn.execute(
-            "DELETE FROM file_key_shares WHERE file_id = 1 AND hardware_key_id = 1",
-            [],
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn removing_a_surplus_share_is_allowed() {
-        let conn = open_in_memory().expect("schema should apply");
-        conn.execute(
-            "INSERT INTO hardware_keys (id, label, fingerprint, public_key) VALUES
-             (1, 'key-a', 'fp-a', x'01'),
-             (2, 'key-b', 'fp-b', x'02')",
-            [],
-        )
-        .expect("seed hardware_keys");
-        // 1-of-2: quorum only needs one key, so two registered shares
-        // leaves one to spare.
-        conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, quorum_threshold)
-             VALUES (1, 'secret.txt', '/data/secret.txt.enc', 1)",
-            [],
-        )
-        .expect("seed files");
-        conn.execute(
-            "INSERT INTO file_key_shares (file_id, hardware_key_id, wrapped_share) VALUES
-             (1, 1, x'aa'),
-             (1, 2, x'bb')",
-            [],
-        )
-        .expect("seed file_key_shares");
+        seed_encryption_key(&conn, 1);
+        seed_key(&conn, 1);
 
         let result = conn.execute(
-            "DELETE FROM file_key_shares WHERE file_id = 1 AND hardware_key_id = 1",
+            "INSERT INTO key_nodes (key_id, label, hardware_key_id, wrapped_share)
+             VALUES (1, 'leaf', 1, x'aa')",
             [],
         );
         assert!(result.is_ok());
     }
 
     #[test]
-    fn raising_quorum_threshold_above_share_count_is_blocked() {
+    fn key_node_rejects_mixed_split_and_leaf_shape() {
         let conn = open_in_memory().expect("schema should apply");
-        seed_two_of_two_file(&conn);
-        let result = conn.execute("UPDATE files SET quorum_threshold = 3 WHERE id = 1", []);
-        assert!(result.is_err());
-    }
+        seed_encryption_key(&conn, 1);
+        seed_key(&conn, 1);
 
-    #[test]
-    fn lowering_quorum_threshold_is_allowed() {
-        let conn = open_in_memory().expect("schema should apply");
-        seed_two_of_two_file(&conn);
-        let result = conn.execute("UPDATE files SET quorum_threshold = 1 WHERE id = 1", []);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn moving_a_required_share_to_another_file_is_blocked() {
-        let conn = open_in_memory().expect("schema should apply");
-        seed_two_of_two_file(&conn);
-        conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, quorum_threshold)
-             VALUES (2, 'other.txt', '/data/other.txt.enc', 1)",
-            [],
-        )
-        .expect("seed second file");
-
+        // threshold set alongside hardware_key_id/wrapped_share: neither a
+        // clean split node nor a clean leaf.
         let result = conn.execute(
-            "UPDATE file_key_shares SET file_id = 2 WHERE file_id = 1 AND hardware_key_id = 1",
+            "INSERT INTO key_nodes (key_id, label, threshold, hardware_key_id, wrapped_share)
+             VALUES (1, 'bad', 2, 1, x'aa')",
             [],
         );
         assert!(result.is_err());
     }
 
     #[test]
-    fn moving_a_surplus_share_to_another_file_is_allowed() {
+    fn key_node_rejects_neither_split_nor_leaf_shape() {
         let conn = open_in_memory().expect("schema should apply");
-        conn.execute(
-            "INSERT INTO hardware_keys (id, label, fingerprint, public_key) VALUES
-             (1, 'key-a', 'fp-a', x'01'),
-             (2, 'key-b', 'fp-b', x'02')",
-            [],
-        )
-        .expect("seed hardware_keys");
-        conn.execute(
-            "INSERT INTO files (id, name, encrypted_path, quorum_threshold) VALUES
-             (1, 'secret.txt', '/data/secret.txt.enc', 1),
-             (2, 'other.txt', '/data/other.txt.enc', 1)",
-            [],
-        )
-        .expect("seed files");
-        conn.execute(
-            "INSERT INTO file_key_shares (file_id, hardware_key_id, wrapped_share) VALUES
-             (1, 1, x'aa'),
-             (1, 2, x'bb')",
-            [],
-        )
-        .expect("seed file_key_shares");
+        seed_key(&conn, 1);
 
-        // File 1 is 1-of-2, so moving key 1's share to file 2 still leaves
-        // file 1 with one share, satisfying its threshold.
         let result = conn.execute(
-            "UPDATE file_key_shares SET file_id = 2 WHERE file_id = 1 AND hardware_key_id = 1",
+            "INSERT INTO key_nodes (key_id, label) VALUES (1, 'empty')",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn key_node_split_node_is_allowed() {
+        let conn = open_in_memory().expect("schema should apply");
+        seed_key(&conn, 1);
+
+        let result = conn.execute(
+            "INSERT INTO key_nodes (key_id, label, threshold) VALUES (1, 'split', 2)",
+            [],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn files_key_id_must_reference_an_existing_key() {
+        let conn = open_in_memory().expect("schema should apply");
+        let result = conn.execute(
+            "INSERT INTO files (name, encrypted_path, key_id, nonce)
+             VALUES ('secret.txt', '/data/secret.txt.enc', 999, x'00')",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn files_key_id_referencing_an_existing_key_is_allowed() {
+        let conn = open_in_memory().expect("schema should apply");
+        seed_key(&conn, 1);
+
+        let result = conn.execute(
+            "INSERT INTO files (name, encrypted_path, key_id, nonce)
+             VALUES ('secret.txt', '/data/secret.txt.enc', 1, x'00')",
             [],
         );
         assert!(result.is_ok());

@@ -37,6 +37,27 @@ fn hash_token(token: &str) -> Result<String> {
     Ok(hex::encode(Sha256::digest(raw)))
 }
 
+/// Resolves a bearer token to its share row's own id, without consuming a
+/// use — needed so a PIN-protected share (see `pin.rs`) can be checked
+/// *before* redemption consumes what might be its only remaining use.
+fn share_id_for_token(conn: &Connection, table: &str, token: &str) -> Result<i64> {
+    let token_hash = hash_token(token)?;
+    conn.query_row(
+        &format!("SELECT id FROM {table} WHERE token_hash = ?1"),
+        params![token_hash],
+        |row| row.get(0),
+    )
+    .map_err(|_| Error::InvalidShareToken)
+}
+
+pub fn credential_share_id_for_token(conn: &Connection, token: &str) -> Result<i64> {
+    share_id_for_token(conn, "credential_shares", token)
+}
+
+pub fn file_share_id_for_token(conn: &Connection, token: &str) -> Result<i64> {
+    share_id_for_token(conn, "file_shares", token)
+}
+
 fn create_share(
     conn: &Connection,
     table: &str,
@@ -220,6 +241,23 @@ mod tests {
         let conn = db::open_in_memory().expect("schema should apply");
         let result = redeem_credential_share(&conn, "not-a-real-token");
         assert!(matches!(result, Err(Error::InvalidShareToken)));
+    }
+
+    #[test]
+    fn share_id_for_token_resolves_without_consuming_a_use() {
+        let conn = db::open_in_memory().expect("schema should apply");
+        let credential_id = seed_credential(&conn);
+        let share = create_credential_share(&conn, credential_id, 3600, Some(1))
+            .expect("create_credential_share should succeed");
+
+        let peeked = credential_share_id_for_token(&conn, &share.token)
+            .expect("credential_share_id_for_token should succeed");
+        assert_eq!(peeked, share.id);
+
+        // Peeking didn't consume the single allowed use.
+        let resolved = redeem_credential_share(&conn, &share.token)
+            .expect("redeem_credential_share should still succeed");
+        assert_eq!(resolved, credential_id);
     }
 
     #[test]
