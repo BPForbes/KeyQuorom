@@ -18,8 +18,8 @@ hex = "0.4"
 base64 = "0.22"
 zeroize = "1"
 clap = { version = "4", features = ["derive"] }
-rpassword = "7"
-sharks = "0.5"
+rpassword = "7.5"
+blahaj = "0.6"
 crypto_box = { version = "0.9", features = ["seal"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde = { version = "1", features = ["derive"] }

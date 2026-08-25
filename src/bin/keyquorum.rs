@@ -146,8 +146,9 @@ enum KeyCommand {
     /// Reconstruct a key's secret from raw shares
     Reconstruct {
         key_id: i64,
-        /// hardware_key_id=path-to-hex-encoded-raw-share (repeatable); any
-        /// leaf not covered here is prompted for interactively instead
+        /// node_id=path-to-hex-encoded-raw-share (repeatable; node_id is a
+        /// leaf's id as shown by `key tree`). Any leaf not covered here is
+        /// prompted for interactively instead
         #[arg(long = "share-file")]
         share_files: Vec<String>,
     },
@@ -205,7 +206,8 @@ struct AccessQuorumArgs {
     /// state 1 / --status: which quorum-protected file
     #[arg(long)]
     id: Option<i64>,
-    /// state 1 only: hardware_key_id=path-to-hex-encoded-raw-share (repeatable)
+    /// state 1 only: node_id=path-to-hex-encoded-raw-share (repeatable;
+    /// node_id is a leaf's id as shown by `--status`)
     #[arg(long = "share-file")]
     share_files: Vec<String>,
     /// state 1 only: write plaintext here instead of stdout
@@ -626,13 +628,15 @@ fn print_tree_node(node: &TreeNodeSummary, depth: usize) {
     let indent = "  ".repeat(depth);
     match &node.hardware_key_label {
         Some(label) => println!(
-            "{indent}{} -> hardware key {} ({label})",
+            "{indent}{} (node {}) -> hardware key {} ({label})",
             node.label,
+            node.id,
             node.hardware_key_id.unwrap_or(-1)
         ),
         None => println!(
-            "{indent}{} [{} of {}]",
+            "{indent}{} (node {}) [{} of {}]",
             node.label,
+            node.id,
             node.threshold.unwrap_or(0),
             node.children.len()
         ),
@@ -643,35 +647,39 @@ fn print_tree_node(node: &TreeNodeSummary, depth: usize) {
 }
 
 /// Gathers raw shares for every leaf in `root`: from `--share-file
-/// hardware_key_id=path` entries first, falling back to a hidden prompt
-/// per remaining leaf (blank entry = skip that leaf). Never accepts a raw
-/// share as a literal argv value — individually a share leaks nothing,
-/// but threshold-many together reconstruct the real secret and would sit
-/// exposed in `ps` while the command runs.
+/// node_id=path` entries first, falling back to a hidden prompt per
+/// remaining leaf (blank entry = skip that leaf). Keyed by each leaf's own
+/// `node_id` rather than its `hardware_key_id`, since the same hardware
+/// key can legitimately back more than one leaf (e.g. present in two
+/// different branches) — hardware_key_id alone can't tell those apart.
+/// Never accepts a raw share as a literal argv value — individually a
+/// share leaks nothing, but threshold-many together reconstruct the real
+/// secret and would sit exposed in `ps` while the command runs.
 fn collect_shares(root: &TreeNodeSummary, share_files: &[String]) -> Result<HashMap<i64, Vec<u8>>> {
     let mut leaves = Vec::new();
     collect_leaves(root, &mut leaves);
 
-    let mut by_hardware_key: HashMap<i64, Vec<u8>> = HashMap::new();
+    let mut by_node_id: HashMap<i64, Vec<u8>> = HashMap::new();
     for entry in share_files {
-        let (hardware_key_id_str, path) = entry.split_once('=').unwrap_or_else(|| {
-            fatal_usage_error("--share-file must be in the form hardware_key_id=path")
-        });
-        let hardware_key_id: i64 = hardware_key_id_str.parse().unwrap_or_else(|_| {
-            fatal_usage_error("--share-file's hardware_key_id must be an integer")
-        });
+        let (node_id_str, path) = entry
+            .split_once('=')
+            .unwrap_or_else(|| fatal_usage_error("--share-file must be in the form node_id=path"));
+        let node_id: i64 = node_id_str
+            .parse()
+            .unwrap_or_else(|_| fatal_usage_error("--share-file's node_id must be an integer"));
         let bytes = read_hex_bytes(Path::new(path))?;
-        by_hardware_key.insert(hardware_key_id, bytes);
+        by_node_id.insert(node_id, bytes);
     }
 
     let mut shares = HashMap::new();
     for (node_id, hardware_key_id, label) in &leaves {
-        if let Some(bytes) = by_hardware_key.remove(hardware_key_id) {
+        if let Some(bytes) = by_node_id.remove(node_id) {
             shares.insert(*node_id, bytes);
             continue;
         }
-        let prompt =
-            format!("Share for '{label}' (hardware key {hardware_key_id}, hex, blank to skip): ");
+        let prompt = format!(
+            "Share for '{label}' (node {node_id}, hardware key {hardware_key_id}, hex, blank to skip): "
+        );
         let entered = prompt_secret(&prompt)?;
         let trimmed = entered.trim();
         if !trimmed.is_empty() {

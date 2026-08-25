@@ -12,13 +12,13 @@
 
 use crate::error::{Error, Result};
 use crate::keys;
+use blahaj::{Share, Sharks};
 use rusqlite::{params, Connection, Row};
 use serde::Deserialize;
-use sharks::{Share, Sharks};
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum NodeSpec {
     Leaf {
         label: String,
@@ -72,7 +72,17 @@ fn validate_node(conn: &Connection, spec: &NodeSpec, leaf_count: &mut usize) -> 
             children,
             ..
         } => {
-            if children.is_empty() || *threshold == 0 || (*threshold as usize) > children.len() {
+            // Sharks/blahaj operate over GF(256): a Split with more than
+            // 255 children would exhaust the available non-zero
+            // x-coordinates, which downstream would silently produce
+            // fewer shares than children (see the shares.len() check in
+            // split_node) rather than erroring here where the problem is
+            // obvious.
+            if children.is_empty()
+                || *threshold == 0
+                || (*threshold as usize) > children.len()
+                || children.len() > 255
+            {
                 return Err(Error::InvalidQuorumThreshold);
             }
             for child in children {
@@ -158,6 +168,13 @@ fn split_node(
                 .take(children.len())
                 .collect();
 
+            // zip() would otherwise silently stop at the shorter side,
+            // dropping trailing children without any error if the dealer
+            // ever produced fewer shares than requested.
+            if shares.len() != children.len() {
+                return Err(Error::InvalidQuorumThreshold);
+            }
+
             for (child_spec, share) in children.iter().zip(shares.iter()) {
                 let raw_share: Vec<u8> = Vec::from(share);
                 split_node(conn, key_id, Some(node_id), &raw_share, child_spec)?;
@@ -221,8 +238,13 @@ fn reconstruct_node(
             break;
         }
         if let Ok(value) = reconstruct_node(conn, child_id, raw_shares) {
-            let share = Share::try_from(value.as_slice()).map_err(|_| Error::QuorumNotMet)?;
-            resolved.push(share);
+            // A malformed share (wrong length, mistyped hex, ...) is
+            // treated the same as an unresolved child rather than
+            // aborting the whole reconstruction — other valid children
+            // may still be enough to meet this node's threshold.
+            if let Ok(share) = Share::try_from(value.as_slice()) {
+                resolved.push(share);
+            }
         }
     }
 
@@ -373,6 +395,55 @@ mod tests {
         shares.insert(leaves[&"b".to_string()], raw_b);
 
         let recovered = reconstruct(&conn, key_id, &shares).expect("reconstruct should succeed");
+        assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn reconstruct_skips_a_malformed_share_instead_of_aborting() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_a, _sk_a) = register_encryption_key(&conn, "a");
+        let (id_b, sk_b) = register_encryption_key(&conn, "b");
+        let (id_c, sk_c) = register_encryption_key(&conn, "c");
+
+        let spec = NodeSpec::Split {
+            label: "root".into(),
+            threshold: 2,
+            children: vec![
+                NodeSpec::Leaf {
+                    label: "a".into(),
+                    hardware_key_id: id_a,
+                },
+                NodeSpec::Leaf {
+                    label: "b".into(),
+                    hardware_key_id: id_b,
+                },
+                NodeSpec::Leaf {
+                    label: "c".into(),
+                    hardware_key_id: id_c,
+                },
+            ],
+        };
+
+        let secret = b"the quorum has been reached!!!!".to_vec();
+        let key_id = split(&mut conn, "flat", &secret, &spec).expect("split should succeed");
+
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let raw_b = unwrap_leaf_share(&conn, leaves[&"b".to_string()], &sk_b);
+        let raw_c = unwrap_leaf_share(&conn, leaves[&"c".to_string()], &sk_c);
+
+        // A genuinely malformed "share" (not valid Share-encoded bytes)
+        // for `a` — the first leaf tried, in id order, since children are
+        // inserted in spec order — alongside two real, correctly-unwrapped
+        // shares for b and c. Before the fix, hitting the malformed entry
+        // while still under threshold aborted the *entire* reconstruction
+        // via `?`, never even trying b or c.
+        let mut shares = HashMap::new();
+        shares.insert(leaves[&"a".to_string()], vec![0xFF]);
+        shares.insert(leaves[&"b".to_string()], raw_b);
+        shares.insert(leaves[&"c".to_string()], raw_c);
+
+        let recovered = reconstruct(&conn, key_id, &shares)
+            .expect("reconstruct should succeed despite one malformed share");
         assert_eq!(recovered, secret);
     }
 
@@ -554,6 +625,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_more_than_255_children() {
+        let conn = db::open_in_memory().expect("schema should apply");
+        let (id_a, _) = register_encryption_key(&conn, "a");
+
+        let spec = NodeSpec::Split {
+            label: "root".into(),
+            threshold: 1,
+            children: (0..256)
+                .map(|i| NodeSpec::Leaf {
+                    label: format!("leaf-{i}"),
+                    hardware_key_id: id_a,
+                })
+                .collect(),
+        };
+
+        assert!(matches!(
+            validate(&conn, &spec),
+            Err(Error::InvalidQuorumThreshold)
+        ));
+    }
+
+    #[test]
     fn validate_rejects_zero_threshold() {
         let conn = db::open_in_memory().expect("schema should apply");
         let (id_a, _) = register_encryption_key(&conn, "a");
@@ -643,5 +736,19 @@ mod tests {
             .collect();
         assert!(labels.contains(&"alice".to_string()));
         assert!(labels.contains(&"bob".to_string()));
+    }
+
+    #[test]
+    fn node_spec_rejects_an_object_mixing_leaf_and_split_fields() {
+        let json = r#"{"label": "confused", "hardware_key_id": 1, "threshold": 2, "children": []}"#;
+        let result: std::result::Result<NodeSpec, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn node_spec_rejects_an_unexpected_field() {
+        let json = r#"{"label": "leaf", "hardware_key_id": 1, "extra": true}"#;
+        let result: std::result::Result<NodeSpec, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 }

@@ -60,10 +60,14 @@ keyquorum key split --tree-spec tree.json --label "escrow demo"
 keyquorum key tree 1
 keyquorum key reconstruct 1 --share-file 1=alice_share.hex --share-file 2=bob_share.hex
 
-keyquorum access quorum --state 0 ./secret.txt ./secret.txt.kqenc --tree-spec tree.json
+keyquorum access quorum --state 0 --source ./secret.txt --encrypted-path ./secret.txt.kqenc --tree-spec tree.json
 keyquorum access quorum --status --id 1
 keyquorum access quorum --state 1 --id 1 --share-file 1=alice_share.hex --share-file 2=bob_share.hex
 ```
+
+`--share-file` is keyed by each leaf's own node id (shown by `key tree`/
+`--status`), not its hardware key id — the same hardware key can back more
+than one leaf, so only the node id is guaranteed unique.
 
 ### Password-protected files and credentials
 

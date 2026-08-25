@@ -84,6 +84,9 @@ pub fn register_key(
     key_type: KeyType,
     public_key: &[u8],
 ) -> Result<i64> {
+    if public_key.len() != 32 {
+        return Err(Error::InvalidPublicKey);
+    }
     let fp = fingerprint(public_key);
     conn.execute(
         "INSERT INTO hardware_keys (label, key_type, fingerprint, public_key) VALUES (?1, ?2, ?3, ?4)",
@@ -171,6 +174,16 @@ mod tests {
         let keys = list_keys(&conn).expect("list_keys should succeed");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].id, id);
+    }
+
+    #[test]
+    fn register_key_rejects_wrong_length_public_key() {
+        let conn = db::open_in_memory().expect("schema should apply");
+        let result = register_key(&conn, "Alice", KeyType::Encryption, &[0u8; 31]);
+        assert!(matches!(result, Err(Error::InvalidPublicKey)));
+
+        let keys = list_keys(&conn).expect("list_keys should succeed");
+        assert!(keys.is_empty());
     }
 
     #[test]

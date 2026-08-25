@@ -108,6 +108,26 @@ mod tests {
     }
 
     #[test]
+    fn key_node_leaf_cannot_be_reassigned_to_a_signing_key_via_update() {
+        let conn = open_in_memory().expect("schema should apply");
+        seed_encryption_key(&conn, 1);
+        seed_signing_key(&conn, 2);
+        seed_key(&conn, 1);
+        conn.execute(
+            "INSERT INTO key_nodes (key_id, label, hardware_key_id, wrapped_share)
+             VALUES (1, 'leaf', 1, x'aa')",
+            [],
+        )
+        .expect("seed key_nodes leaf");
+
+        let result = conn.execute(
+            "UPDATE key_nodes SET hardware_key_id = 2 WHERE key_id = 1 AND label = 'leaf'",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn key_node_rejects_mixed_split_and_leaf_shape() {
         let conn = open_in_memory().expect("schema should apply");
         seed_encryption_key(&conn, 1);

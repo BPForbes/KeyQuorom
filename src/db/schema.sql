@@ -59,6 +59,18 @@ BEGIN
     SELECT RAISE(ABORT, 'cannot make a signing-only hardware key a quorum leaf');
 END;
 
+-- Same guard, for the (currently unused — tree construction is
+-- insert-only) case of a future code path reassigning a leaf's
+-- hardware_key_id via UPDATE.
+CREATE TRIGGER IF NOT EXISTS trg_key_nodes_guard_key_type_on_update
+BEFORE UPDATE OF hardware_key_id ON key_nodes
+FOR EACH ROW
+WHEN NEW.hardware_key_id IS NOT NULL
+AND (SELECT key_type FROM hardware_keys WHERE id = NEW.hardware_key_id) != 'encryption'
+BEGIN
+    SELECT RAISE(ABORT, 'cannot make a signing-only hardware key a quorum leaf');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_key_nodes_parent ON key_nodes (parent_id);
 CREATE INDEX IF NOT EXISTS idx_key_nodes_key ON key_nodes (key_id);
 CREATE INDEX IF NOT EXISTS idx_key_nodes_hardware_key ON key_nodes (hardware_key_id);

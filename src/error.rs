@@ -23,6 +23,7 @@ pub enum Error {
     PinLocked,
     PinNotSet,
     InvalidPin,
+    BundleFieldTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -51,6 +52,9 @@ impl fmt::Display for Error {
             Error::PinLocked => write!(f, "PIN is locked after too many incorrect attempts"),
             Error::PinNotSet => write!(f, "no PIN is set for this resource"),
             Error::InvalidPin => write!(f, "PIN must be exactly 4 digits"),
+            Error::BundleFieldTooLarge => {
+                write!(f, "export bundle field exceeds its encodable length")
+            }
         }
     }
 }

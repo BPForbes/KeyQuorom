@@ -11,6 +11,7 @@ use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 pub struct FileStatus {
     pub id: i64,
@@ -54,25 +55,25 @@ pub fn lock_file(
     locked_files::write_owner_only(encrypted_path, &ciphertext)?;
 
     let tx = conn.transaction()?;
-    let insert = (|| -> Result<i64> {
+    let result = (|| -> Result<i64> {
         let key_id = key_tree::build_tree(&tx, &name, &data_key[..], tree_spec)?;
         tx.execute(
             "INSERT INTO files (name, encrypted_path, key_id, nonce) VALUES (?1, ?2, ?3, ?4)",
             params![name, encrypted_path_str, key_id, nonce.to_vec()],
         )?;
-        Ok(tx.last_insert_rowid())
+        let file_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(file_id)
     })();
 
-    match insert {
-        Ok(file_id) => {
-            tx.commit()?;
-            Ok(file_id)
-        }
-        Err(e) => {
-            let _ = fs::remove_file(encrypted_path);
-            Err(e)
-        }
+    // Commit failure goes through this same arm as every other failure in
+    // the closure above, so the just-written ciphertext is always cleaned
+    // up on any failure — including one that happens after a successful
+    // insert, at commit time itself.
+    if result.is_err() {
+        let _ = fs::remove_file(encrypted_path);
     }
+    result
 }
 
 pub fn status(conn: &Connection, file_id: i64) -> Result<FileStatus> {
@@ -132,8 +133,13 @@ fn reconstruct_and_decrypt(
     nonce: &[u8],
     raw_shares: &HashMap<i64, Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    let data_key = key_tree::reconstruct(conn, key_id, raw_shares)?;
-    let data_key: [u8; crypto::KEY_LEN] = data_key.try_into().map_err(|_| Error::QuorumNotMet)?;
+    let data_key = Zeroizing::new(key_tree::reconstruct(conn, key_id, raw_shares)?);
+    let data_key: Zeroizing<[u8; crypto::KEY_LEN]> = Zeroizing::new(
+        data_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::QuorumNotMet)?,
+    );
     let nonce: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| Error::IntegrityCheckFailed)?;
 
     let ciphertext = fs::read(encrypted_path)?;
