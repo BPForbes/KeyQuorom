@@ -157,6 +157,67 @@ enum KeyCommand {
         #[arg(long = "share-file")]
         share_files: Vec<String>,
     },
+    /// Print the lowest common ancestor of two or more node labels
+    Lca {
+        key_id: i64,
+        /// Node labels as shown by `key tree` (at least two: --node A B)
+        #[arg(long = "node", required = true, num_args = 2..)]
+        nodes: Vec<String>,
+    },
+    /// Evict an active leaf and refresh survivor shares (threshold unchanged)
+    Evict {
+        key_id: i64,
+        /// Leaf node id as shown by `key tree`
+        #[arg(long)]
+        node_id: i64,
+        /// Survivor raw shares: node_id=path-to-hex (repeatable). Every
+        /// remaining active sibling of the evicted leaf must be supplied.
+        #[arg(long = "share-file")]
+        share_files: Vec<String>,
+    },
+    /// Manage cross-branch whitelist entries and established pairings
+    Bridge {
+        #[command(subcommand)]
+        command: BridgeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BridgeCommand {
+    /// Grant --node permission to form a cross-branch link with --peer
+    Allow {
+        key_id: i64,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        peer: String,
+    },
+    /// Revoke that permission and drop any established link between them
+    Deny {
+        key_id: i64,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        peer: String,
+    },
+    /// Establish a pairing if either node's whitelist allows it
+    Add {
+        key_id: i64,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// Tear down an established pairing (whitelist is left intact)
+    Remove {
+        key_id: i64,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
+    /// List whitelist entries and established pairings
+    List { key_id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -458,6 +519,68 @@ fn run_key(conn: &mut Connection, command: KeyCommand) -> Result<()> {
             let secret = key_tree::reconstruct(conn, key_id, &shares)?;
             println!("{}", hex::encode(secret));
         }
+        KeyCommand::Lca { key_id, nodes } => {
+            let tree = key_tree::KeyQuorumTree::load(conn, key_id)?;
+            let mut indices = Vec::with_capacity(nodes.len());
+            for label in &nodes {
+                indices.push(tree.index_by_label(label)?);
+            }
+            let lca_idx = tree.find_lowest_common_ancestor_of(&indices)?;
+            let lca = &tree.nodes[lca_idx];
+            println!("{} (node {})", lca.id, lca.db_id);
+        }
+        KeyCommand::Evict {
+            key_id,
+            node_id,
+            share_files,
+        } => {
+            let summary = key_tree::describe(conn, key_id)?;
+            let shares = collect_shares(&summary.root, &share_files)?;
+            key_tree::evict_and_refresh(conn, key_id, node_id, &shares)?;
+            println!("Evicted node {node_id}; survivor shares refreshed");
+        }
+        KeyCommand::Bridge { command } => run_bridge(conn, command)?,
+    }
+    Ok(())
+}
+
+fn run_bridge(conn: &Connection, command: BridgeCommand) -> Result<()> {
+    match command {
+        BridgeCommand::Allow { key_id, node, peer } => {
+            key_tree::allow_bridge(conn, key_id, &node, &peer)?;
+            println!("Allowed {node} to bridge to {peer}");
+        }
+        BridgeCommand::Deny { key_id, node, peer } => {
+            key_tree::deny_bridge(conn, key_id, &node, &peer)?;
+            println!("Denied {node} bridging to {peer}");
+        }
+        BridgeCommand::Add { key_id, from, to } => {
+            key_tree::add_bridge(conn, key_id, &from, &to)?;
+            println!("Established bridge {from} <-> {to}");
+        }
+        BridgeCommand::Remove { key_id, from, to } => {
+            key_tree::remove_bridge(conn, key_id, &from, &to)?;
+            println!("Removed bridge {from} <-> {to}");
+        }
+        BridgeCommand::List { key_id } => {
+            let listing = key_tree::list_bridges(conn, key_id)?;
+            println!("Allowed:");
+            if listing.allowed.is_empty() {
+                println!("  (none)");
+            } else {
+                for (node, peer) in listing.allowed {
+                    println!("  {node} -> {peer}");
+                }
+            }
+            println!("Established:");
+            if listing.established.is_empty() {
+                println!("  (none)");
+            } else {
+                for link in listing.established {
+                    println!("  {} <-> {}", link.from, link.to);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -660,20 +783,27 @@ fn print_share(share: &sharing::Share) {
 
 fn print_tree_node(node: &TreeNodeSummary, depth: usize) {
     let indent = "  ".repeat(depth);
+    let inactive = if node.is_active { "" } else { " [inactive]" };
     match &node.hardware_key_label {
         Some(label) => println!(
-            "{indent}{} (node {}) -> hardware key {} ({label})",
+            "{indent}{} (node {}){inactive} -> hardware key {} ({label})",
             node.label,
             node.id,
             node.hardware_key_id.unwrap_or(-1)
         ),
         None => println!(
-            "{indent}{} (node {}) [{} of {}]",
+            "{indent}{} (node {}){inactive} [{} of {}]",
             node.label,
             node.id,
             node.threshold.unwrap_or(0),
             node.children.len()
         ),
+    }
+    if !node.allowed_bridges.is_empty() {
+        println!(
+            "{indent}  allowed bridges: {}",
+            node.allowed_bridges.join(", ")
+        );
     }
     for child in &node.children {
         print_tree_node(child, depth + 1);
@@ -739,8 +869,10 @@ fn collect_shares(root: &TreeNodeSummary, share_files: &[String]) -> Result<Hash
 }
 
 fn collect_leaves(node: &TreeNodeSummary, out: &mut Vec<(i64, i64, String)>) {
-    if let Some(hardware_key_id) = node.hardware_key_id {
-        out.push((node.id, hardware_key_id, node.label.clone()));
+    if node.is_active {
+        if let Some(hardware_key_id) = node.hardware_key_id {
+            out.push((node.id, hardware_key_id, node.label.clone()));
+        }
     }
     for child in &node.children {
         collect_leaves(child, out);
@@ -908,6 +1040,70 @@ mod tests {
             "1",
             "--output",
             "plaintext",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn key_bridge_and_lca_parse() {
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "key",
+            "bridge",
+            "allow",
+            "1",
+            "--node",
+            "M.A.1",
+            "--peer",
+            "M.B",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "key",
+            "bridge",
+            "add",
+            "1",
+            "--from",
+            "M.A.1",
+            "--to",
+            "M.B",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "key",
+            "bridge",
+            "remove",
+            "1",
+            "--from",
+            "M.A.1",
+            "--to",
+            "M.B",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "key",
+            "lca",
+            "1",
+            "--node",
+            "M.A.1",
+            "M.A.2",
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["keyquorum", "key", "lca", "1", "--node", "only-one"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "keyquorum",
+            "key",
+            "evict",
+            "1",
+            "--node-id",
+            "5",
+            "--share-file",
+            "3=a.hex",
         ])
         .is_ok());
     }

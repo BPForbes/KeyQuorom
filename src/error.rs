@@ -24,6 +24,13 @@ pub enum Error {
     PinNotSet,
     InvalidPin,
     BundleFieldTooLarge,
+    NodeNotFound,
+    DuplicateNodeLabel,
+    InvalidBridge,
+    BridgeNotWhitelisted,
+    BridgeNotFound,
+    CannotEvict,
+    ShareShapeMismatch,
 }
 
 impl fmt::Display for Error {
@@ -54,6 +61,31 @@ impl fmt::Display for Error {
             Error::InvalidPin => write!(f, "PIN must be exactly 4 digits"),
             Error::BundleFieldTooLarge => {
                 write!(f, "export bundle field exceeds its encodable length")
+            }
+            Error::NodeNotFound => write!(f, "no node with that label or id exists in this key"),
+            Error::DuplicateNodeLabel => {
+                write!(f, "each node label in a key tree must be unique")
+            }
+            Error::InvalidBridge => {
+                write!(
+                    f,
+                    "bridge peer is missing, refers to this node, or is not in this key"
+                )
+            }
+            Error::BridgeNotWhitelisted => {
+                write!(f, "cross-branch link is not whitelisted by either node")
+            }
+            Error::BridgeNotFound => {
+                write!(f, "no established cross-branch link between those nodes")
+            }
+            Error::CannotEvict => {
+                write!(
+                    f,
+                    "this leaf cannot be evicted (not an active leaf, remaining siblings cannot meet the threshold, or a sibling is not a leaf)"
+                )
+            }
+            Error::ShareShapeMismatch => {
+                write!(f, "shares must share an x-coordinate and y-length")
             }
         }
     }

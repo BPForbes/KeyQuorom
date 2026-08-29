@@ -203,18 +203,22 @@ mod tests {
         let spec = NodeSpec::Split {
             label: "root".into(),
             threshold: 2,
+            allowed_bridges: vec![],
             children: vec![
                 NodeSpec::Leaf {
                     label: "a".into(),
                     hardware_key_id: id_a,
+                    allowed_bridges: vec![],
                 },
                 NodeSpec::Leaf {
                     label: "b".into(),
                     hardware_key_id: id_b,
+                    allowed_bridges: vec![],
                 },
                 NodeSpec::Leaf {
                     label: "c".into(),
                     hardware_key_id: id_c,
+                    allowed_bridges: vec![],
                 },
             ],
         };
@@ -252,14 +256,17 @@ mod tests {
         let spec = NodeSpec::Split {
             label: "root".into(),
             threshold: 2,
+            allowed_bridges: vec![],
             children: vec![
                 NodeSpec::Leaf {
                     label: "a".into(),
                     hardware_key_id: id_a,
+                    allowed_bridges: vec![],
                 },
                 NodeSpec::Leaf {
                     label: "b".into(),
                     hardware_key_id: id_b,
+                    allowed_bridges: vec![],
                 },
             ],
         };
@@ -290,9 +297,11 @@ mod tests {
         let spec = NodeSpec::Split {
             label: "root".into(),
             threshold: 2,
+            allowed_bridges: vec![],
             children: vec![NodeSpec::Leaf {
                 label: "a".into(),
                 hardware_key_id: id_a,
+                allowed_bridges: vec![],
             }],
         };
 
@@ -314,6 +323,7 @@ mod tests {
         let spec = NodeSpec::Leaf {
             label: "a".into(),
             hardware_key_id: id_a,
+            allowed_bridges: vec![],
         };
 
         let dir = tempfile::tempdir().expect("tempdir should be created");
@@ -350,14 +360,17 @@ mod tests {
         let spec = NodeSpec::Split {
             label: "root".into(),
             threshold: 1,
+            allowed_bridges: vec![],
             children: vec![
                 NodeSpec::Leaf {
                     label: "signer".into(),
                     hardware_key_id: id,
+                    allowed_bridges: vec![],
                 },
                 NodeSpec::Leaf {
                     label: "b".into(),
                     hardware_key_id: id_b,
+                    allowed_bridges: vec![],
                 },
             ],
         };
@@ -382,14 +395,17 @@ mod tests {
         let spec = NodeSpec::Split {
             label: "root".into(),
             threshold: 1,
+            allowed_bridges: vec![],
             children: vec![
                 NodeSpec::Leaf {
                     label: "a".into(),
                     hardware_key_id: id_a,
+                    allowed_bridges: vec![],
                 },
                 NodeSpec::Leaf {
                     label: "b".into(),
                     hardware_key_id: id_b,
+                    allowed_bridges: vec![],
                 },
             ],
         };

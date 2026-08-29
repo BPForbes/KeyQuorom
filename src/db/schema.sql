@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS key_nodes (
     threshold         INTEGER CHECK (threshold IS NULL OR threshold > 0),
     hardware_key_id   INTEGER REFERENCES hardware_keys(id) ON DELETE RESTRICT,
     wrapped_share     BLOB,
+    -- 0 after a PSS eviction; reconstruct ignores inactive children.
+    is_active         INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
     CHECK (
         (threshold IS NOT NULL AND hardware_key_id IS NULL AND wrapped_share IS NULL)
         OR (threshold IS NULL AND hardware_key_id IS NOT NULL AND wrapped_share IS NOT NULL)
@@ -74,6 +76,27 @@ END;
 CREATE INDEX IF NOT EXISTS idx_key_nodes_parent ON key_nodes (parent_id);
 CREATE INDEX IF NOT EXISTS idx_key_nodes_key ON key_nodes (key_id);
 CREATE INDEX IF NOT EXISTS idx_key_nodes_hardware_key ON key_nodes (hardware_key_id);
+
+-- Supervisor whitelist: node `node_id` may form a cross-branch pairing
+-- with the node whose label is `peer_label` in the same key tree.
+CREATE TABLE IF NOT EXISTS key_node_bridges (
+    node_id     INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+    peer_label  TEXT NOT NULL,
+    PRIMARY KEY (node_id, peer_label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_key_node_bridges_peer
+    ON key_node_bridges (peer_label);
+
+-- Established undirected pairing (no channel key material).
+-- node_a_id < node_b_id so each pair has one row.
+CREATE TABLE IF NOT EXISTS key_node_links (
+    node_a_id       INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+    node_b_id       INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+    established_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (node_a_id, node_b_id),
+    CHECK (node_a_id < node_b_id)
+);
 
 -- A hardware-key-quorum-protected file. No content hash is stored: an
 -- unkeyed hash of the plaintext would leak a fingerprint of it

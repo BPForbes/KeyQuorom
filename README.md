@@ -46,14 +46,29 @@ A key's split tree is described as a JSON file, e.g. `tree.json`:
 {
   "label": "root", "threshold": 2,
   "children": [
-    { "label": "alice", "hardware_key_id": 1 },
+    { "label": "alice", "hardware_key_id": 1, "allowed_bridges": ["it"] },
     { "label": "dept", "threshold": 1, "children": [
         { "label": "bob", "hardware_key_id": 2 },
         { "label": "carol", "hardware_key_id": 3 }
-    ]}
+    ]},
+    { "label": "it", "hardware_key_id": 4 }
   ]
 }
 ```
+
+Labels must be unique within a tree. Optional `allowed_bridges` lists peer labels that node may later pair with (`key bridge add`).
+
+```sh
+keyquorum key lca 1 --node alice bob
+keyquorum key bridge allow 1 --node alice --peer it
+keyquorum key bridge add 1 --from alice --to it
+keyquorum key bridge list 1
+keyquorum key bridge remove 1 --from alice --to it
+keyquorum key bridge deny 1 --node alice --peer it
+keyquorum key evict 1 --node-id 5 --share-file 3=alice_share.hex --share-file 4=bob_share.hex
+```
+
+`key bridge allow` / `deny` change the whitelist. `add` / `remove` stand up or tear down an established pairing (add requires a whitelist hit on either side; deny also drops any pairing). `key evict` marks a leaf inactive and refreshes the remaining siblings' shares so the evicted piece becomes useless; the parent threshold is unchanged.
 
 ```sh
 keyquorum key split --tree-spec tree.json --label "escrow demo"
