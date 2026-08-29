@@ -132,7 +132,8 @@ OpenSSH public key). A `.pub` file uses a sibling `.key` when present.
 
 ```sh
 keyquorum split --label "team escrow" --threshold 2 \
-  --leaf alice=alice.pub --leaf bob=bob.pub --leaf carol=carol.pub
+  --leaf alice=alice.pub --leaf bob=bob.pub --leaf carol=carol.pub \
+  --generate-keys --register
 keyquorum tree <key-id>
 keyquorum revoke <carol-hardware-id> --evict \
   --share-file alice.key --share-file bob.pub

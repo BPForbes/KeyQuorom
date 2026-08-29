@@ -110,7 +110,7 @@ pub fn refresh_among(shares: &mut [Vec<u8>], threshold: u8) -> Result<()> {
     Ok(())
 }
 
-fn require_distinct_nonzero_xs(xs: &[u8]) -> Result<()> {
+pub(crate) fn require_distinct_nonzero_xs(xs: &[u8]) -> Result<()> {
     let mut seen = HashSet::with_capacity(xs.len());
     for &x in xs {
         if x == 0 || !seen.insert(x) {

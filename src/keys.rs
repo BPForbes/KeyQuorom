@@ -143,12 +143,33 @@ pub fn encryption_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
     *secret_key.public_key().as_bytes()
 }
 
+/// RFC 8410 SubjectPublicKeyInfo prefixes (BIT STRING of 32 key bytes).
+const SPKI_X25519: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
+];
+const SPKI_ED25519: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+/// RFC 8410 PKCS#8 OneAsymmetricKey prefixes (OCTET STRING of 32 key bytes).
+const PKCS8_X25519: &[u8] = &[
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
+];
+const PKCS8_ED25519: &[u8] = &[
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
 fn decode_pem_key(text: &str) -> Result<Vec<u8>> {
+    let mut saw_label = false;
     let mut b64 = String::new();
     let mut inside = false;
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with("-----BEGIN ") {
+        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
+            let name = rest.strip_suffix("-----").ok_or(Error::InvalidPublicKey)?;
+            if !pem_label_is_curve_key(name) {
+                return Err(Error::InvalidPublicKey);
+            }
+            saw_label = true;
             inside = true;
             continue;
         }
@@ -159,15 +180,35 @@ fn decode_pem_key(text: &str) -> Result<Vec<u8>> {
             b64.push_str(line);
         }
     }
+    if !saw_label {
+        return Err(Error::InvalidPublicKey);
+    }
     let der = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|_| Error::InvalidPublicKey)?;
+    extract_curve_key_bytes(&der)
+}
+
+fn pem_label_is_curve_key(label: &str) -> bool {
+    matches!(
+        label,
+        "PUBLIC KEY"
+            | "PRIVATE KEY"
+            | "ED25519 PUBLIC KEY"
+            | "ED25519 PRIVATE KEY"
+            | "X25519 PUBLIC KEY"
+            | "X25519 PRIVATE KEY"
+    )
+}
+
+fn extract_curve_key_bytes(der: &[u8]) -> Result<Vec<u8>> {
     if der.len() == 32 {
-        return Ok(der);
+        return Ok(der.to_vec());
     }
-    // PKCS#8 / SPKI keep the 32-byte key at the end of the DER body.
-    if der.len() > 32 {
-        return Ok(der[der.len() - 32..].to_vec());
+    for prefix in [SPKI_X25519, SPKI_ED25519, PKCS8_X25519, PKCS8_ED25519] {
+        if der.len() == prefix.len() + 32 && der.starts_with(prefix) {
+            return Ok(der[prefix.len()..].to_vec());
+        }
     }
     Err(Error::InvalidPublicKey)
 }
@@ -175,17 +216,39 @@ fn decode_pem_key(text: &str) -> Result<Vec<u8>> {
 fn parse_openssh_public(line: &str) -> Option<Vec<u8>> {
     let mut parts = line.split_whitespace();
     let algo = parts.next()?;
-    if !algo.starts_with("ssh-") {
+    if algo != "ssh-ed25519" {
         return None;
     }
     let data = base64::engine::general_purpose::STANDARD
         .decode(parts.next()?)
         .ok()?;
-    if data.len() >= 32 {
-        Some(data[data.len() - 32..].to_vec())
-    } else {
-        None
+    parse_ssh_ed25519_blob(&data)
+}
+
+fn parse_ssh_ed25519_blob(mut data: &[u8]) -> Option<Vec<u8>> {
+    let algo = read_ssh_string(&mut data)?;
+    if algo != b"ssh-ed25519" {
+        return None;
     }
+    let key = read_ssh_string(&mut data)?;
+    if key.len() != 32 || !data.is_empty() {
+        return None;
+    }
+    Some(key.to_vec())
+}
+
+fn read_ssh_string<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
+    if data.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes(data[..4].try_into().ok()?) as usize;
+    *data = &data[4..];
+    if data.len() < len {
+        return None;
+    }
+    let (head, tail) = data.split_at(len);
+    *data = tail;
+    Some(head)
 }
 
 pub fn revoke_key(conn: &Connection, id: i64) -> Result<()> {
@@ -351,6 +414,14 @@ mod tests {
         let pem = format!("-----BEGIN PUBLIC KEY-----\n{pem_body}\n-----END PUBLIC KEY-----\n");
         assert_eq!(parse_key_text(&pem).unwrap(), raw);
 
+        let mut spki = SPKI_X25519.to_vec();
+        spki.extend_from_slice(&raw);
+        let spki_pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            Engine::encode(&base64::engine::general_purpose::STANDARD, spki)
+        );
+        assert_eq!(parse_key_text(&spki_pem).unwrap(), raw);
+
         let mut openssh_blob = Vec::from(*b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20");
         openssh_blob.extend_from_slice(&raw);
         let line = format!(
@@ -358,6 +429,30 @@ mod tests {
             Engine::encode(&base64::engine::general_purpose::STANDARD, openssh_blob)
         );
         assert_eq!(parse_key_text(&line).unwrap(), raw);
+    }
+
+    #[test]
+    fn parse_key_text_rejects_non_curve_pem_and_openssh() {
+        let raw = [0x22u8; 40];
+        let rsa_pem = format!(
+            "-----BEGIN RSA PUBLIC KEY-----\n{}\n-----END RSA PUBLIC KEY-----\n",
+            Engine::encode(&base64::engine::general_purpose::STANDARD, raw)
+        );
+        assert!(parse_key_text(&rsa_pem).is_err());
+
+        let public_pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            Engine::encode(&base64::engine::general_purpose::STANDARD, raw)
+        );
+        assert!(parse_key_text(&public_pem).is_err());
+
+        let mut ssh_rsa = Vec::from(*b"\x00\x00\x00\x07ssh-rsa\x00\x00\x00\x20");
+        ssh_rsa.extend_from_slice(&[0x33u8; 32]);
+        let line = format!(
+            "ssh-rsa {} alice@host",
+            Engine::encode(&base64::engine::general_purpose::STANDARD, ssh_rsa)
+        );
+        assert!(parse_key_text(&line).is_err());
     }
 
     #[test]

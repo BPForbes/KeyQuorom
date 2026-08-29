@@ -731,7 +731,7 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
                 let new_id =
                     resolve_or_register_pub(conn, &node, &public_key_file, false, register)?;
                 let old_secret = secret_for_named_leaf(conn, key_id, &node, &share_file)?;
-                key_tree::rebind_leaf(conn, key_id, &node, new_id, &old_secret)?;
+                key_tree::rebind_leaf(conn, key_id, &node, new_id, old_secret.as_ref())?;
                 println!("Rebound {node} to hardware key {new_id}");
             }
             _ => fatal_usage_error("bind requires --peer or --public-key-file"),
@@ -1531,7 +1531,7 @@ fn secret_for_named_leaf(
     key_id: i64,
     label: &str,
     share_file: &str,
-) -> Result<[u8; 32]> {
+) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let tree = key_tree::KeyQuorumTree::load(conn, key_id)?;
     let idx = tree.index_by_label(label)?;
     if !tree.nodes[idx].is_active || tree.nodes[idx].hardware_key_id.is_none() {
@@ -1547,7 +1547,7 @@ fn secret_for_named_leaf(
         Ok(_) => resolve_private_for_public(path, &arr)?,
         Err(_) => zeroize::Zeroizing::new(arr),
     };
-    Ok(*secret)
+    Ok(secret)
 }
 
 fn find_tree_node<'a>(node: &'a TreeNodeSummary, label: &str) -> Option<&'a TreeNodeSummary> {

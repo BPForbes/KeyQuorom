@@ -865,6 +865,7 @@ pub fn add_leaf_and_reshare(
     if raw_for_recover.len() < threshold {
         return Err(Error::QuorumNotMet);
     }
+    require_recoverable_share_coordinates(&raw_for_recover)?;
 
     let parent_secret = recover_secret(threshold as u8, &raw_for_recover)?;
     keys::get_active_encryption_key(&tx, new_hardware_id)?;
@@ -902,7 +903,19 @@ pub fn add_leaf_and_reshare(
     Ok(new_id)
 }
 
+fn require_recoverable_share_coordinates(raw_shares: &[Vec<u8>]) -> Result<()> {
+    let mut xs = Vec::with_capacity(raw_shares.len());
+    for raw in raw_shares {
+        if raw.is_empty() {
+            return Err(Error::ShareShapeMismatch);
+        }
+        xs.push(raw[0]);
+    }
+    pss::require_distinct_nonzero_xs(&xs)
+}
+
 fn recover_secret(threshold: u8, raw_shares: &[Vec<u8>]) -> Result<Vec<u8>> {
+    require_recoverable_share_coordinates(raw_shares)?;
     let mut shares = Vec::with_capacity(raw_shares.len());
     for raw in raw_shares {
         let share = Share::try_from(raw.as_slice()).map_err(|_| Error::QuorumNotMet)?;
@@ -1225,6 +1238,18 @@ mod tests {
             .unwrap();
         stmt.query_map(params![key_id], |row| {
             Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<HashMap<_, _>>>()
+        .unwrap()
+    }
+
+    fn wrapped_shares_by_id(conn: &Connection, key_id: i64) -> HashMap<i64, Vec<u8>> {
+        let mut stmt = conn
+            .prepare("SELECT id, wrapped_share FROM key_nodes WHERE key_id = ?1")
+            .unwrap();
+        stmt.query_map(params![key_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
         .unwrap()
         .collect::<rusqlite::Result<HashMap<_, _>>>()
@@ -2205,5 +2230,47 @@ mod tests {
             }
             NodeSpec::Leaf { .. } => panic!("expected split"),
         }
+    }
+
+    #[test]
+    fn add_leaf_rejects_duplicate_or_zero_share_coordinates() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_s, sk_s) = register_encryption_key(&conn, "software");
+        let (id_a, sk_a) = register_encryption_key(&conn, "accounting");
+        let (id_f, _sk_f) = register_encryption_key(&conn, "finance");
+        let spec = two_department_spec(id_s, id_a);
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "master", secret, &spec).expect("split");
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let raw_s = unwrap_leaf_share(&conn, leaves["M.S"], &sk_s);
+        let raw_a = unwrap_leaf_share(&conn, leaves["M.A"], &sk_a);
+        let before = wrapped_shares_by_id(&conn, key_id);
+
+        let mut duplicate = HashMap::new();
+        duplicate.insert(leaves["M.S"], raw_s.clone());
+        duplicate.insert(leaves["M.A"], raw_s.clone());
+        assert!(matches!(
+            add_leaf_and_reshare(&mut conn, key_id, "M", "M.F", id_f, &duplicate),
+            Err(Error::ShareShapeMismatch)
+        ));
+        assert_eq!(wrapped_shares_by_id(&conn, key_id), before);
+
+        let mut zero_x = raw_s.clone();
+        zero_x[0] = 0;
+        let mut with_zero = HashMap::new();
+        with_zero.insert(leaves["M.S"], zero_x);
+        with_zero.insert(leaves["M.A"], raw_a.clone());
+        assert!(matches!(
+            add_leaf_and_reshare(&mut conn, key_id, "M", "M.F", id_f, &with_zero),
+            Err(Error::ShareShapeMismatch)
+        ));
+        assert_eq!(wrapped_shares_by_id(&conn, key_id), before);
+
+        let mut distinct = HashMap::new();
+        distinct.insert(leaves["M.S"], raw_s);
+        distinct.insert(leaves["M.A"], raw_a);
+        add_leaf_and_reshare(&mut conn, key_id, "M", "M.F", id_f, &distinct)
+            .expect("distinct shares should add");
+        assert_ne!(wrapped_shares_by_id(&conn, key_id), before);
     }
 }
