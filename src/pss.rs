@@ -9,7 +9,7 @@
 use crate::error::{Error, Result};
 use blahaj::{Share, Sharks};
 use rand::rngs::OsRng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Builds one zero-constant polynomial of degree `threshold - 1` and
 /// evaluates it at each requested Shamir x-coordinate.
@@ -23,14 +23,10 @@ pub fn generate_zero_deltas(
     secret_len: usize,
     xs: &[u8],
 ) -> Result<HashMap<u8, Vec<u8>>> {
-    if threshold == 0 || secret_len == 0 || xs.is_empty() {
+    if threshold < 2 || secret_len == 0 || xs.is_empty() {
         return Err(Error::ShareShapeMismatch);
     }
-    for &x in xs {
-        if x == 0 {
-            return Err(Error::ShareShapeMismatch);
-        }
-    }
+    require_distinct_nonzero_xs(xs)?;
 
     let zero = vec![0u8; secret_len];
     let sharks = Sharks(threshold);
@@ -81,10 +77,14 @@ pub fn refresh_among(shares: &mut [Vec<u8>], threshold: u8) -> Result<()> {
 
     let mut xs = Vec::with_capacity(shares.len());
     for share in shares.iter() {
-        if share.len() != secret_len + 1 || share[0] == 0 {
+        if share.len() != secret_len + 1 {
             return Err(Error::ShareShapeMismatch);
         }
         xs.push(share[0]);
+    }
+    require_distinct_nonzero_xs(&xs)?;
+    if threshold < 2 {
+        return Err(Error::ShareShapeMismatch);
     }
 
     let mut combined: HashMap<u8, Vec<u8>> = HashMap::with_capacity(xs.len());
@@ -106,6 +106,16 @@ pub fn refresh_among(shares: &mut [Vec<u8>], threshold: u8) -> Result<()> {
         let x = share[0];
         let delta = combined.get(&x).ok_or(Error::ShareShapeMismatch)?;
         *share = apply_deltas(share, delta)?;
+    }
+    Ok(())
+}
+
+fn require_distinct_nonzero_xs(xs: &[u8]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(xs.len());
+    for &x in xs {
+        if x == 0 || !seen.insert(x) {
+            return Err(Error::ShareShapeMismatch);
+        }
     }
     Ok(())
 }
@@ -156,5 +166,26 @@ mod tests {
         let a = vec![1, 10, 20];
         let b = vec![2, 10, 20];
         assert!(matches!(add_shares(&a, &b), Err(Error::ShareShapeMismatch)));
+    }
+
+    #[test]
+    fn refresh_rejects_duplicate_share_coordinates() {
+        let secret = b"the quorum has been reached!!!!";
+        let shares = split_secret(secret, 2, 2);
+        let mut duplicated = [shares[0].clone(), shares[0].clone()];
+        assert!(matches!(
+            refresh_among(&mut duplicated, 2),
+            Err(Error::ShareShapeMismatch)
+        ));
+    }
+
+    #[test]
+    fn refresh_rejects_a_threshold_of_one() {
+        let secret = b"the quorum has been reached!!!!";
+        let mut shares = split_secret(secret, 1, 2);
+        assert!(matches!(
+            refresh_among(&mut shares, 1),
+            Err(Error::ShareShapeMismatch)
+        ));
     }
 }

@@ -25,7 +25,30 @@ fn init(conn: &Connection) -> Result<()> {
     // share redemption race) resolves in commit order rather than erroring.
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    conn.execute_batch(SCHEMA)
+    conn.execute_batch(SCHEMA)?;
+    migrate(conn)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+/// `CREATE TABLE IF NOT EXISTS` never adds columns to an already-created
+/// table. Databases from before `key_nodes.is_active` must be altered
+/// before any SELECT of that column.
+fn migrate(conn: &Connection) -> Result<()> {
+    if table_has_column(conn, "key_nodes", "is_active")? {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE key_nodes ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+        [],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -176,6 +199,42 @@ mod tests {
             [],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn opening_a_legacy_key_nodes_table_adds_is_active() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE key_nodes (
+                id                INTEGER PRIMARY KEY,
+                key_id            INTEGER NOT NULL,
+                parent_id         INTEGER,
+                label             TEXT NOT NULL,
+                threshold         INTEGER,
+                hardware_key_id   INTEGER,
+                wrapped_share     BLOB
+             );
+             CREATE TABLE keys (
+                id INTEGER PRIMARY KEY,
+                label TEXT NOT NULL
+             );
+             INSERT INTO keys (id, label) VALUES (1, 'legacy');
+             INSERT INTO key_nodes (key_id, label, threshold) VALUES (1, 'root', 1);",
+        )
+        .expect("legacy schema should apply");
+
+        assert!(!table_has_column(&conn, "key_nodes", "is_active").unwrap());
+        init(&conn).expect("init should migrate the legacy table");
+
+        let is_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM key_nodes WHERE label = 'root'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("is_active should be readable after migrate");
+        assert_eq!(is_active, 1);
+        init(&conn).expect("a second init must be idempotent");
     }
 
     #[test]

@@ -81,7 +81,7 @@ impl fmt::Display for Error {
             Error::CannotEvict => {
                 write!(
                     f,
-                    "this leaf cannot be evicted (not an active leaf, remaining siblings cannot meet the threshold, or a sibling is not a leaf)"
+                    "this leaf cannot be evicted (not an active leaf, parent threshold is 1, remaining siblings cannot meet the threshold, or a sibling is not a leaf)"
                 )
             }
             Error::ShareShapeMismatch => {

@@ -712,6 +712,11 @@ pub fn evict_and_refresh(
     let parent_idx = evicted.parent_idx.ok_or(Error::CannotEvict)?;
     let parent = &tree.nodes[parent_idx];
     let threshold = parent.threshold.ok_or(Error::CannotEvict)?;
+    // t = 1 makes the PSS blinding polynomial identically zero, so the
+    // evicted share would still reconstruct the parent by itself.
+    if threshold < 2 {
+        return Err(Error::CannotEvict);
+    }
 
     let mut survivor_idxs = Vec::new();
     for &child in &parent.children_indices {
@@ -1516,6 +1521,64 @@ mod tests {
         assert!(matches!(
             reconstruct(&conn, key_id, &stale),
             Err(Error::QuorumNotMet)
+        ));
+    }
+
+    #[test]
+    fn evict_rejects_the_same_raw_share_for_two_survivors() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id1, sk1) = register_encryption_key(&conn, "ma1");
+        let (id2, _) = register_encryption_key(&conn, "ma2");
+        let (id3, _) = register_encryption_key(&conn, "ma3");
+        let (idb, _) = register_encryption_key(&conn, "mb");
+        let spec = department_tree_spec(id1, id2, id3, idb);
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "org", secret, &spec).expect("split should succeed");
+
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let raw1 = unwrap_leaf_share(&conn, leaves["M.A.1"], &sk1);
+        let mut survivors = HashMap::new();
+        survivors.insert(leaves["M.A.1"], raw1.clone());
+        survivors.insert(leaves["M.A.2"], raw1);
+        assert!(matches!(
+            evict_and_refresh(&mut conn, key_id, leaves["M.A.3"], &survivors),
+            Err(Error::ShareShapeMismatch)
+        ));
+        let tree = KeyQuorumTree::load(&conn, key_id).expect("load should succeed");
+        assert!(tree.nodes[tree.index_by_label("M.A.3").unwrap()].is_active);
+    }
+
+    #[test]
+    fn evict_rejects_a_parent_threshold_of_one() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_a, sk_a) = register_encryption_key(&conn, "a");
+        let (id_b, _sk_b) = register_encryption_key(&conn, "b");
+        let spec = NodeSpec::Split {
+            label: "root".into(),
+            threshold: 1,
+            allowed_bridges: vec![],
+            children: vec![
+                NodeSpec::Leaf {
+                    label: "a".into(),
+                    hardware_key_id: id_a,
+                    allowed_bridges: vec![],
+                },
+                NodeSpec::Leaf {
+                    label: "b".into(),
+                    hardware_key_id: id_b,
+                    allowed_bridges: vec![],
+                },
+            ],
+        };
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "flat", secret, &spec).expect("split should succeed");
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let raw_a = unwrap_leaf_share(&conn, leaves["a"], &sk_a);
+        let mut survivors = HashMap::new();
+        survivors.insert(leaves["a"], raw_a);
+        assert!(matches!(
+            evict_and_refresh(&mut conn, key_id, leaves["b"], &survivors),
+            Err(Error::CannotEvict)
         ));
     }
 }
