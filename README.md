@@ -24,89 +24,140 @@ hardware/USB integration exists.
 ## Getting Started
 
 Build the CLI with `cargo build --release`; the binary is `target/release/keyquorum`.
-Passwords, PINs, and raw quorum shares are always prompted for interactively (or read
-from a `--share-file`) rather than taken as plain arguments. Run `keyquorum --help` for
+Passwords, PINs, and hardware-key material are always prompted for interactively (or read
+from a `--share-file` key path) rather than taken as plain arguments. Run `keyquorum --help` for
 the full command list.
 
-### Keys
+### Hardware keys
+
+Hardware and tree verbs are top-level (`generate`, `split`, `bind`, …).
 
 ```sh
 # Generate a keypair. The private key is printed to stdout ONCE and never
 # written to disk by this tool — redirect it yourself.
-keyquorum key generate --type encryption --public-key-out alice.pub > alice.key
-keyquorum key register --type encryption --label alice --public-key-file alice.pub
-keyquorum key list
+keyquorum generate --type encryption --public-key-out alice.pub --label alice --register > alice.key
+keyquorum register --type encryption --label bob --public-key-file bob.pub
+keyquorum list
 ```
 
-### Splitting a key (standalone escrow, or protecting a file)
+`generate --register` writes the public key and records it in one step.
+`list` shows hardware keys and every live split tree.
 
-A key's split tree is described as a JSON file, e.g. `tree.json`:
+### Splitting a secret (standalone escrow, or protecting a file)
 
-```json
-{
-  "label": "root", "threshold": 2,
-  "children": [
-    { "label": "alice", "hardware_key_id": 1, "allowed_bridges": ["it"] },
-    { "label": "dept", "threshold": 1, "children": [
-        { "label": "bob", "hardware_key_id": 2 },
-        { "label": "carol", "hardware_key_id": 3 }
-    ]},
-    { "label": "it", "hardware_key_id": 4 }
-  ]
-}
-```
+The live SQLite tree **is** the spec. `split`, `bind`, `add`, `revoke`,
+`bridge`, and `access quorum --state 0 --leaf` write that tree in place.
+There is no JSON file to author first. `tree --output` writes a snapshot
+of whatever is stored now. `--tree-spec FILE` remains only for a nested
+one-shot tree.
 
-Labels must be unique within a tree. Optional `allowed_bridges` lists peer labels that node may later pair with (`key bridge add`).
+Labels must be unique within a tree. `tree <id> --node A B` prints that
+set's lowest common ancestor; `reconstruct --node A B` starts recovery
+at that ancestor. `tree` with no id lists every stored spec.
+
+`split --source master.pub` escrows that key file (hex, PEM, or OpenSSH).
+`--leaf` builds a one-level tree and binds every sibling pair (so `M.S <-> M.A`
+is recorded even after later refreshes). Reconstruct with the holders' key
+files and `--output`. A 2-of-2 department tree (`M` = `master.pub`,
+`M.S` = `SoftwareDepartment.pub`, `M.A` = `AccountingDepartment.pub`)
+reassembles the master from the two department keys:
 
 ```sh
-keyquorum key lca 1 --node alice bob
-keyquorum key bridge allow 1 --node alice --peer it
-keyquorum key bridge add 1 --from alice --to it
-keyquorum key bridge list 1
-keyquorum key bridge remove 1 --from alice --to it
-keyquorum key bridge deny 1 --node alice --peer it
+keyquorum split --label master --threshold 2 \
+  --leaf M.S=SoftwareDepartment.pub --leaf M.A=AccountingDepartment.pub \
+  --source master.pub --generate-keys --register
+keyquorum reconstruct <key-id> \
+  --share-file SoftwareDepartment.pub --share-file AccountingDepartment.pub \
+  --output master.pub
+# same thing, naming the nodes:
+# keyquorum reconstruct <key-id> --node M.S M.A \
+#   --share-file SoftwareDepartment.pub --share-file AccountingDepartment.pub \
+#   --output master.pub
+keyquorum tree
+keyquorum tree <key-id> --output org.json
 ```
 
-`key bridge allow` / `deny` change the whitelist. `add` / `remove` stand up or tear down an established pairing (add requires a whitelist hit on either side; deny also drops any pairing).
+`--generate-keys` creates each leaf's `.pub` / `.key` pair; `--register`
+records those public keys. Dotted leaf labels (`M.S`, `M.A`) infer the
+root node `M`. `--bind M.S=M.A` adds an extra pairing; `--leaf` already
+binds sibling leaves.
 
-Eviction needs its own tree: the evicted leaf's parent must have threshold at least 2, and every remaining active sibling must be a hardware-backed leaf. `key evict` refuses a 1-of-N parent (the refresh would be a no-op). Copy leaf node ids from `key tree` — they are not `hardware_key_id` values.
+A `.pub` share file uses the sibling `.key` (or a private-key prompt) to
+unwrap that department's sealed share. Both departments are required
+because `M`'s threshold is 2.
 
-```json
-{
-  "label": "team", "threshold": 2,
-  "children": [
-    { "label": "alice", "hardware_key_id": 1 },
-    { "label": "bob", "hardware_key_id": 2 },
-    { "label": "carol", "hardware_key_id": 3 }
-  ]
-}
+Later commands keep changing that same tree. Pairings are stored by node
+id, so they survive a secret refresh, a new leaf, or a leaf moving to a
+new public key:
+
+```sh
+# Pair two nodes (whitelist both ways + establish the link)
+keyquorum bind <key-id> --node M.S --peer M.A
+
+# Move M.S onto a new token; node id — and the bind — stay put
+keyquorum bind <key-id> --node M.S \
+  --public-key-file NewSoftware.pub --share-file SoftwareDepartment.key --register
+
+# Grow M to 2-of-3; survivor node ids (and M.S <-> M.A) stay put
+keyquorum add <key-id> --parent M --node M.F \
+  --public-key-file FinanceDepartment.pub \
+  --share-file SoftwareDepartment.pub --share-file AccountingDepartment.pub \
+  --generate-keys --register
 ```
 
 ```sh
-keyquorum key split --tree-spec team.json --label "team escrow"
-keyquorum key tree <key-id>
-keyquorum key evict <key-id> --node-id <carol-node-id> \
-  --share-file <alice-node-id>=alice_share.hex \
-  --share-file <bob-node-id>=bob_share.hex
+keyquorum tree 1 --node alice bob
+keyquorum reconstruct 1 --node alice bob --share-file alice.pub --share-file bob.key
+keyquorum bridge allow 1 --node alice --peer it
+keyquorum bridge add 1 --from alice --to it
+keyquorum bridge list 1
+keyquorum bridge remove 1 --from alice --to it
+keyquorum bridge deny 1 --node alice --peer it
+```
+
+`bind --peer` is the usual way to stand up `A <-> B`. `bridge allow` /
+`deny` change the whitelist only. `bridge add` / `remove` stand up or
+tear down an established pairing (add requires a whitelist hit on either
+side; deny also drops any pairing).
+
+Banning a hardware key is `revoke <hardware-id>`. That always drops
+pairings and whitelist rows for every live leaf sealed to that token.
+`--evict` PSS-refreshes survivors of that leaf (`--key-id` / `--node`,
+or the unique leaf the token backs). Eviction needs a parent threshold
+of at least 2, and every remaining active sibling must be a
+hardware-backed leaf — a 1-of-N parent is refused. Binds between
+survivors stay. `--share-file` is that sibling's actual key file
+(`.pub` / `.key` from `generate` or `split --generate-keys`, or a PEM /
+OpenSSH public key). A `.pub` file uses a sibling `.key` when present.
+
+```sh
+keyquorum split --label "team escrow" --threshold 2 \
+  --leaf alice=alice.pub --leaf bob=bob.pub --leaf carol=carol.pub
+keyquorum tree <key-id>
+keyquorum revoke <carol-hardware-id> --evict \
+  --share-file alice.key --share-file bob.pub
+# pin a leaf when the token backs more than one:
+#   --key-id <key-id> --node carol
 ```
 
 ```sh
-keyquorum key split --tree-spec tree.json --label "escrow demo"
-keyquorum key tree <key-id>
-keyquorum key reconstruct <key-id> --share-file <alice-node-id>=alice_share.hex --share-file <bob-node-id>=bob_share.hex
+keyquorum split --label "escrow demo" --threshold 2 \
+  --leaf alice=alice.pub --leaf bob=bob.pub
+keyquorum tree <key-id>
+keyquorum reconstruct <key-id> --share-file alice.key --share-file bob.pub
 
-keyquorum access quorum --state 0 --source ./secret.txt --encrypted-path ./secret.txt.kqenc --tree-spec tree.json
+keyquorum access quorum --state 0 --source ./secret.txt --encrypted-path ./secret.txt.kqenc \
+  --leaf alice=alice.pub --leaf bob=bob.pub --generate-keys --register
 keyquorum access quorum --status --id <file-id>
-keyquorum access quorum --state 1 --id <file-id> --share-file <alice-node-id>=alice_share.hex --share-file <bob-node-id>=bob_share.hex
+keyquorum access quorum --state 1 --id <file-id> --share-file alice.key --share-file bob.pub
 ```
 
-`<key-id>` and `<file-id>` are printed by `key split`/`access quorum
---state 0` ("Split key 1" / "Locked file 1"). `<alice-node-id>` and
-`<bob-node-id>` are each leaf's own node id, printed by `key tree`/
-`access quorum --status` — copy them from there. `--share-file` is keyed
-by that node id, not the `hardware_key_id` values from the tree-spec JSON
-above (a different, unrelated set of ids) — the same hardware key can
-back more than one leaf, so only the node id is guaranteed unique.
+`<key-id>` and `<file-id>` are printed by `split` / `access quorum
+--state 0` ("Split key 1" / "Locked file 1"). `--share-file` takes the
+same key files `generate` wrote (`alice.pub` / `alice.key`) or another
+standard public-key file (PEM, OpenSSH `.pub`). The private key unwraps
+every leaf sealed to that hardware key. `tree` still prints leaf node
+ids for inspection.
 
 ### Password-protected files and credentials
 
@@ -140,9 +191,9 @@ These are deliberately not implemented — not stubbed, just not yet built — b
 all need a private-key custody model (a software file? the OS keychain? real hardware?)
 that hasn't been decided:
 
-- **Persisted private-key custody** for `key generate` (today the private key only ever
+- **Persisted private-key custody** for `generate` (today the private key only ever
   goes to stdout).
-- **`key unwrap-share`** — turning a stored, sealed quorum share back into the raw share
+- **`unwrap-share`** — turning a stored, sealed quorum share back into the raw share
   a hardware key's own private key would produce.
 - **`sign`** — producing a signature (`verify` is implemented).
 - **`import`** — opening an `export` bundle on the receiving end (the bundle format and

@@ -15,23 +15,23 @@ use crate::keys;
 use crate::pss;
 use blahaj::{Share, Sharks};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum NodeSpec {
     Leaf {
         label: String,
         hardware_key_id: i64,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         allowed_bridges: Vec<String>,
     },
     Split {
         label: String,
         threshold: u8,
         children: Vec<NodeSpec>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         allowed_bridges: Vec<String>,
     },
 }
@@ -51,6 +51,24 @@ impl NodeSpec {
             | Self::Split {
                 allowed_bridges, ..
             } => allowed_bridges,
+        }
+    }
+
+    /// One-level split used by `split --leaf`. Nested trees still go
+    /// through a JSON snapshot (`--tree-spec` / `tree --output`).
+    pub fn flat_split(root: impl Into<String>, threshold: u8, leaves: Vec<(String, i64)>) -> Self {
+        Self::Split {
+            label: root.into(),
+            threshold,
+            allowed_bridges: Vec::new(),
+            children: leaves
+                .into_iter()
+                .map(|(label, hardware_key_id)| Self::Leaf {
+                    label,
+                    hardware_key_id,
+                    allowed_bridges: Vec::new(),
+                })
+                .collect(),
         }
     }
 }
@@ -100,6 +118,17 @@ pub struct TreeSummary {
     pub key_id: i64,
     pub label: String,
     pub root: TreeNodeSummary,
+}
+
+pub struct TreeListing {
+    pub key_id: i64,
+    pub label: String,
+}
+
+pub struct HardwareLeafRef {
+    pub key_id: i64,
+    pub node_id: i64,
+    pub label: String,
 }
 
 /// Every `Split`'s threshold must be in `1..=children.len()`, every `Leaf`
@@ -223,13 +252,7 @@ fn split_node(
             ..
         } => {
             let hardware_key = keys::get_active_encryption_key(conn, *hardware_key_id)?;
-            let public_key_bytes: [u8; 32] = hardware_key.public_key[..]
-                .try_into()
-                .map_err(|_| Error::InvalidPublicKey)?;
-            let public_key = crypto_box::PublicKey::from_bytes(public_key_bytes);
-            let wrapped_share = public_key
-                .seal(&mut rand::rngs::OsRng, secret)
-                .expect("crypto_box sealing should not fail for an in-memory share");
+            let wrapped_share = seal_share(&hardware_key, secret)?;
             conn.execute(
                 "INSERT INTO key_nodes (key_id, parent_id, label, hardware_key_id, wrapped_share)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -273,6 +296,16 @@ fn split_node(
             Ok(())
         }
     }
+}
+
+fn seal_share(hardware_key: &keys::HardwareKey, share: &[u8]) -> Result<Vec<u8>> {
+    let public_key_bytes: [u8; 32] = hardware_key.public_key[..]
+        .try_into()
+        .map_err(|_| Error::InvalidPublicKey)?;
+    let public_key = crypto_box::PublicKey::from_bytes(public_key_bytes);
+    Ok(public_key
+        .seal(&mut rand::rngs::OsRng, share)
+        .expect("crypto_box sealing should not fail for an in-memory share"))
 }
 
 fn insert_allowed_bridges(conn: &Connection, node_id: i64, peers: &[String]) -> Result<()> {
@@ -691,6 +724,251 @@ pub fn list_bridges(conn: &Connection, key_id: i64) -> Result<BridgeListing> {
     })
 }
 
+/// Whitelist both directions and establish the pairing. Node ids stay
+/// put across later secret refreshes, so this bind survives PSS / add /
+/// rebind as long as those operations UPDATE the same rows.
+pub fn bind_pair(conn: &Connection, key_id: i64, a_label: &str, b_label: &str) -> Result<()> {
+    allow_bridge(conn, key_id, a_label, b_label)?;
+    allow_bridge(conn, key_id, b_label, a_label)?;
+    add_bridge(conn, key_id, a_label, b_label)?;
+    Ok(())
+}
+
+/// Bind `leaf_label` to every other active leaf sibling of its parent.
+pub fn bind_leaf_to_active_siblings(
+    conn: &Connection,
+    key_id: i64,
+    leaf_label: &str,
+) -> Result<()> {
+    let tree = KeyQuorumTree::load(conn, key_id)?;
+    let idx = tree.index_by_label(leaf_label)?;
+    let parent_idx = tree.nodes[idx].parent_idx.ok_or(Error::InvalidBridge)?;
+    let siblings: Vec<String> = tree.nodes[parent_idx]
+        .children_indices
+        .iter()
+        .copied()
+        .filter(|&c| c != idx && tree.nodes[c].is_active && tree.nodes[c].hardware_key_id.is_some())
+        .map(|c| tree.nodes[c].id.clone())
+        .collect();
+    for peer in siblings {
+        bind_pair(conn, key_id, leaf_label, &peer)?;
+    }
+    Ok(())
+}
+
+/// Establish a pairing between every pair of active leaf siblings under
+/// each split. Used after `split --leaf` so the live spec records
+/// those binds without a JSON file.
+pub fn bind_all_sibling_leaf_pairs(conn: &Connection, key_id: i64) -> Result<()> {
+    let tree = KeyQuorumTree::load(conn, key_id)?;
+    let mut pairs = Vec::new();
+    for node in &tree.nodes {
+        if node.threshold.is_none() {
+            continue;
+        }
+        let leaves: Vec<String> = node
+            .children_indices
+            .iter()
+            .copied()
+            .filter(|&c| tree.nodes[c].is_active && tree.nodes[c].hardware_key_id.is_some())
+            .map(|c| tree.nodes[c].id.clone())
+            .collect();
+        for i in 0..leaves.len() {
+            for j in (i + 1)..leaves.len() {
+                pairs.push((leaves[i].clone(), leaves[j].clone()));
+            }
+        }
+    }
+    for (a, b) in pairs {
+        bind_pair(conn, key_id, &a, &b)?;
+    }
+    Ok(())
+}
+
+/// Reseal an active leaf to a new hardware key. The share bytes and the
+/// `key_nodes.id` stay the same, so existing pairings survive.
+pub fn rebind_leaf(
+    conn: &Connection,
+    key_id: i64,
+    node_label: &str,
+    new_hardware_id: i64,
+    old_secret: &[u8],
+) -> Result<()> {
+    let tree = KeyQuorumTree::load(conn, key_id)?;
+    let idx = tree.index_by_label(node_label)?;
+    let node = &tree.nodes[idx];
+    if !node.is_active || node.hardware_key_id.is_none() {
+        return Err(Error::NodeNotFound);
+    }
+    let share = unwrap_leaf_share(conn, node.db_id, old_secret)?;
+    let new_hw = keys::get_active_encryption_key(conn, new_hardware_id)?;
+    let wrapped = seal_share(&new_hw, &share)?;
+    let updated = conn.execute(
+        "UPDATE key_nodes SET hardware_key_id = ?1, wrapped_share = ?2
+         WHERE id = ?3 AND key_id = ?4",
+        params![new_hardware_id, wrapped, node.db_id, key_id],
+    )?;
+    if updated != 1 {
+        return Err(Error::NodeNotFound);
+    }
+    Ok(())
+}
+
+/// Recover a parent split, dealer `n+1` shares at the same threshold,
+/// reseal existing active leaf children in place, and insert the new
+/// leaf. Survivor node ids are unchanged so their binds survive.
+/// A complete old quorum still reconstructs the same secret; mixed
+/// old-and-new sibling shares do not.
+pub fn add_leaf_and_reshare(
+    conn: &mut Connection,
+    key_id: i64,
+    parent_label: &str,
+    new_label: &str,
+    new_hardware_id: i64,
+    presented: &HashMap<i64, Vec<u8>>,
+) -> Result<i64> {
+    if new_label.is_empty() {
+        return Err(Error::DuplicateNodeLabel);
+    }
+    let tx = conn.transaction()?;
+    let tree = KeyQuorumTree::load(&tx, key_id)?;
+    if tree.id_to_index.contains_key(new_label) {
+        return Err(Error::DuplicateNodeLabel);
+    }
+    let parent_idx = tree.index_by_label(parent_label)?;
+    let parent = &tree.nodes[parent_idx];
+    let threshold = parent.threshold.ok_or(Error::CannotAddLeaf)?;
+
+    let mut active_leaves = Vec::new();
+    for &child in &parent.children_indices {
+        let node = &tree.nodes[child];
+        if !node.is_active {
+            continue;
+        }
+        if node.hardware_key_id.is_none() {
+            return Err(Error::CannotAddLeaf);
+        }
+        active_leaves.push(child);
+    }
+
+    let n = active_leaves.len() + 1;
+    if n > 255 || threshold > n {
+        return Err(Error::CannotAddLeaf);
+    }
+
+    let mut raw_for_recover = Vec::new();
+    for &idx in &active_leaves {
+        if let Some(raw) = presented.get(&tree.nodes[idx].db_id) {
+            raw_for_recover.push(raw.clone());
+        }
+    }
+    if raw_for_recover.len() < threshold {
+        return Err(Error::QuorumNotMet);
+    }
+
+    let parent_secret = recover_secret(threshold as u8, &raw_for_recover)?;
+    keys::get_active_encryption_key(&tx, new_hardware_id)?;
+
+    let new_shares: Vec<Share> = Sharks(threshold as u8)
+        .dealer_rng(&parent_secret, &mut rand::rngs::OsRng)
+        .take(n)
+        .collect();
+    if new_shares.len() != n {
+        return Err(Error::InvalidQuorumThreshold);
+    }
+
+    for (idx, share) in active_leaves.iter().zip(new_shares.iter()) {
+        let node = &tree.nodes[*idx];
+        let hw_id = node.hardware_key_id.ok_or(Error::CannotAddLeaf)?;
+        let hardware_key = keys::get_active_encryption_key(&tx, hw_id)?;
+        let raw: Vec<u8> = Vec::from(share);
+        let wrapped = seal_share(&hardware_key, &raw)?;
+        tx.execute(
+            "UPDATE key_nodes SET wrapped_share = ?1 WHERE id = ?2",
+            params![wrapped, node.db_id],
+        )?;
+    }
+
+    let new_share: Vec<u8> = Vec::from(&new_shares[n - 1]);
+    let new_hw = keys::get_active_encryption_key(&tx, new_hardware_id)?;
+    let wrapped = seal_share(&new_hw, &new_share)?;
+    tx.execute(
+        "INSERT INTO key_nodes (key_id, parent_id, label, hardware_key_id, wrapped_share)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![key_id, parent.db_id, new_label, new_hardware_id, wrapped],
+    )?;
+    let new_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(new_id)
+}
+
+fn recover_secret(threshold: u8, raw_shares: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut shares = Vec::with_capacity(raw_shares.len());
+    for raw in raw_shares {
+        let share = Share::try_from(raw.as_slice()).map_err(|_| Error::QuorumNotMet)?;
+        shares.push(share);
+    }
+    Sharks(threshold)
+        .recover(shares.iter())
+        .map_err(|_| Error::QuorumNotMet)
+}
+
+/// Snapshot of the live tree: active nodes, current hardware bindings,
+/// and whitelist entries. This is an export, not something callers edit
+/// and feed back in as the source of truth.
+pub fn export_spec(conn: &Connection, key_id: i64) -> Result<NodeSpec> {
+    let tree = KeyQuorumTree::load(conn, key_id)?;
+    Ok(export_node(&tree, tree.root_index))
+}
+
+fn export_node(tree: &KeyQuorumTree, idx: usize) -> NodeSpec {
+    let node = &tree.nodes[idx];
+    let mut allowed: Vec<String> = node.allowed_bridges.iter().cloned().collect();
+    allowed.sort();
+    if let Some(hardware_key_id) = node.hardware_key_id {
+        NodeSpec::Leaf {
+            label: node.id.clone(),
+            hardware_key_id,
+            allowed_bridges: allowed,
+        }
+    } else {
+        let children = node
+            .children_indices
+            .iter()
+            .copied()
+            .filter(|&c| tree.nodes[c].is_active)
+            .map(|c| export_node(tree, c))
+            .collect();
+        NodeSpec::Split {
+            label: node.id.clone(),
+            threshold: node.threshold.unwrap_or(1) as u8,
+            children,
+            allowed_bridges: allowed,
+        }
+    }
+}
+
+fn delete_node_bindings(conn: &rusqlite::Connection, key_id: i64, node_id: i64) -> Result<()> {
+    let label: String = conn.query_row(
+        "SELECT label FROM key_nodes WHERE id = ?1 AND key_id = ?2",
+        params![node_id, key_id],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "DELETE FROM key_node_links WHERE node_a_id = ?1 OR node_b_id = ?1",
+        params![node_id],
+    )?;
+    conn.execute(
+        "DELETE FROM key_node_bridges
+         WHERE node_id = ?1
+            OR (peer_label = ?2 AND node_id IN (
+                    SELECT id FROM key_nodes WHERE key_id = ?3
+                ))",
+        params![node_id, label, key_id],
+    )?;
+    Ok(())
+}
+
 /// Evict an active leaf and PSS-refresh every remaining active leaf sibling
 /// of its parent. Threshold is unchanged. All remaining siblings must be
 /// leaves and must present their current raw shares.
@@ -754,15 +1032,10 @@ pub fn evict_and_refresh(
         "UPDATE key_nodes SET is_active = 0 WHERE id = ?1",
         params![evicted_node_id],
     )?;
+    delete_node_bindings(&tx, key_id, evicted_node_id)?;
 
     for ((db_id, hardware_key), new_share) in share_meta.iter().zip(shares.iter()) {
-        let public_key_bytes: [u8; 32] = hardware_key.public_key[..]
-            .try_into()
-            .map_err(|_| Error::InvalidPublicKey)?;
-        let public_key = crypto_box::PublicKey::from_bytes(public_key_bytes);
-        let wrapped_share = public_key
-            .seal(&mut rand::rngs::OsRng, new_share)
-            .expect("crypto_box sealing should not fail for an in-memory share");
+        let wrapped_share = seal_share(hardware_key, new_share)?;
         tx.execute(
             "UPDATE key_nodes SET wrapped_share = ?1 WHERE id = ?2",
             params![wrapped_share, db_id],
@@ -773,8 +1046,36 @@ pub fn evict_and_refresh(
     Ok(())
 }
 
+/// Unseal one leaf's `wrapped_share` with that leaf's encryption secret.
+pub fn unwrap_leaf_share(
+    conn: &Connection,
+    node_id: i64,
+    secret_key_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let secret_bytes: [u8; 32] = secret_key_bytes
+        .try_into()
+        .map_err(|_| Error::InvalidPublicKey)?;
+    let secret_key = crypto_box::SecretKey::from(secret_bytes);
+    let expected_public = *secret_key.public_key().as_bytes();
+
+    let (hardware_key_id, wrapped): (Option<i64>, Option<Vec<u8>>) = conn.query_row(
+        "SELECT hardware_key_id, wrapped_share FROM key_nodes WHERE id = ?1",
+        params![node_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let hardware_key_id = hardware_key_id.ok_or(Error::NodeNotFound)?;
+    let wrapped = wrapped.ok_or(Error::NodeNotFound)?;
+    let hardware_key = keys::get_key(conn, hardware_key_id)?;
+    if hardware_key.public_key != expected_public {
+        return Err(Error::IntegrityCheckFailed);
+    }
+    secret_key
+        .unseal(&wrapped)
+        .map_err(|_| Error::IntegrityCheckFailed)
+}
+
 /// Read-only tree summary — labels, thresholds, and which hardware key
-/// backs each leaf — for `key tree <id>` / audit review.
+/// backs each leaf — for `tree <id>` / audit review.
 pub fn describe(conn: &Connection, key_id: i64) -> Result<TreeSummary> {
     let label: String = conn.query_row(
         "SELECT label FROM keys WHERE id = ?1",
@@ -788,6 +1089,55 @@ pub fn describe(conn: &Connection, key_id: i64) -> Result<TreeSummary> {
         label,
         root,
     })
+}
+
+/// Every stored split tree (`keys` rows), newest last.
+pub fn list_trees(conn: &Connection) -> Result<Vec<TreeListing>> {
+    let mut stmt = conn.prepare("SELECT id, label FROM keys ORDER BY id")?;
+    let trees = stmt
+        .query_map([], |row| {
+            Ok(TreeListing {
+                key_id: row.get(0)?,
+                label: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(trees)
+}
+
+/// Active leaves sealed to this hardware key, across every tree.
+pub fn active_leaves_for_hardware(
+    conn: &Connection,
+    hardware_key_id: i64,
+) -> Result<Vec<HardwareLeafRef>> {
+    let mut stmt = conn.prepare(
+        "SELECT key_id, id, label FROM key_nodes
+         WHERE hardware_key_id = ?1 AND is_active = 1
+         ORDER BY key_id, id",
+    )?;
+    let leaves = stmt
+        .query_map(params![hardware_key_id], |row| {
+            Ok(HardwareLeafRef {
+                key_id: row.get(0)?,
+                node_id: row.get(1)?,
+                label: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(leaves)
+}
+
+/// Drop pairings and whitelist rows for every active leaf sealed to
+/// this hardware key. Node rows stay; only the live spec's binds change.
+pub fn drop_bindings_for_hardware(
+    conn: &Connection,
+    hardware_key_id: i64,
+) -> Result<Vec<HardwareLeafRef>> {
+    let leaves = active_leaves_for_hardware(conn, hardware_key_id)?;
+    for leaf in &leaves {
+        delete_node_bindings(conn, leaf.key_id, leaf.node_id)?;
+    }
+    Ok(leaves)
 }
 
 fn describe_node(conn: &Connection, node_id: i64) -> Result<TreeNodeSummary> {
@@ -863,15 +1213,7 @@ mod tests {
         node_id: i64,
         secret_key: &crypto_box::SecretKey,
     ) -> Vec<u8> {
-        let wrapped: Vec<u8> = conn
-            .query_row(
-                "SELECT wrapped_share FROM key_nodes WHERE id = ?1",
-                params![node_id],
-                |row| row.get(0),
-            )
-            .expect("leaf node should exist");
-        secret_key
-            .unseal(&wrapped)
+        super::unwrap_leaf_share(conn, node_id, &secret_key.to_bytes())
             .expect("unseal should succeed with the matching secret key")
     }
 
@@ -1602,5 +1944,266 @@ mod tests {
             evict_and_refresh(&mut conn, key_id, leaves["b"], &survivors),
             Err(Error::CannotEvict)
         ));
+    }
+
+    #[test]
+    fn unwrap_leaf_share_rejects_the_wrong_secret() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_a, sk_a) = register_encryption_key(&conn, "alice");
+        let (id_b, sk_b) = register_encryption_key(&conn, "bob");
+        let spec = NodeSpec::Split {
+            label: "root".into(),
+            threshold: 2,
+            allowed_bridges: vec![],
+            children: vec![
+                NodeSpec::Leaf {
+                    label: "a".into(),
+                    hardware_key_id: id_a,
+                    allowed_bridges: vec![],
+                },
+                NodeSpec::Leaf {
+                    label: "b".into(),
+                    hardware_key_id: id_b,
+                    allowed_bridges: vec![],
+                },
+            ],
+        };
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "flat", secret, &spec).expect("split should succeed");
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        assert!(super::unwrap_leaf_share(&conn, leaves["a"], &sk_b.to_bytes()).is_err());
+        let raw = super::unwrap_leaf_share(&conn, leaves["a"], &sk_a.to_bytes())
+            .expect("matching secret should unwrap");
+        assert!(!raw.is_empty());
+    }
+
+    #[test]
+    fn split_and_reconstruct_a_pub_file_payload() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_a, sk_a) = register_encryption_key(&conn, "alice");
+        let (id_b, sk_b) = register_encryption_key(&conn, "bob");
+        let spec = NodeSpec::Split {
+            label: "root".into(),
+            threshold: 2,
+            allowed_bridges: vec![],
+            children: vec![
+                NodeSpec::Leaf {
+                    label: "a".into(),
+                    hardware_key_id: id_a,
+                    allowed_bridges: vec![],
+                },
+                NodeSpec::Leaf {
+                    label: "b".into(),
+                    hardware_key_id: id_b,
+                    allowed_bridges: vec![],
+                },
+            ],
+        };
+        let pub_file = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="
+        );
+        let key_id = split(&mut conn, "master-pub", pub_file.as_bytes(), &spec)
+            .expect("split should accept a pub-file payload");
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let mut shares = HashMap::new();
+        shares.insert(leaves["a"], unwrap_leaf_share(&conn, leaves["a"], &sk_a));
+        shares.insert(leaves["b"], unwrap_leaf_share(&conn, leaves["b"], &sk_b));
+        let recovered = reconstruct(&conn, key_id, &shares).expect("reconstruct");
+        assert_eq!(recovered, pub_file.as_bytes());
+    }
+
+    fn two_department_spec(software: i64, accounting: i64) -> NodeSpec {
+        NodeSpec::flat_split(
+            "M",
+            2,
+            vec![("M.S".into(), software), ("M.A".into(), accounting)],
+        )
+    }
+
+    #[test]
+    fn bind_survives_rebind_and_adding_a_leaf() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_s, sk_s) = register_encryption_key(&conn, "software");
+        let (id_a, sk_a) = register_encryption_key(&conn, "accounting");
+        let (id_new_s, sk_new_s) = register_encryption_key(&conn, "software-new");
+        let (id_f, sk_f) = register_encryption_key(&conn, "finance");
+        let spec = two_department_spec(id_s, id_a);
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "master", secret, &spec).expect("split");
+        bind_pair(&conn, key_id, "M.S", "M.A").expect("bind departments");
+
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let ms_id = leaves["M.S"];
+        let ma_id = leaves["M.A"];
+        rebind_leaf(&conn, key_id, "M.S", id_new_s, &sk_s.to_bytes()).expect("rebind");
+        assert_eq!(leaf_ids_by_label(&conn, key_id)["M.S"], ms_id);
+        let listing = list_bridges(&conn, key_id).expect("list");
+        assert!(listing
+            .established
+            .iter()
+            .any(|l| { (l.from == "M.S" && l.to == "M.A") || (l.from == "M.A" && l.to == "M.S") }));
+
+        let mut after_rebind = HashMap::new();
+        after_rebind.insert(ms_id, unwrap_leaf_share(&conn, ms_id, &sk_new_s));
+        after_rebind.insert(ma_id, unwrap_leaf_share(&conn, ma_id, &sk_a));
+        assert_eq!(reconstruct(&conn, key_id, &after_rebind).unwrap(), secret);
+
+        let new_id = add_leaf_and_reshare(&mut conn, key_id, "M", "M.F", id_f, &after_rebind)
+            .expect("add finance");
+        assert_eq!(leaf_ids_by_label(&conn, key_id)["M.S"], ms_id);
+        assert_eq!(leaf_ids_by_label(&conn, key_id)["M.A"], ma_id);
+        assert_eq!(leaf_ids_by_label(&conn, key_id)["M.F"], new_id);
+        let listing = list_bridges(&conn, key_id).expect("list after add");
+        assert!(listing
+            .established
+            .iter()
+            .any(|l| { (l.from == "M.S" && l.to == "M.A") || (l.from == "M.A" && l.to == "M.S") }));
+
+        let new_s = unwrap_leaf_share(&conn, ms_id, &sk_new_s);
+        let new_a = unwrap_leaf_share(&conn, ma_id, &sk_a);
+        let new_f = unwrap_leaf_share(&conn, new_id, &sk_f);
+        let mut survivors = HashMap::new();
+        survivors.insert(ms_id, new_s.clone());
+        survivors.insert(ma_id, new_a.clone());
+        assert_eq!(reconstruct(&conn, key_id, &survivors).unwrap(), secret);
+        let mut with_new = HashMap::new();
+        with_new.insert(ms_id, new_s);
+        with_new.insert(new_id, new_f);
+        assert_eq!(reconstruct(&conn, key_id, &with_new).unwrap(), secret);
+        // A full old quorum still encodes the same secret (Shamir). Mixing
+        // one old share with one new-polynomial share must not.
+        let mut mixed = HashMap::new();
+        mixed.insert(ms_id, after_rebind[&ms_id].clone());
+        mixed.insert(ma_id, new_a);
+        if let Ok(mixed_secret) = reconstruct(&conn, key_id, &mixed) {
+            assert_ne!(
+                mixed_secret, secret,
+                "mixed-generation sibling shares must not yield the parent secret"
+            );
+        }
+    }
+
+    #[test]
+    fn evict_drops_binds_that_mention_the_evicted_node() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id1, sk1) = register_encryption_key(&conn, "ma1");
+        let (id2, sk2) = register_encryption_key(&conn, "ma2");
+        let (id3, _sk3) = register_encryption_key(&conn, "ma3");
+        let (idb, _skb) = register_encryption_key(&conn, "mb");
+        let spec = department_tree_spec(id1, id2, id3, idb);
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "org", secret, &spec).expect("split");
+        add_bridge(&conn, key_id, "M.A.1", "M.B").expect("keep this bind");
+        bind_pair(&conn, key_id, "M.A.1", "M.A.3").expect("bind to evicted");
+
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let mut survivors = HashMap::new();
+        survivors.insert(
+            leaves["M.A.1"],
+            unwrap_leaf_share(&conn, leaves["M.A.1"], &sk1),
+        );
+        survivors.insert(
+            leaves["M.A.2"],
+            unwrap_leaf_share(&conn, leaves["M.A.2"], &sk2),
+        );
+        evict_and_refresh(&mut conn, key_id, leaves["M.A.3"], &survivors).expect("evict");
+
+        let listing = list_bridges(&conn, key_id).expect("list");
+        assert!(listing.established.iter().any(|l| {
+            (l.from == "M.A.1" && l.to == "M.B") || (l.from == "M.B" && l.to == "M.A.1")
+        }));
+        assert!(!listing
+            .established
+            .iter()
+            .any(|l| l.from == "M.A.3" || l.to == "M.A.3"));
+        assert!(!listing
+            .allowed
+            .iter()
+            .any(|(from, to)| from == "M.A.3" || to == "M.A.3"));
+    }
+
+    #[test]
+    fn revoke_drops_every_bind_for_that_hardware_key() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_s, _) = register_encryption_key(&conn, "software");
+        let (id_a, _) = register_encryption_key(&conn, "accounting");
+        let spec = two_department_spec(id_s, id_a);
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "master", secret, &spec).expect("split");
+        bind_all_sibling_leaf_pairs(&conn, key_id).expect("bind");
+        assert!(!list_bridges(&conn, key_id).unwrap().established.is_empty());
+        let trees = list_trees(&conn).expect("list trees");
+        assert_eq!(trees.len(), 1);
+        assert_eq!(trees[0].label, "master");
+        let dropped = drop_bindings_for_hardware(&conn, id_s).expect("drop");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].label, "M.S");
+        assert!(list_bridges(&conn, key_id).unwrap().established.is_empty());
+        assert!(list_bridges(&conn, key_id)
+            .unwrap()
+            .allowed
+            .iter()
+            .all(|(from, to)| from != "M.S" && to != "M.S"));
+    }
+
+    #[test]
+    fn export_spec_omits_inactive_leaves_and_keeps_binds() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (id_s, sk_s) = register_encryption_key(&conn, "software");
+        let (id_a, sk_a) = register_encryption_key(&conn, "accounting");
+        let spec = two_department_spec(id_s, id_a);
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "master", secret, &spec).expect("split");
+        bind_all_sibling_leaf_pairs(&conn, key_id).expect("auto-bind");
+        let exported = export_spec(&conn, key_id).expect("export");
+        match exported {
+            NodeSpec::Split {
+                label,
+                threshold,
+                children,
+                ..
+            } => {
+                assert_eq!(label, "M");
+                assert_eq!(threshold, 2);
+                assert_eq!(children.len(), 2);
+                let mut peers = children[0].allowed_bridges().to_vec();
+                peers.sort();
+                assert!(peers.contains(&"M.A".to_string()) || peers.contains(&"M.S".to_string()));
+            }
+            NodeSpec::Leaf { .. } => panic!("expected split"),
+        }
+
+        let (id_f, _sk_f) = register_encryption_key(&conn, "finance");
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let mut presented = HashMap::new();
+        presented.insert(
+            leaves["M.S"],
+            unwrap_leaf_share(&conn, leaves["M.S"], &sk_s),
+        );
+        presented.insert(
+            leaves["M.A"],
+            unwrap_leaf_share(&conn, leaves["M.A"], &sk_a),
+        );
+        add_leaf_and_reshare(&mut conn, key_id, "M", "M.F", id_f, &presented).expect("add");
+        let leaves = leaf_ids_by_label(&conn, key_id);
+        let evicted = leaves["M.F"];
+        let mut survivors = HashMap::new();
+        survivors.insert(
+            leaves["M.S"],
+            unwrap_leaf_share(&conn, leaves["M.S"], &sk_s),
+        );
+        survivors.insert(
+            leaves["M.A"],
+            unwrap_leaf_share(&conn, leaves["M.A"], &sk_a),
+        );
+        evict_and_refresh(&mut conn, key_id, evicted, &survivors).expect("evict finance");
+        match export_spec(&conn, key_id).expect("export after evict") {
+            NodeSpec::Split { children, .. } => {
+                let labels: Vec<_> = children.iter().map(|c| c.label().to_string()).collect();
+                assert_eq!(labels, vec!["M.S".to_string(), "M.A".to_string()]);
+            }
+            NodeSpec::Leaf { .. } => panic!("expected split"),
+        }
     }
 }

@@ -30,6 +30,7 @@ pub enum Error {
     BridgeNotWhitelisted,
     BridgeNotFound,
     CannotEvict,
+    CannotAddLeaf,
     ShareShapeMismatch,
 }
 
@@ -50,7 +51,7 @@ impl fmt::Display for Error {
             Error::InvalidQuorumThreshold => {
                 write!(f, "threshold must be between 1 and the number of children")
             }
-            Error::InvalidTreeSpec => write!(f, "key split tree spec is malformed"),
+            Error::InvalidTreeSpec => write!(f, "tree snapshot is malformed"),
             Error::KeyRevoked => write!(f, "hardware key has been revoked"),
             Error::WrongKeyType => write!(f, "hardware key is not the required type"),
             Error::InvalidPublicKey => write!(f, "public key is malformed"),
@@ -82,6 +83,12 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "this leaf cannot be evicted (not an active leaf, parent threshold is 1, remaining siblings cannot meet the threshold, or a sibling is not a leaf)"
+                )
+            }
+            Error::CannotAddLeaf => {
+                write!(
+                    f,
+                    "cannot add a leaf here (parent is not a split of active leaves, or adding would exceed 255 children)"
                 )
             }
             Error::ShareShapeMismatch => {

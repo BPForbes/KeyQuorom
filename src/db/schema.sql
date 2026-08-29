@@ -61,9 +61,8 @@ BEGIN
     SELECT RAISE(ABORT, 'cannot make a signing-only hardware key a quorum leaf');
 END;
 
--- Same guard, for the (currently unused — tree construction is
--- insert-only) case of a future code path reassigning a leaf's
--- hardware_key_id via UPDATE.
+-- Same guard when `bind --public-key-file` reassigns a leaf's
+-- hardware_key_id (node id stays put so pairings survive the rebind).
 CREATE TRIGGER IF NOT EXISTS trg_key_nodes_guard_key_type_on_update
 BEFORE UPDATE OF hardware_key_id ON key_nodes
 FOR EACH ROW

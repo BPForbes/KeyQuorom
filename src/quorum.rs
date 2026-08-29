@@ -167,15 +167,7 @@ mod tests {
         node_id: i64,
         secret_key: &crypto_box::SecretKey,
     ) -> Vec<u8> {
-        let wrapped: Vec<u8> = conn
-            .query_row(
-                "SELECT wrapped_share FROM key_nodes WHERE id = ?1",
-                params![node_id],
-                |row| row.get(0),
-            )
-            .expect("leaf node should exist");
-        secret_key
-            .unseal(&wrapped)
+        crate::key_tree::unwrap_leaf_share(conn, node_id, &secret_key.to_bytes())
             .expect("unseal should succeed with the matching secret key")
     }
 

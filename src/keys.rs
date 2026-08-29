@@ -3,7 +3,8 @@
 //! README's Roadmap) and CRUD over the `hardware_keys` table.
 
 use crate::error::{Error, Result};
-use rusqlite::{params, Connection, Row};
+use base64::Engine as _;
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -113,6 +114,80 @@ pub fn get_key(conn: &Connection, id: i64) -> Result<HardwareKey> {
     Ok(key)
 }
 
+pub fn get_key_by_public_key(conn: &Connection, public_key: &[u8]) -> Result<HardwareKey> {
+    conn.query_row(
+        &format!("SELECT {SELECT_COLUMNS} FROM hardware_keys WHERE public_key = ?1"),
+        params![public_key],
+        row_to_key,
+    )
+    .optional()?
+    .ok_or(Error::InvalidPublicKey)
+}
+
+/// Raw 32-byte public or private key material from a hex dump, PEM, or
+/// OpenSSH `.pub` line — the files `generate` writes and the usual
+/// standard key-file shapes.
+pub fn parse_key_text(contents: &str) -> Result<Vec<u8>> {
+    let trimmed = contents.trim();
+    if trimmed.starts_with("-----BEGIN ") {
+        return decode_pem_key(trimmed);
+    }
+    if let Some(raw) = parse_openssh_public(trimmed) {
+        return Ok(raw);
+    }
+    hex::decode(trimmed).map_err(|_| Error::InvalidPublicKey)
+}
+
+pub fn encryption_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
+    let secret_key = crypto_box::SecretKey::from(*secret);
+    *secret_key.public_key().as_bytes()
+}
+
+fn decode_pem_key(text: &str) -> Result<Vec<u8>> {
+    let mut b64 = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("-----BEGIN ") {
+            inside = true;
+            continue;
+        }
+        if line.starts_with("-----END ") {
+            break;
+        }
+        if inside {
+            b64.push_str(line);
+        }
+    }
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| Error::InvalidPublicKey)?;
+    if der.len() == 32 {
+        return Ok(der);
+    }
+    // PKCS#8 / SPKI keep the 32-byte key at the end of the DER body.
+    if der.len() > 32 {
+        return Ok(der[der.len() - 32..].to_vec());
+    }
+    Err(Error::InvalidPublicKey)
+}
+
+fn parse_openssh_public(line: &str) -> Option<Vec<u8>> {
+    let mut parts = line.split_whitespace();
+    let algo = parts.next()?;
+    if !algo.starts_with("ssh-") {
+        return None;
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(parts.next()?)
+        .ok()?;
+    if data.len() >= 32 {
+        Some(data[data.len() - 32..].to_vec())
+    } else {
+        None
+    }
+}
+
 pub fn revoke_key(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(
         "UPDATE hardware_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
@@ -143,6 +218,7 @@ pub(crate) fn get_active_encryption_key(conn: &Connection, id: i64) -> Result<Ha
 mod tests {
     use super::*;
     use crate::db;
+    use base64::Engine;
 
     #[test]
     fn keypair_generation_is_distinct_across_calls() {
@@ -252,5 +328,41 @@ mod tests {
 
         let key = get_active_encryption_key(&conn, id).expect("key should be active");
         assert_eq!(key.id, id);
+    }
+
+    #[test]
+    fn get_key_by_public_key_finds_the_registered_row() {
+        let conn = db::open_in_memory().expect("schema should apply");
+        let (_, public_key) = generate_encryption_keypair();
+        let id = register_key(&conn, "Alice", KeyType::Encryption, &public_key)
+            .expect("register_key should succeed");
+
+        let key = get_key_by_public_key(&conn, &public_key).expect("lookup should succeed");
+        assert_eq!(key.id, id);
+        assert!(get_key_by_public_key(&conn, &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn parse_key_text_accepts_hex_pem_and_openssh() {
+        let raw = [0x11u8; 32];
+        assert_eq!(parse_key_text(&hex::encode(raw)).unwrap(), raw);
+
+        let pem_body = Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{pem_body}\n-----END PUBLIC KEY-----\n");
+        assert_eq!(parse_key_text(&pem).unwrap(), raw);
+
+        let mut openssh_blob = Vec::from(*b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20");
+        openssh_blob.extend_from_slice(&raw);
+        let line = format!(
+            "ssh-ed25519 {} alice@host",
+            Engine::encode(&base64::engine::general_purpose::STANDARD, openssh_blob)
+        );
+        assert_eq!(parse_key_text(&line).unwrap(), raw);
+    }
+
+    #[test]
+    fn encryption_public_from_secret_matches_generated_pair() {
+        let (secret, public) = generate_encryption_keypair();
+        assert_eq!(encryption_public_from_secret(&secret), public);
     }
 }
