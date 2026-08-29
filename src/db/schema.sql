@@ -1,88 +1,92 @@
 -- KeyQuorum local storage schema.
 --
--- A protected file's encryption key is split into shares, each wrapped for
--- one registered hardware key. Unlocking a file requires presenting enough
--- hardware keys to reconstruct at least `quorum_threshold` shares.
+-- A splittable secret ("key") is organized as a tree of `key_nodes`: a
+-- SPLIT node divides its value via Shamir's Secret Sharing among its
+-- children with its own threshold, recursively, down to LEAF nodes, each
+-- of which is a share sealed to one registered hardware key. A protected
+-- file references a key's root and is unlocked by reconstructing that
+-- key's tree.
 
 CREATE TABLE IF NOT EXISTS hardware_keys (
     id            INTEGER PRIMARY KEY,
     label         TEXT NOT NULL,
+    key_type      TEXT NOT NULL CHECK (key_type IN ('encryption', 'signing')),
     fingerprint   TEXT NOT NULL UNIQUE,
     public_key    BLOB NOT NULL,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     revoked_at    TEXT
 );
 
--- No content hash is stored here either, for the same reason as
--- `password_locked_files` below: an unkeyed hash of the plaintext would
--- leak a fingerprint of it independent of whatever protects the file.
--- Once this table's file encryption is wired up, its own AEAD
--- authentication tag is what should verify integrity.
+-- A splittable secret in its own right, independent of any file — "key
+-- split" is a capability on its own, not just a mechanism for protecting
+-- files (see key_nodes below).
+CREATE TABLE IF NOT EXISTS keys (
+    id            INTEGER PRIMARY KEY,
+    label         TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- One row per node in a key's split tree. A node is either a SPLIT node
+-- (threshold set, hardware_key_id/wrapped_share NULL — reconstructing it
+-- means Shamir-recovering at least `threshold` of its children's values)
+-- or a LEAF (hardware_key_id/wrapped_share set, threshold NULL — a share
+-- sealed to one specific hardware key). parent_id NULL marks a key's root
+-- node. A flat "M-of-N hardware keys" quorum is just a one-level tree: a
+-- single SPLIT root with N LEAF children.
+CREATE TABLE IF NOT EXISTS key_nodes (
+    id                INTEGER PRIMARY KEY,
+    key_id            INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+    parent_id         INTEGER REFERENCES key_nodes(id) ON DELETE CASCADE,
+    label             TEXT NOT NULL,
+    threshold         INTEGER CHECK (threshold IS NULL OR threshold > 0),
+    hardware_key_id   INTEGER REFERENCES hardware_keys(id) ON DELETE RESTRICT,
+    wrapped_share     BLOB,
+    CHECK (
+        (threshold IS NOT NULL AND hardware_key_id IS NULL AND wrapped_share IS NULL)
+        OR (threshold IS NULL AND hardware_key_id IS NOT NULL AND wrapped_share IS NOT NULL)
+    )
+);
+
+-- A signing-purpose hardware key must never become a quorum leaf: nobody
+-- could ever unwrap it, since it isn't an encryption key. key_type isn't
+-- checked anywhere else at the SQL layer, so this is load-bearing.
+CREATE TRIGGER IF NOT EXISTS trg_key_nodes_guard_key_type
+BEFORE INSERT ON key_nodes
+FOR EACH ROW
+WHEN NEW.hardware_key_id IS NOT NULL
+AND (SELECT key_type FROM hardware_keys WHERE id = NEW.hardware_key_id) != 'encryption'
+BEGIN
+    SELECT RAISE(ABORT, 'cannot make a signing-only hardware key a quorum leaf');
+END;
+
+-- Same guard, for the (currently unused — tree construction is
+-- insert-only) case of a future code path reassigning a leaf's
+-- hardware_key_id via UPDATE.
+CREATE TRIGGER IF NOT EXISTS trg_key_nodes_guard_key_type_on_update
+BEFORE UPDATE OF hardware_key_id ON key_nodes
+FOR EACH ROW
+WHEN NEW.hardware_key_id IS NOT NULL
+AND (SELECT key_type FROM hardware_keys WHERE id = NEW.hardware_key_id) != 'encryption'
+BEGIN
+    SELECT RAISE(ABORT, 'cannot make a signing-only hardware key a quorum leaf');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_key_nodes_parent ON key_nodes (parent_id);
+CREATE INDEX IF NOT EXISTS idx_key_nodes_key ON key_nodes (key_id);
+CREATE INDEX IF NOT EXISTS idx_key_nodes_hardware_key ON key_nodes (hardware_key_id);
+
+-- A hardware-key-quorum-protected file. No content hash is stored: an
+-- unkeyed hash of the plaintext would leak a fingerprint of it
+-- independent of whatever protects the file — AES-256-GCM's own
+-- authentication tag is what verifies integrity on unlock.
 CREATE TABLE IF NOT EXISTS files (
     id                INTEGER PRIMARY KEY,
     name              TEXT NOT NULL,
     encrypted_path    TEXT NOT NULL UNIQUE,
-    quorum_threshold  INTEGER NOT NULL CHECK (
-        quorum_threshold > 0 AND typeof(quorum_threshold) = 'integer'
-    ),
+    key_id            INTEGER NOT NULL REFERENCES keys(id) ON DELETE RESTRICT,
+    nonce             BLOB NOT NULL,
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-
--- Which hardware keys are registered for a file's quorum, and the key
--- share wrapped for each one. A hardware key that still backs a share is
--- protected from deletion (ON DELETE RESTRICT) rather than silently
--- cascading, since losing a share out from under a file can drop it below
--- its quorum_threshold and make it permanently unrecoverable.
-CREATE TABLE IF NOT EXISTS file_key_shares (
-    file_id          INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    hardware_key_id  INTEGER NOT NULL REFERENCES hardware_keys(id) ON DELETE RESTRICT,
-    wrapped_share    BLOB NOT NULL,
-    PRIMARY KEY (file_id, hardware_key_id)
-);
-
--- Guard against removing a share (directly, or as a side effect of trying
--- to delete/unbind a hardware key) when doing so would drop a file's
--- remaining shares below its quorum_threshold.
-CREATE TRIGGER IF NOT EXISTS trg_file_key_shares_guard_quorum
-BEFORE DELETE ON file_key_shares
-FOR EACH ROW
-WHEN (
-    SELECT count(*) FROM file_key_shares WHERE file_id = OLD.file_id
-) - 1 < (
-    SELECT quorum_threshold FROM files WHERE id = OLD.file_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'cannot remove key share: file would fall below its quorum threshold');
-END;
-
--- Also guard against raising a file's quorum_threshold above its current
--- number of registered shares, which would make it unrecoverable without
--- ever deleting a share.
-CREATE TRIGGER IF NOT EXISTS trg_files_guard_quorum_threshold_increase
-BEFORE UPDATE OF quorum_threshold ON files
-FOR EACH ROW
-WHEN NEW.quorum_threshold > (
-    SELECT count(*) FROM file_key_shares WHERE file_id = OLD.id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'cannot raise quorum_threshold above the number of registered shares');
-END;
-
--- Also guard against reassigning a share to a different file, which would
--- silently drop it from its original file's count the same way a delete
--- would.
-CREATE TRIGGER IF NOT EXISTS trg_file_key_shares_guard_quorum_on_move
-BEFORE UPDATE OF file_id ON file_key_shares
-FOR EACH ROW
-WHEN NEW.file_id != OLD.file_id
-AND (
-    SELECT count(*) FROM file_key_shares WHERE file_id = OLD.file_id
-) - 1 < (
-    SELECT quorum_threshold FROM files WHERE id = OLD.file_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'cannot move key share: file would fall below its quorum threshold');
-END;
 
 -- Audit log of unlock attempts, successful or not.
 CREATE TABLE IF NOT EXISTS unlock_events (
@@ -92,9 +96,6 @@ CREATE TABLE IF NOT EXISTS unlock_events (
     success         INTEGER NOT NULL CHECK (success IN (0, 1)),
     keys_presented  TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_file_key_shares_hardware_key
-    ON file_key_shares (hardware_key_id);
 
 CREATE INDEX IF NOT EXISTS idx_unlock_events_file
     ON unlock_events (file_id);
@@ -113,11 +114,11 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 
 -- A file locked with a single password rather than a hardware-key quorum:
--- a lighter-weight protection tier, independent of the `files` /
--- `file_key_shares` quorum mechanism above. No separate content hash is
--- stored: AES-256-GCM's own authentication tag already proves the
--- decrypted plaintext is intact, and an unkeyed hash of the plaintext
--- would otherwise leak a password-independent fingerprint of it.
+-- a lighter-weight protection tier, independent of the `files` / `keys`
+-- quorum mechanism above. No separate content hash is stored: AES-256-GCM's
+-- own authentication tag already proves the decrypted plaintext is intact,
+-- and an unkeyed hash of the plaintext would otherwise leak a
+-- password-independent fingerprint of it.
 CREATE TABLE IF NOT EXISTS password_locked_files (
     id                INTEGER PRIMARY KEY,
     name              TEXT NOT NULL,
@@ -157,3 +158,30 @@ CREATE INDEX IF NOT EXISTS idx_credential_shares_credential
 
 CREATE INDEX IF NOT EXISTS idx_file_shares_file
     ON file_shares (file_id);
+
+-- Optional 4-digit-PIN gate on a resource, layered on top of (never
+-- instead of) that resource's real protection (master password, quorum,
+-- or a recipient's real public key for shared content) — see pin.rs for
+-- the honest caveat on what the attempt-lockout below can and can't
+-- guarantee against an attacker with an offline copy of this database.
+-- One generic table rather than duplicating these columns across five
+-- different resource tables, since SQLite has no clean polymorphic FK;
+-- mirrors how credential_shares/file_shares already are structurally
+-- the same shape.
+CREATE TABLE IF NOT EXISTS pins (
+    id                  INTEGER PRIMARY KEY,
+    resource_type       TEXT NOT NULL CHECK (resource_type IN (
+        'credential', 'locked_file', 'quorum_file',
+        'credential_share', 'file_share'
+    )),
+    resource_id         INTEGER NOT NULL,
+    pin_hash            BLOB NOT NULL,
+    pin_salt            BLOB NOT NULL,
+    require_every_use   INTEGER NOT NULL DEFAULT 0 CHECK (require_every_use IN (0, 1)),
+    ttl_seconds         INTEGER NOT NULL CHECK (ttl_seconds > 0),
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    locked_at           TEXT,
+    unlocked_until       TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (resource_type, resource_id)
+);

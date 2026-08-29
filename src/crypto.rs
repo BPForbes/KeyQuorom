@@ -39,6 +39,15 @@ pub fn random_nonce() -> [u8; NONCE_LEN] {
     nonce
 }
 
+/// Generates a random 256-bit data key for hardware-key-quorum file
+/// encryption (as opposed to `derive_key`, which is password-based). The
+/// returned buffer is zeroed on drop.
+pub fn random_key() -> Zeroizing<[u8; KEY_LEN]> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    OsRng.fill_bytes(&mut key[..]);
+    key
+}
+
 /// Argon2id parameters, pinned explicitly rather than via `Argon2::default()`
 /// (they currently match that default) so a future upgrade of the `argon2`
 /// crate can't silently change the parameters out from under
@@ -94,6 +103,13 @@ mod tests {
         let a = derive_key("correct horse battery staple", &salt).unwrap();
         let b = derive_key("correct horse battery staple", &salt).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn random_key_differs_across_calls() {
+        let a = random_key();
+        let b = random_key();
+        assert_ne!(*a, *b);
     }
 
     #[test]

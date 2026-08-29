@@ -81,7 +81,7 @@ pub fn unlock_file(conn: &Connection, id: i64, password: &str) -> Result<Vec<u8>
 /// cleans up its own partial write if anything after creation fails —
 /// but only ever removes a file it created itself.
 #[cfg(unix)]
-fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut file = fs::OpenOptions::new()
@@ -110,8 +110,14 @@ fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Non-Unix fallback: there's no portable API called here to restrict file
+/// permissions, so despite the name, this does **not** provide an
+/// owner-only guarantee on this platform — only the `create_new` (refuse
+/// to touch a pre-existing file) and cleanup-on-partial-write behavior
+/// carry over from the Unix version above. Callers on a non-Unix target
+/// must not assume the written file is protected from other local users.
 #[cfg(not(unix))]
-fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
+pub fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

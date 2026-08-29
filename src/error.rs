@@ -12,6 +12,18 @@ pub enum Error {
     ShareRevoked,
     ShareExhausted,
     IntegrityCheckFailed,
+    QuorumNotMet,
+    InvalidQuorumThreshold,
+    InvalidTreeSpec,
+    KeyRevoked,
+    WrongKeyType,
+    InvalidPublicKey,
+    SignatureVerificationFailed,
+    PinMismatch,
+    PinLocked,
+    PinNotSet,
+    InvalidPin,
+    BundleFieldTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -27,6 +39,22 @@ impl fmt::Display for Error {
             Error::ShareRevoked => write!(f, "share link has been revoked"),
             Error::ShareExhausted => write!(f, "share link has reached its use limit"),
             Error::IntegrityCheckFailed => write!(f, "decrypted content failed integrity check"),
+            Error::QuorumNotMet => write!(f, "not enough valid shares to reconstruct this key"),
+            Error::InvalidQuorumThreshold => {
+                write!(f, "threshold must be between 1 and the number of children")
+            }
+            Error::InvalidTreeSpec => write!(f, "key split tree spec is malformed"),
+            Error::KeyRevoked => write!(f, "hardware key has been revoked"),
+            Error::WrongKeyType => write!(f, "hardware key is not the required type"),
+            Error::InvalidPublicKey => write!(f, "public key is malformed"),
+            Error::SignatureVerificationFailed => write!(f, "signature does not match"),
+            Error::PinMismatch => write!(f, "incorrect PIN"),
+            Error::PinLocked => write!(f, "PIN is locked after too many incorrect attempts"),
+            Error::PinNotSet => write!(f, "no PIN is set for this resource"),
+            Error::InvalidPin => write!(f, "PIN must be exactly 4 digits"),
+            Error::BundleFieldTooLarge => {
+                write!(f, "export bundle field exceeds its encodable length")
+            }
         }
     }
 }
