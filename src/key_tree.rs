@@ -1246,7 +1246,10 @@ mod tests {
 
     fn wrapped_shares_by_id(conn: &Connection, key_id: i64) -> HashMap<i64, Vec<u8>> {
         let mut stmt = conn
-            .prepare("SELECT id, wrapped_share FROM key_nodes WHERE key_id = ?1")
+            .prepare(
+                "SELECT id, wrapped_share FROM key_nodes
+                 WHERE key_id = ?1 AND wrapped_share IS NOT NULL",
+            )
             .unwrap();
         stmt.query_map(params![key_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
