@@ -53,6 +53,11 @@ pub fn generate_zero_deltas(
 }
 
 /// XOR of two share encodings that must already share `x` and y-length.
+pub fn apply_deltas(share: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+    add_shares(share, delta)
+}
+
+/// XOR of two share encodings that must already share `x` and y-length.
 pub fn add_shares(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
     if a.len() < 2 || a.len() != b.len() || a[0] != b[0] {
         return Err(Error::ShareShapeMismatch);
@@ -93,14 +98,14 @@ pub fn refresh_among(shares: &mut [Vec<u8>], threshold: u8) -> Result<()> {
         let deltas = generate_zero_deltas(threshold, secret_len, &xs)?;
         for (&x, delta) in &deltas {
             let acc = combined.get_mut(&x).ok_or(Error::ShareShapeMismatch)?;
-            *acc = add_shares(acc, delta)?;
+            *acc = apply_deltas(acc, delta)?;
         }
     }
 
     for share in shares.iter_mut() {
         let x = share[0];
         let delta = combined.get(&x).ok_or(Error::ShareShapeMismatch)?;
-        *share = add_shares(share, delta)?;
+        *share = apply_deltas(share, delta)?;
     }
     Ok(())
 }

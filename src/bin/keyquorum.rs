@@ -1082,16 +1082,10 @@ mod tests {
             "M.B",
         ])
         .is_ok());
-        assert!(Cli::try_parse_from([
-            "keyquorum",
-            "key",
-            "lca",
-            "1",
-            "--node",
-            "M.A.1",
-            "M.A.2",
-        ])
-        .is_ok());
+        assert!(
+            Cli::try_parse_from(["keyquorum", "key", "lca", "1", "--node", "M.A.1", "M.A.2",])
+                .is_ok()
+        );
         assert!(
             Cli::try_parse_from(["keyquorum", "key", "lca", "1", "--node", "only-one"]).is_err()
         );
