@@ -67,7 +67,7 @@ pub fn add_shares(a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
 /// In-process mutual refresh: each survivor generates a blinding
 /// polynomial and every local share absorbs every generated delta.
 pub fn refresh_among(shares: &mut [Vec<u8>], threshold: u8) -> Result<()> {
-    if shares.is_empty() {
+    if shares.is_empty() || shares.len() < threshold as usize {
         return Err(Error::ShareShapeMismatch);
     }
     let secret_len = shares[0].len().saturating_sub(1);
@@ -185,6 +185,16 @@ mod tests {
         let mut shares = split_secret(secret, 1, 2);
         assert!(matches!(
             refresh_among(&mut shares, 1),
+            Err(Error::ShareShapeMismatch)
+        ));
+    }
+
+    #[test]
+    fn refresh_rejects_fewer_shares_than_the_threshold() {
+        let secret = b"the quorum has been reached!!!!";
+        let mut shares = split_secret(secret, 2, 2);
+        assert!(matches!(
+            refresh_among(&mut shares[..1], 2),
             Err(Error::ShareShapeMismatch)
         ));
     }

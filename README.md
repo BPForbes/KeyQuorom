@@ -65,10 +65,30 @@ keyquorum key bridge add 1 --from alice --to it
 keyquorum key bridge list 1
 keyquorum key bridge remove 1 --from alice --to it
 keyquorum key bridge deny 1 --node alice --peer it
-keyquorum key evict 1 --node-id 5 --share-file 3=alice_share.hex --share-file 4=bob_share.hex
 ```
 
-`key bridge allow` / `deny` change the whitelist. `add` / `remove` stand up or tear down an established pairing (add requires a whitelist hit on either side; deny also drops any pairing). `key evict` marks a leaf inactive and refreshes the remaining siblings' shares so the evicted piece becomes useless; the parent threshold is unchanged.
+`key bridge allow` / `deny` change the whitelist. `add` / `remove` stand up or tear down an established pairing (add requires a whitelist hit on either side; deny also drops any pairing).
+
+Eviction needs its own tree: the evicted leaf's parent must have threshold at least 2, and every remaining active sibling must be a hardware-backed leaf. `key evict` refuses a 1-of-N parent (the refresh would be a no-op). Copy leaf node ids from `key tree` — they are not `hardware_key_id` values.
+
+```json
+{
+  "label": "team", "threshold": 2,
+  "children": [
+    { "label": "alice", "hardware_key_id": 1 },
+    { "label": "bob", "hardware_key_id": 2 },
+    { "label": "carol", "hardware_key_id": 3 }
+  ]
+}
+```
+
+```sh
+keyquorum key split --tree-spec team.json --label "team escrow"
+keyquorum key tree <key-id>
+keyquorum key evict <key-id> --node-id <carol-node-id> \
+  --share-file <alice-node-id>=alice_share.hex \
+  --share-file <bob-node-id>=bob_share.hex
+```
 
 ```sh
 keyquorum key split --tree-spec tree.json --label "escrow demo"

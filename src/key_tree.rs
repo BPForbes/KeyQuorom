@@ -596,20 +596,18 @@ pub fn deny_bridge(
     peer_label: &str,
 ) -> Result<()> {
     let node_id = node_id_for_label(conn, key_id, node_label)?;
+    let peer_id = node_id_for_label(conn, key_id, peer_label)?;
     conn.execute(
-        "DELETE FROM key_node_bridges WHERE node_id = ?1 AND peer_label = ?2",
-        params![node_id, peer_label],
+        "DELETE FROM key_node_bridges
+         WHERE (node_id = ?1 AND peer_label = ?2)
+            OR (node_id = ?3 AND peer_label = ?4)",
+        params![node_id, peer_label, peer_id, node_label],
     )?;
-    if let (Ok(a), Ok(b)) = (
-        node_id_for_label(conn, key_id, node_label),
-        node_id_for_label(conn, key_id, peer_label),
-    ) {
-        if let Ok((lo, hi)) = ordered_pair(a, b) {
-            conn.execute(
-                "DELETE FROM key_node_links WHERE node_a_id = ?1 AND node_b_id = ?2",
-                params![lo, hi],
-            )?;
-        }
+    if let Ok((lo, hi)) = ordered_pair(node_id, peer_id) {
+        conn.execute(
+            "DELETE FROM key_node_links WHERE node_a_id = ?1 AND node_b_id = ?2",
+            params![lo, hi],
+        )?;
     }
     Ok(())
 }
@@ -744,8 +742,10 @@ pub fn evict_and_refresh(
         let raw = survivor_raw_shares
             .get(&node.db_id)
             .ok_or(Error::QuorumNotMet)?;
+        let hardware_key_id = node.hardware_key_id.ok_or(Error::CannotEvict)?;
+        let hardware_key = keys::get_active_encryption_key(&tx, hardware_key_id)?;
         shares.push(raw.clone());
-        share_meta.push((node.db_id, node.hardware_key_id.ok_or(Error::CannotEvict)?));
+        share_meta.push((node.db_id, hardware_key));
     }
 
     pss::refresh_among(&mut shares, threshold as u8)?;
@@ -755,8 +755,7 @@ pub fn evict_and_refresh(
         params![evicted_node_id],
     )?;
 
-    for ((db_id, hardware_key_id), new_share) in share_meta.iter().zip(shares.iter()) {
-        let hardware_key = keys::get_key(&tx, *hardware_key_id)?;
+    for ((db_id, hardware_key), new_share) in share_meta.iter().zip(shares.iter()) {
         let public_key_bytes: [u8; 32] = hardware_key.public_key[..]
             .try_into()
             .map_err(|_| Error::InvalidPublicKey)?;
@@ -1462,6 +1461,29 @@ mod tests {
         assert!(matches!(
             add_bridge(&conn, key_id, "missing", "M.B"),
             Err(Error::NodeNotFound)
+        ));
+    }
+
+    #[test]
+    fn deny_bridge_removes_the_reverse_whitelist_entry() {
+        let mut conn = db::open_in_memory().expect("schema should apply");
+        let (ma1, _) = register_encryption_key(&conn, "ma1");
+        let (ma2, _) = register_encryption_key(&conn, "ma2");
+        let (ma3, _) = register_encryption_key(&conn, "ma3");
+        let (mb, _) = register_encryption_key(&conn, "mb");
+        let spec = department_tree_spec(ma1, ma2, ma3, mb);
+        let secret = b"company master secret 32 bytes!";
+        let key_id = split(&mut conn, "org", secret, &spec).expect("split should succeed");
+
+        // Spec already whitelists M.A.1 -> M.B; add the reverse so either
+        // side would authorize a pairing after a one-way deny.
+        allow_bridge(&conn, key_id, "M.B", "M.A.1").expect("reverse allow should succeed");
+        add_bridge(&conn, key_id, "M.A.1", "M.B").expect("either whitelist should allow");
+        deny_bridge(&conn, key_id, "M.A.1", "M.B").expect("deny should succeed");
+        assert!(list_bridges(&conn, key_id).unwrap().established.is_empty());
+        assert!(matches!(
+            add_bridge(&conn, key_id, "M.B", "M.A.1"),
+            Err(Error::BridgeNotWhitelisted)
         ));
     }
 

@@ -41,14 +41,32 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 /// table. Databases from before `key_nodes.is_active` must be altered
 /// before any SELECT of that column.
 fn migrate(conn: &Connection) -> Result<()> {
-    if table_has_column(conn, "key_nodes", "is_active")? {
-        return Ok(());
+    // BEGIN IMMEDIATE serializes this check-and-alter against concurrent
+    // `open`s so two connections cannot both decide the column is missing.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let outcome = (|| -> Result<()> {
+        if table_has_column(conn, "key_nodes", "is_active")? {
+            return Ok(());
+        }
+        conn.execute(
+            "ALTER TABLE key_nodes ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            if table_has_column(conn, "key_nodes", "is_active")? {
+                return Ok(());
+            }
+            Err(err)
+        }
     }
-    conn.execute(
-        "ALTER TABLE key_nodes ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
-        [],
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]
