@@ -3,7 +3,8 @@
 //! README's Roadmap) and CRUD over the `hardware_keys` table.
 
 use crate::error::{Error, Result};
-use rusqlite::{params, Connection, Row};
+use base64::Engine as _;
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -113,6 +114,143 @@ pub fn get_key(conn: &Connection, id: i64) -> Result<HardwareKey> {
     Ok(key)
 }
 
+pub fn get_key_by_public_key(conn: &Connection, public_key: &[u8]) -> Result<HardwareKey> {
+    conn.query_row(
+        &format!("SELECT {SELECT_COLUMNS} FROM hardware_keys WHERE public_key = ?1"),
+        params![public_key],
+        row_to_key,
+    )
+    .optional()?
+    .ok_or(Error::InvalidPublicKey)
+}
+
+/// Raw 32-byte public or private key material from a hex dump, PEM, or
+/// OpenSSH `.pub` line — the files `generate` writes and the usual
+/// standard key-file shapes.
+pub fn parse_key_text(contents: &str) -> Result<Vec<u8>> {
+    let trimmed = contents.trim();
+    if trimmed.starts_with("-----BEGIN ") {
+        return decode_pem_key(trimmed);
+    }
+    if let Some(raw) = parse_openssh_public(trimmed) {
+        return Ok(raw);
+    }
+    hex::decode(trimmed).map_err(|_| Error::InvalidPublicKey)
+}
+
+pub fn encryption_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
+    let secret_key = crypto_box::SecretKey::from(*secret);
+    *secret_key.public_key().as_bytes()
+}
+
+/// RFC 8410 SubjectPublicKeyInfo prefixes (BIT STRING of 32 key bytes).
+const SPKI_X25519: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
+];
+const SPKI_ED25519: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+/// RFC 8410 PKCS#8 OneAsymmetricKey prefixes (OCTET STRING of 32 key bytes).
+const PKCS8_X25519: &[u8] = &[
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
+];
+const PKCS8_ED25519: &[u8] = &[
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
+fn decode_pem_key(text: &str) -> Result<Vec<u8>> {
+    let mut saw_label = false;
+    let mut b64 = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
+            let name = rest.strip_suffix("-----").ok_or(Error::InvalidPublicKey)?;
+            if !pem_label_is_curve_key(name) {
+                return Err(Error::InvalidPublicKey);
+            }
+            saw_label = true;
+            inside = true;
+            continue;
+        }
+        if line.starts_with("-----END ") {
+            break;
+        }
+        if inside {
+            b64.push_str(line);
+        }
+    }
+    if !saw_label {
+        return Err(Error::InvalidPublicKey);
+    }
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| Error::InvalidPublicKey)?;
+    extract_curve_key_bytes(&der)
+}
+
+fn pem_label_is_curve_key(label: &str) -> bool {
+    matches!(
+        label,
+        "PUBLIC KEY"
+            | "PRIVATE KEY"
+            | "ED25519 PUBLIC KEY"
+            | "ED25519 PRIVATE KEY"
+            | "X25519 PUBLIC KEY"
+            | "X25519 PRIVATE KEY"
+    )
+}
+
+fn extract_curve_key_bytes(der: &[u8]) -> Result<Vec<u8>> {
+    if der.len() == 32 {
+        return Ok(der.to_vec());
+    }
+    for prefix in [SPKI_X25519, SPKI_ED25519, PKCS8_X25519, PKCS8_ED25519] {
+        if der.len() == prefix.len() + 32 && der.starts_with(prefix) {
+            return Ok(der[prefix.len()..].to_vec());
+        }
+    }
+    Err(Error::InvalidPublicKey)
+}
+
+fn parse_openssh_public(line: &str) -> Option<Vec<u8>> {
+    let mut parts = line.split_whitespace();
+    let algo = parts.next()?;
+    if algo != "ssh-ed25519" {
+        return None;
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(parts.next()?)
+        .ok()?;
+    parse_ssh_ed25519_blob(&data)
+}
+
+fn parse_ssh_ed25519_blob(mut data: &[u8]) -> Option<Vec<u8>> {
+    let algo = read_ssh_string(&mut data)?;
+    if algo != b"ssh-ed25519" {
+        return None;
+    }
+    let key = read_ssh_string(&mut data)?;
+    if key.len() != 32 || !data.is_empty() {
+        return None;
+    }
+    Some(key.to_vec())
+}
+
+fn read_ssh_string<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {
+    if data.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes(data[..4].try_into().ok()?) as usize;
+    *data = &data[4..];
+    if data.len() < len {
+        return None;
+    }
+    let (head, tail) = data.split_at(len);
+    *data = tail;
+    Some(head)
+}
+
 pub fn revoke_key(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(
         "UPDATE hardware_keys SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
@@ -140,117 +278,5 @@ pub(crate) fn get_active_encryption_key(conn: &Connection, id: i64) -> Result<Ha
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db;
-
-    #[test]
-    fn keypair_generation_is_distinct_across_calls() {
-        let (sk_a, pk_a) = generate_encryption_keypair();
-        let (sk_b, pk_b) = generate_encryption_keypair();
-        assert_ne!(*sk_a, *sk_b);
-        assert_ne!(pk_a, pk_b);
-
-        let (sign_sk_a, sign_pk_a) = generate_signing_keypair();
-        let (sign_sk_b, sign_pk_b) = generate_signing_keypair();
-        assert_ne!(*sign_sk_a, *sign_sk_b);
-        assert_ne!(sign_pk_a, sign_pk_b);
-    }
-
-    #[test]
-    fn register_and_list_roundtrip() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let (_, public_key) = generate_encryption_keypair();
-        let id = register_key(&conn, "Alice", KeyType::Encryption, &public_key)
-            .expect("register_key should succeed");
-
-        let key = get_key(&conn, id).expect("get_key should succeed");
-        assert_eq!(key.label, "Alice");
-        assert_eq!(key.key_type, KeyType::Encryption);
-        assert_eq!(key.public_key, public_key);
-        assert_eq!(key.fingerprint, fingerprint(&public_key));
-        assert!(key.revoked_at.is_none());
-
-        let keys = list_keys(&conn).expect("list_keys should succeed");
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].id, id);
-    }
-
-    #[test]
-    fn register_key_rejects_wrong_length_public_key() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let result = register_key(&conn, "Alice", KeyType::Encryption, &[0u8; 31]);
-        assert!(matches!(result, Err(Error::InvalidPublicKey)));
-
-        let keys = list_keys(&conn).expect("list_keys should succeed");
-        assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn duplicate_fingerprint_is_rejected() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let (_, public_key) = generate_encryption_keypair();
-        register_key(&conn, "Alice", KeyType::Encryption, &public_key)
-            .expect("first register_key should succeed");
-
-        let result = register_key(&conn, "Alice (copy)", KeyType::Encryption, &public_key);
-        assert!(matches!(result, Err(Error::Db(_))));
-    }
-
-    #[test]
-    fn revoke_sets_revoked_at() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let (_, public_key) = generate_encryption_keypair();
-        let id = register_key(&conn, "Alice", KeyType::Encryption, &public_key)
-            .expect("register_key should succeed");
-
-        revoke_key(&conn, id).expect("revoke_key should succeed");
-        let key = get_key(&conn, id).expect("get_key should succeed");
-        assert!(key.revoked_at.is_some());
-    }
-
-    #[test]
-    fn remove_key_succeeds_when_unused() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let (_, public_key) = generate_encryption_keypair();
-        let id = register_key(&conn, "Alice", KeyType::Encryption, &public_key)
-            .expect("register_key should succeed");
-
-        remove_key(&conn, id).expect("remove_key should succeed");
-        assert!(get_key(&conn, id).is_err());
-    }
-
-    #[test]
-    fn get_active_encryption_key_rejects_revoked_key() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let (_, public_key) = generate_encryption_keypair();
-        let id = register_key(&conn, "Alice", KeyType::Encryption, &public_key)
-            .expect("register_key should succeed");
-        revoke_key(&conn, id).expect("revoke_key should succeed");
-
-        let result = get_active_encryption_key(&conn, id);
-        assert!(matches!(result, Err(Error::KeyRevoked)));
-    }
-
-    #[test]
-    fn get_active_encryption_key_rejects_signing_key() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let (_, public_key) = generate_signing_keypair();
-        let id = register_key(&conn, "Alice", KeyType::Signing, &public_key)
-            .expect("register_key should succeed");
-
-        let result = get_active_encryption_key(&conn, id);
-        assert!(matches!(result, Err(Error::WrongKeyType)));
-    }
-
-    #[test]
-    fn get_active_encryption_key_accepts_active_encryption_key() {
-        let conn = db::open_in_memory().expect("schema should apply");
-        let (_, public_key) = generate_encryption_keypair();
-        let id = register_key(&conn, "Alice", KeyType::Encryption, &public_key)
-            .expect("register_key should succeed");
-
-        let key = get_active_encryption_key(&conn, id).expect("key should be active");
-        assert_eq!(key.id, id);
-    }
-}
+#[path = "keys_tests/tests.rs"]
+mod tests;

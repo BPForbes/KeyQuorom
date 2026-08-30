@@ -6,6 +6,7 @@ pub mod key_tree;
 pub mod keys;
 pub mod locked_files;
 pub mod pin;
+pub mod pss;
 pub mod quorum;
 pub mod sharing;
 pub mod signing;
