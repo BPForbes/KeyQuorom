@@ -38,6 +38,9 @@ pub enum Error {
     BridgeDestroyed,
     BridgeGenerationMismatch,
     SealedKeyNotHeld,
+    /// Two parties whose node labels differ but reduce to the same delivery
+    /// file name, which would leave one of them without an envelope.
+    AmbiguousDeliveryName(String),
 }
 
 impl fmt::Display for Error {
@@ -123,6 +126,12 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "this store does not hold a sealed bridge secret for that member"
+                )
+            }
+            Error::AmbiguousDeliveryName(file) => {
+                write!(
+                    f,
+                    "two bridge parties both map to the delivery file {file}; rename one node label"
                 )
             }
         }

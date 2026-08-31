@@ -22,9 +22,10 @@
 //!
 //! `create` and `remove-member` generate every delivery package first.
 //! The CLI writes those `.kqpb` files, then commits. A failed write
-//! therefore leaves no live row (or no generation change), so the
-//! command can be retried. Library [`create`] still plans and commits in
-//! one call for in-process tests.
+//! therefore leaves no live row (or no generation change), and a failed
+//! commit takes the freshly written envelopes back down with it, so the
+//! command can be retried either way. Library [`create`] still plans and
+//! commits in one call for in-process tests.
 
 use crate::crypto::{random_salt, SALT_LEN};
 use crate::error::{Error, Result};
@@ -201,6 +202,7 @@ enum PlannedRemovalKind {
         bridge_id: i64,
         removed_label: String,
         notify: Vec<String>,
+        expected_generation: u32,
     },
     Rotate {
         uid: String,
@@ -514,9 +516,10 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<BridgeEvent> {
 }
 
 /// A remaining *member* who holds the sealed secret drops `removed_label`,
-/// rotates (or destroys if fewer than two members remain), and returns
-/// per-person packages for every remaining stakeholder plus the removed
-/// employee (so their store can drop the old standard).
+/// rotates (or destroys if fewer than two members remain), and returns one
+/// package per store: the new roster, plus a destroy notice for everyone the
+/// roster drops — the removed employee, and any supervisor who was on it
+/// only as that employee's parent — so those stores drop the old standard.
 ///
 /// Library callers that do not write packages to disk can use this helper,
 /// which commits immediately. The CLI plans, writes envelopes, then commits.
@@ -609,6 +612,7 @@ pub fn plan_remove_member(
                 bridge_id,
                 removed_label: removed_label.to_string(),
                 notify,
+                expected_generation: summary.generation,
             },
         });
     }
@@ -633,25 +637,35 @@ pub fn plan_remove_member(
         Some(new_secret_bytes),
         Some(&old_signing),
     )?;
-    packages.push(destroy_package_for(
-        uid,
-        summary.generation,
-        summary.label.as_deref().unwrap_or(""),
-        &old_public,
-        &summary.salt,
-        &members,
-        &supervisors,
-        removed_label,
-        removed_label,
-        summary
-            .parties
-            .iter()
-            .find(|p| p.label == removed_label)
-            .map(|p| p.encryption_public_key)
-            .ok_or(Error::NotBridgeMember)?,
-        PartyRole::Member,
-        &old_signing,
-    )?);
+    // Everyone the new roster drops gets a destroy notice for the generation
+    // they still hold, so their store stops tracking a bridge they are no
+    // longer party to: the removed member, plus any supervisor who was only
+    // on the roster as that member's parent.
+    //
+    // A department manager removed as a *member* can still be the parent of
+    // a remaining member, and `supervisor_pubs_for` keeps them on the new
+    // roster in that case. They get the supervisor envelope above and no
+    // destroy notice — two envelopes for one store collide on delivery, and
+    // the destroy would tear down a bridge they are meant to keep watching.
+    for party in &summary.parties {
+        if members.contains_key(&party.label) || supervisors.contains_key(&party.label) {
+            continue;
+        }
+        packages.push(destroy_package_for(
+            uid,
+            summary.generation,
+            summary.label.as_deref().unwrap_or(""),
+            &old_public,
+            &summary.salt,
+            &members,
+            &supervisors,
+            removed_label,
+            &party.label,
+            party.encryption_public_key,
+            party.role,
+            &old_signing,
+        )?);
+    }
 
     Ok(PlannedRemoval {
         outcome: RemoveMemberOutcome {
@@ -687,12 +701,20 @@ pub fn commit_planned_removal(conn: &Connection, planned: &PlannedRemoval) -> Re
             bridge_id,
             removed_label,
             notify,
+            expected_generation,
         } => with_immediate_transaction(conn, |conn| {
-            conn.execute(
+            // Same guard as the rotate path: the plan was built outside this
+            // transaction, so refuse to destroy a bridge that moved on in
+            // between — the destroy notices we handed out are signed with the
+            // generation read at plan time and no store would accept them.
+            let updated = conn.execute(
                 "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE uid = ?1",
-                params![uid],
+                 WHERE uid = ?1 AND generation = ?2 AND destroyed_at IS NULL",
+                params![uid, *expected_generation as i64],
             )?;
+            if updated != 1 {
+                return Err(Error::BridgeGenerationMismatch);
+            }
             conn.execute(
                 "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
                 params![bridge_id],

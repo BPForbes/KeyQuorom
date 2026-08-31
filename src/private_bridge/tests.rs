@@ -303,6 +303,89 @@ fn remove_member_rotates_and_notifies_remaining_stores() {
 }
 
 #[test]
+fn removing_a_manager_who_still_supervises_keeps_them_on_the_roster() {
+    let creator = db::open_in_memory().expect("schema");
+    let (sk_s, pk_s) = enc(&creator, "M.S");
+    let (sk_s2, pk_s2) = enc(&creator, "M.S.2");
+    let (_, pk_a2) = enc(&creator, "M.A.2");
+    let (sk_m, pk_m) = enc(&creator, "M");
+    let (_, pk_a) = enc(&creator, "M.A");
+    let (_, spk_s) = sign_key(&creator, "M.S");
+    let (_, spk_s2) = sign_key(&creator, "M.S.2");
+    let (_, spk_a2) = sign_key(&creator, "M.A.2");
+    // M.S signs as a member *and* is M.S.2's department manager.
+    let created = create(
+        &creator,
+        None,
+        Some("eng-acct"),
+        &[
+            party("M.S", pk_s, spk_s),
+            party("M.S.2", pk_s2, spk_s2),
+            party("M.A.2", pk_a2, spk_a2),
+        ],
+        &[supervisor("M", pk_m), supervisor("M.A", pk_a)],
+        Some("M.S.2"),
+    )
+    .expect("create");
+
+    let invite = |label: &str| {
+        created
+            .packages
+            .iter()
+            .find(|p| p.label == label)
+            .unwrap_or_else(|| panic!("invite for {label}"))
+            .bytes
+            .clone()
+    };
+    let db_s = db::open_in_memory().expect("m.s store");
+    import_package(&db_s, &invite("M.S"), &sk_s.to_bytes()).expect("import M.S invite");
+    let db_m = db::open_in_memory().expect("m store");
+    import_package(&db_m, &invite("M"), &sk_m.to_bytes()).expect("import M invite");
+
+    let outcome =
+        remove_member(&creator, &created.uid, "M.S", "M.S.2", &sk_s2.to_bytes()).expect("remove");
+    assert!(!outcome.destroyed);
+
+    // One envelope per store, or the CLI cannot write them to one directory.
+    let labels: Vec<&str> = outcome.packages.iter().map(|p| p.label.as_str()).collect();
+    let unique: BTreeSet<&str> = labels.iter().copied().collect();
+    assert_eq!(
+        labels.len(),
+        unique.len(),
+        "duplicate envelopes: {labels:?}"
+    );
+    // M.S stays on as M.S.2's manager; M was only there for member M.S.
+    assert_eq!(
+        unique,
+        BTreeSet::from(["M", "M.A", "M.A.2", "M.S", "M.S.2"])
+    );
+
+    let for_s = outcome
+        .packages
+        .iter()
+        .find(|p| p.label == "M.S")
+        .expect("M.S package");
+    assert_eq!(for_s.role, PartyRole::Supervisor);
+    import_package(&db_s, &for_s.bytes, &sk_s.to_bytes()).expect("M.S tracks the new generation");
+    let s_view = get(&db_s, &created.uid).expect("M.S summary");
+    assert!(!s_view.destroyed);
+    assert_eq!(s_view.generation, created.generation + 1);
+    assert!(s_view
+        .parties
+        .iter()
+        .any(|p| p.label == "M.S" && p.role == PartyRole::Supervisor && !p.has_sealed_key));
+
+    // M supervised nobody but member M.S, so their store drops the bridge.
+    let for_m = outcome
+        .packages
+        .iter()
+        .find(|p| p.label == "M")
+        .expect("M package");
+    import_package(&db_m, &for_m.bytes, &sk_m.to_bytes()).expect("M ingests destroy");
+    assert!(get(&db_m, &created.uid).expect("M summary").destroyed);
+}
+
+#[test]
 fn two_member_bridge_is_destroyed_when_one_leaves() {
     let conn = db::open_in_memory().expect("schema");
     let (sk_s3, pk_s3) = enc(&conn, "M.S.3");

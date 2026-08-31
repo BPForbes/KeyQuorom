@@ -136,9 +136,13 @@ standard. This database never keeps another person's sealed secret;
 
 Those two commands use the same plan-then-commit pattern: they generate
 every envelope first, write the files, then persist the new (or rotated)
-bridge in this database. If a write fails, the command leaves no live
-row for that change, so you can retry. There is no separate "redeliver
-initial packages" command because a failed create never commits.
+bridge in this database. Either both land or neither does: a failed write
+leaves no live row for that change, and a failed commit deletes the
+envelopes it just wrote — they describe a bridge this store never
+recorded, and `.kqpb` files are never overwritten, so leaving them behind
+would block the retry. Either way, run the command again. There is no
+separate "redeliver initial packages" command because a failed create
+never commits.
 
 Each `--member` must already have a registered **signing** public key
 under that label (`generate --type signing --label M.S.2 --register`).
