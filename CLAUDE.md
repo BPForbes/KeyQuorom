@@ -9,18 +9,19 @@ encrypted and bound to registered physical tokens (e.g. USB devices). Unlocking 
 protected file requires presenting a quorum of the registered hardware keys, providing
 layered, hardware-backed access control.
 
-The project is Rust-based (see `.gitignore` for Cargo-related patterns). It is in an
-early scaffolding stage — no source tree, build manifest, or CI exists yet. Do not
-assume commands like `cargo build`/`cargo test` work until a `Cargo.toml` is actually
-present; check before running them.
+The project is a Rust Cargo crate (see `.gitignore` for Cargo-related patterns).
+Private sign bridges live in `src/private_bridge.rs` and the `keyquorum` CLI.
+`create` and `remove-member` generate delivery packages first and commit only after
+those files are written — do not persist a live bridge before the envelopes exist.
 
 ## Working conventions
 
 - Keep changes minimal and scoped to what's requested — don't scaffold unrelated
   modules, abstractions, or tooling ahead of need.
-- Once a Cargo workspace exists, run `cargo build`, `cargo fmt`,
-  `cargo clippy --all-targets --all-features`, and `cargo test` before considering a
-  change complete.
+- After Rust work, run `cargo build`, `cargo fmt`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
+  `cargo test --locked --all-targets --all-features` before considering a change
+  complete.
 - Match existing code style; this repo has no established style guide yet, so follow
   standard Rust conventions (`rustfmt` defaults) unless told otherwise.
 
@@ -31,7 +32,8 @@ encrypted user files. Treat it as security-sensitive:
 
 - Never commit private keys, tokens, `.env` files, secrets, or plaintext copies of
   protected/test files. See `.gitignore` for patterns already excluded (`*.key`,
-  `*.pem`, `*.secret`, `*.token`, `*.kqkey`, `secrets/`, `keys/`, `test-keys/`, etc.).
+  `*.pem`, `*.secret`, `*.token`, `*.kqkey`, `*.kqpb`, `*.kqbn`, `secrets/`,
+  `keys/`, `test-keys/`, etc.).
 - Be extra careful with any code touching key derivation, encryption/decryption, or
   quorum/threshold logic — correctness bugs here are security bugs.
 - Flag anything that looks like a hardcoded secret or credential before committing.

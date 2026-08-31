@@ -4,21 +4,24 @@ KeyQuorum is a secure file-sharing system centered on hardware key sharing. File
 encrypted and bound to registered physical tokens (e.g. USB devices). Unlocking a
 protected file requires presenting a quorum of the registered hardware keys.
 
-Project is Rust-based and currently in an early scaffolding stage — no source tree or
-`Cargo.toml` exists yet. Don't assume `cargo build`/`cargo test`/`cargo clippy` work
-until a build manifest is actually present.
+The project is a Rust Cargo crate. Private sign bridges live in `src/private_bridge.rs`
+and the `keyquorum` CLI. `create` and `remove-member` generate delivery packages first
+and commit only after those files are written — do not persist a live bridge before
+the envelopes exist.
 
 Rules:
 
 - Keep changes minimal and scoped to what's asked. Don't add speculative abstractions,
   unrelated tooling, or unfinished scaffolding.
-- Once a Cargo workspace exists, run `cargo build`, `cargo fmt`,
-  `cargo clippy --all-targets --all-features`, and `cargo test` before treating a
-  change as done. Follow standard `rustfmt` conventions.
+- After Rust work, run `cargo build`, `cargo fmt`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
+  `cargo test --locked --all-targets --all-features` before treating a change as
+  done. Follow standard `rustfmt` conventions.
 - This project is security-sensitive: it deals with cryptographic key material,
   hardware tokens, and encrypted user files.
   - Never commit private keys, tokens, `.env` files, secrets, or plaintext copies of
-    protected/test files (see `.gitignore` for excluded patterns).
+    protected/test files (see `.gitignore` for excluded patterns, including `*.kqpb`
+    and `*.kqbn`).
   - Be especially careful with code touching key derivation, encryption/decryption,
     or quorum/threshold logic — bugs there are security bugs.
 - Keep `CLAUDE.md` and `AGENTS.md` in sync with these rules when updating one.

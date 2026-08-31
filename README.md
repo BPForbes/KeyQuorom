@@ -134,6 +134,17 @@ Managers receive roster metadata only so they can track the live
 standard. This database never keeps another person's sealed secret;
 `create` / `remove-member` write one `.kqpb` **envelope** per store.
 
+Those two commands use the same plan-then-commit pattern: they generate
+every envelope first, write the files, then persist the new (or rotated)
+bridge in this database. If a write fails, the command leaves no live
+row for that change, so you can retry. There is no separate "redeliver
+initial packages" command because a failed create never commits.
+
+Each `--member` must already have a registered **signing** public key
+under that label (`generate --type signing --label M.S.2 --register`).
+The roster stores that key. `verify` checks the artifact against the
+roster-bound personal key, not a pub declared only on the signature.
+
 Each `.kqpb` is a cryptographic envelope (same idea as `KQXB` export
 bundles): the outside names the recipient’s X25519 public key; the inside
 is `crypto_box`-sealed so only that store’s encryption private key can
@@ -146,6 +157,8 @@ outside (anyone can see)     inside (recipient only)
 -------------------------    --------------------------------
 KQPB magic, kind             wrap_salt || bridge secret (members)
 recipient encryption pub     or roster + salts (managers)
+                             roster includes each member's
+                             personal signing pub
                              + rotate/destroy auth sig
 ```
 
@@ -154,6 +167,11 @@ different pub. Operators copy those files out of band. Online relay
 delivery is enhancement #10 and is not part of this change.
 
 ```sh
+# Each member needs a registered signing public key under their label:
+keyquorum generate --type signing --label M.S.2 --register \
+  --public-key-out M.S.2.sign.pub > M.S.2.sign.key
+# …same for M.S.3 and M.A.2
+
 # On any machine that can see the tree (and manager encryption pubs):
 keyquorum bridge private create 1 \
   --member M.S.2 --member M.S.3 --member M.A.2 \
@@ -174,9 +192,11 @@ keyquorum --db ms2.sqlite verify --bridge-uid <uid> --as-node M.S.2 \
   --message-file report.pdf --signature-file report.kqbs
 ```
 
-If `M.S` evicts `M.S.3`, remaining members must rotate (the departed
-person still holds the old bridge secret). `revoke --evict` prints the
-notify list and writes a `.kqbn` notice. A remaining member then:
+If `M.S` revokes `M.S.3`'s hardware key, that label is dropped from
+every live private bridge. Ordinary `revoke` (not only `--evict`)
+prints the notify list and writes a `.kqbn` notice **after** the
+hardware revoke commits. Remaining members must rotate (the departed
+person still holds the old bridge secret). A remaining member then:
 
 ```sh
 keyquorum bridge private remove-member <uid> --member M.S.3 \
@@ -188,14 +208,15 @@ keyquorum bridge private remove-member <uid> --member M.S.3 \
 A two-person bridge is destroyed when one member is removed.
 
 Banning a hardware key is `revoke <hardware-id>`. That always drops
-pairings and whitelist rows for every live leaf sealed to that token.
-`--evict` PSS-refreshes survivors of that leaf (`--key-id` / `--node`,
-or the unique leaf the token backs). Eviction needs a parent threshold
-of at least 2, and every remaining active sibling must be a
-hardware-backed leaf — a 1-of-N parent is refused. Binds between
-survivors stay. `--share-file` is that sibling's actual key file
-(`.pub` / `.key` from `generate` or `split --generate-keys`, or a PEM /
-OpenSSH public key). A `.pub` file uses a sibling `.key` when present.
+pairings and whitelist rows for every live leaf sealed to that token,
+and drops that label from every live private sign bridge. `--evict`
+PSS-refreshes survivors of that leaf (`--key-id` / `--node`, or the
+unique leaf the token backs). Eviction needs a parent threshold of at
+least 2, and every remaining active sibling must be a hardware-backed
+leaf — a 1-of-N parent is refused. Binds between survivors stay.
+`--share-file` is that sibling's actual key file (`.pub` / `.key` from
+`generate` or `split --generate-keys`, or a PEM / OpenSSH public key).
+A `.pub` file uses a sibling `.key` when present.
 
 ```sh
 keyquorum split --label "team escrow" --threshold 2 \

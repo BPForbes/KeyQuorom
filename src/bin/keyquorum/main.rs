@@ -76,8 +76,9 @@ enum Command {
     },
     /// List registered hardware keys and live split trees
     List,
-    /// Revoke a registered key. Always drops that token's pairings on
-    /// any live tree. Optional --evict PSS-refreshes the survivors.
+    /// Revoke a registered key. Always drops that token's pairings and
+    /// private-bridge membership on any live tree. Optional --evict
+    /// PSS-refreshes the survivors.
     Revoke {
         /// Hardware key id from `list`
         id: i64,
@@ -344,10 +345,12 @@ enum BridgeCommand {
 
 #[derive(Subcommand)]
 enum PrivateBridgeCommand {
-    /// Create a private sign bridge and write per-person packages
+    /// Create a private sign bridge. Writes every .kqpb envelope first,
+    /// then commits this store so a failed write leaves no live row.
     Create {
         key_id: i64,
-        /// Signing member as LABEL or LABEL=pub-file (repeatable)
+        /// Signing member as LABEL or LABEL=pub-file (repeatable).
+        /// Each label must already have a registered signing public key.
         #[arg(long = "member", required = true)]
         members: Vec<String>,
         /// Department/CXO supervisor as LABEL or LABEL=pub-file.
@@ -385,8 +388,8 @@ enum PrivateBridgeCommand {
         #[arg(long)]
         share_file: String,
     },
-    /// Drop a signing member, rotate or destroy, and write packages for
-    /// remaining members, department managers, and the removed person
+    /// Drop a signing member. Writes rotation/destroy packages first,
+    /// then commits so a failed write can be retried.
     RemoveMember {
         uid: String,
         /// Member label to remove

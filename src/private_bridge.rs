@@ -19,6 +19,12 @@
 //! That file is a digital envelope: the header names the recipient's
 //! X25519 public key; `crypto_box` seals the letter. A carrier can route
 //! the envelope without opening it. Network delivery is enhancement #10.
+//!
+//! `create` and `remove-member` generate every delivery package first.
+//! The CLI writes those `.kqpb` files, then commits. A failed write
+//! therefore leaves no live row (or no generation change), so the
+//! command can be retried. Library [`create`] still plans and commits in
+//! one call for in-process tests.
 
 use crate::crypto::{random_salt, SALT_LEN};
 use crate::error::{Error, Result};
@@ -228,6 +234,11 @@ pub struct BridgeChange {
     pub notice: Vec<u8>,
 }
 
+/// Plan invite packages and immediately commit them.
+///
+/// In-process callers (including tests) use this helper. The CLI calls
+/// [`plan_create`], writes the envelopes, then [`commit_planned_creation`]
+/// so a disk failure cannot leave a live bridge without packages.
 pub fn create(
     conn: &Connection,
     key_id: Option<i64>,
