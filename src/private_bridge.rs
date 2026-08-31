@@ -17,8 +17,8 @@
 //! handed a per-recipient `KQPB` file.
 //!
 //! That file is a digital envelope: the header names the recipient's
-//! X25519 public key; `crypto_box` seals the letter. Carriers (USB, mail,
-//! a future mailbox server) can route the envelope without opening it.
+//! X25519 public key; `crypto_box` seals the letter. A carrier can route
+//! the envelope without opening it. Network delivery is enhancement #10.
 
 use crate::crypto::{random_salt, SALT_LEN};
 use crate::error::{Error, Result};

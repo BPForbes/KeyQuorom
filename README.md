@@ -150,9 +150,8 @@ recipient encryption pub     or roster + salts (managers)
 ```
 
 Five people in the example means five envelopes, each addressed to a
-different pub. The next PR’s online server is an inbox of these
-envelopes: store and forward by recipient fingerprint; devices still
-`import` locally after opening with `--share-file`.
+different pub. Operators copy those files out of band. Online relay
+delivery is enhancement #10 and is not part of this change.
 
 ```sh
 # On any machine that can see the tree (and manager encryption pubs):
@@ -183,7 +182,7 @@ notify list and writes a `.kqbn` notice. A remaining member then:
 keyquorum bridge private remove-member <uid> --member M.S.3 \
   --node M.S.2 --share-file Software2.key --output-dir ./bridge-packages
 # Copy the new packages to M.S.2, M.A.2, M.S, M.A, and M.S.3
-# (an online mailbox server to push/pull these files is the next PR).
+# (online relay delivery is enhancement #10).
 ```
 
 A two-person bridge is destroyed when one member is removed.
@@ -263,7 +262,7 @@ keyquorum share redeem-file
 
 Not built yet:
 
-- **Online mailbox server (next PR)** — an inbox of sealed **envelopes** (`.kqpb`): store and forward by recipient encryption fingerprint. The server reads only the outside address, never the letter. Devices still `import` locally. A web UI can wait until `relay push` / `pull` work.
+- **[#10](https://github.com/BPForbes/KeyQuorom/issues/10) Online relay** — inbox of sealed `.kqpb` envelopes (later). Devices still `import` locally.
 
 These still need a private-key custody model (a software file, OS keychain, or real hardware) that hasn't been decided:
 
