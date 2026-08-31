@@ -162,7 +162,8 @@ notify list and writes a `.kqbn` notice. A remaining member then:
 ```sh
 keyquorum bridge private remove-member <uid> --member M.S.3 \
   --node M.S.2 --share-file Software2.key --output-dir ./bridge-packages
-# Send the new packages to M.S.2, M.A.2, M.S, M.A, and M.S.3.
+# Copy the new packages to M.S.2, M.A.2, M.S, M.A, and M.S.3
+# (an online mailbox server to push/pull these files is the next PR).
 ```
 
 A two-person bridge is destroyed when one member is removed.
@@ -244,15 +245,13 @@ These are deliberately not implemented — not stubbed, just not yet built — b
 all need a private-key custody model (a software file? the OS keychain? real hardware?)
 that hasn't been decided:
 
+- **Online mailbox server (next PR)** — a small relay that stores and forwards sealed `.kqpb` / `.kqbn` files to each device’s inbox. The server must not hold private keys or the org SQLite tree; devices still `import` locally. A web UI can wait until `relay push` / `pull` work.
 - **Persisted private-key custody** for `generate` (today the private key only ever
   goes to stdout).
 - **`unwrap-share`** — turning a stored, sealed quorum share back into the raw share
   a hardware key's own private key would produce.
 - **`import`** of password-vault / locked-file `export` bundles (the bundle format
   and encoder are already final). Private-bridge `.kqpb` import is implemented.
-- Out-of-band **signed bridge-update bundles for operators who share no live
-  database** are the next step beyond today's per-person `.kqpb` packages and
-  `.kqbn` eviction notices.
 
 ## Security
 
