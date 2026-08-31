@@ -1025,15 +1025,16 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
                 });
             }
             fs::create_dir_all(&output_dir)?;
-            let created = private_bridge::create(
-                conn,
+            let planned = private_bridge::plan_create(
                 Some(key_id),
                 label.as_deref(),
                 &member_parties,
                 &supervisor_parties,
                 self_node.as_deref(),
             )?;
-            write_delivery_packages(&output_dir, &created.packages)?;
+            write_delivery_packages(&output_dir, &planned.created.packages)?;
+            private_bridge::commit_planned_creation(conn, &planned)?;
+            let created = &planned.created;
             println!(
                 "Created private bridge {} (generation {}). Notify {} store(s):",
                 created.uid,

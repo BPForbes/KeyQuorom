@@ -131,6 +131,18 @@ pub struct CreatedBridge {
     pub packages: Vec<DeliveryPackage>,
 }
 
+/// Bridge material produced by [`plan_create`]. Packages are generated first
+/// so callers can persist them before this store commits.
+pub struct PlannedCreation {
+    pub created: CreatedBridge,
+    key_id: Option<i64>,
+    label: Option<String>,
+    members: BTreeMap<String, MemberKeys>,
+    supervisors: BTreeMap<String, [u8; 32]>,
+    local_label: Option<String>,
+    secret: Zeroizing<[u8; 32]>,
+}
+
 #[derive(Clone, Debug)]
 pub struct BridgeParty {
     pub label: String,
@@ -224,6 +236,20 @@ pub fn create(
     supervisors: &[BridgePartyInput],
     local_label: Option<&str>,
 ) -> Result<CreatedBridge> {
+    let planned = plan_create(key_id, label, members, supervisors, local_label)?;
+    commit_planned_creation(conn, &planned)?;
+    Ok(planned.created)
+}
+
+/// Build invite packages without writing this store. The CLI writes those
+/// files, then [`commit_planned_creation`].
+pub fn plan_create(
+    key_id: Option<i64>,
+    label: Option<&str>,
+    members: &[BridgePartyInput],
+    supervisors: &[BridgePartyInput],
+    local_label: Option<&str>,
+) -> Result<PlannedCreation> {
     let members = unique_members(members)?;
     if members.len() < 2 {
         return Err(Error::TooFewBridgeMembers);
@@ -241,37 +267,6 @@ pub fn create(
     let salt = random_salt();
     let (secret, public_key) = keys::generate_signing_keypair();
     let generation = 1u32;
-
-    with_immediate_transaction(conn, |conn| {
-        persist_new_bridge(
-            conn,
-            &uid,
-            key_id,
-            label,
-            generation,
-            &public_key,
-            &salt,
-            &members,
-            &supervisors,
-            local_label,
-            &secret,
-        )?;
-        insert_event(
-            conn,
-            last_bridge_id(conn, &uid)?,
-            "created",
-            json!({
-                "uid": uid,
-                "generation": generation,
-                "members": sorted_keys(&members),
-                "supervisors": sorted_keys(&supervisors),
-                "notify": notify_labels(members.keys().map(|s| s.as_str())),
-                "salt": hex::encode(salt),
-            }),
-        )?;
-        Ok(())
-    })?;
-
     let secret_bytes: &[u8; 32] = &secret;
     let packages = packages_for_roster(
         KIND_INVITE,
@@ -288,12 +283,55 @@ pub fn create(
         None,
     )?;
 
-    Ok(CreatedBridge {
-        uid,
-        generation,
-        public_key,
-        salt,
-        packages,
+    Ok(PlannedCreation {
+        created: CreatedBridge {
+            uid,
+            generation,
+            public_key,
+            salt,
+            packages,
+        },
+        key_id,
+        label: label.map(str::to_string),
+        members,
+        supervisors,
+        local_label: local_label.map(str::to_string),
+        secret,
+    })
+}
+
+/// Persist a previously planned creation. Callers that write delivery
+/// packages should persist those files first so a later disk failure does
+/// not leave a live bridge without envelopes.
+pub fn commit_planned_creation(conn: &Connection, planned: &PlannedCreation) -> Result<()> {
+    with_immediate_transaction(conn, |conn| {
+        persist_new_bridge(
+            conn,
+            &planned.created.uid,
+            planned.key_id,
+            planned.label.as_deref(),
+            planned.created.generation,
+            &planned.created.public_key,
+            &planned.created.salt,
+            &planned.members,
+            &planned.supervisors,
+            planned.local_label.as_deref(),
+            &planned.secret,
+        )?;
+        insert_event(
+            conn,
+            last_bridge_id(conn, &planned.created.uid)?,
+            "created",
+            json!({
+                "uid": planned.created.uid,
+                "generation": planned.created.generation,
+                "members": sorted_keys(&planned.members),
+                "supervisors": sorted_keys(&planned.supervisors),
+                "notify": notify_labels(planned.members.keys().map(|s| s.as_str())),
+                "salt": hex::encode(planned.created.salt),
+            }),
+        )?;
+        Ok(())
     })
 }
 
