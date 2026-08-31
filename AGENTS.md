@@ -10,17 +10,18 @@ encrypted and bound to registered physical tokens (e.g. USB devices). Unlocking 
 protected file requires presenting a quorum of the registered hardware keys, providing
 layered, hardware-backed access control.
 
-The project is Rust-based. It is currently in an early scaffolding stage — no source
-tree, build manifest, or CI pipeline exists yet. Verify a `Cargo.toml` actually exists
-before assuming `cargo build`, `cargo test`, or `cargo clippy` will run.
+The project is a Rust Cargo crate. Private sign bridges live in `src/private_bridge.rs`
+and the `keyquorum` CLI. `create` and `remove-member` generate delivery packages first
+and commit only after those files are written — do not persist a live bridge before
+the envelopes exist. The two must stay in step in both directions: if the commit
+fails, the CLI deletes the `.kqpb` files it just wrote, because `write_owner_only`
+refuses to overwrite and leftovers would block the retry.
 
 ## Setup / build / test
 
-No build system is present yet. Once a Cargo workspace is added:
-
 - Build: `cargo build`
-- Test: `cargo test`
-- Lint: `cargo clippy --all-targets --all-features`
+- Test: `cargo test --locked --all-targets --all-features`
+- Lint: `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - Format: `cargo fmt`
 
 Run format, lint, and tests before considering any change complete.
@@ -39,7 +40,8 @@ files, so treat it as security-sensitive:
 
 - Never commit private keys, tokens, `.env` files, secrets, or plaintext copies of
   protected/test files. See `.gitignore` for excluded patterns (`*.key`, `*.pem`,
-  `*.secret`, `*.token`, `*.kqkey`, `secrets/`, `keys/`, `test-keys/`, etc.).
+  `*.secret`, `*.token`, `*.kqkey`, `*.kqpb`, `*.kqbn`, `secrets/`, `keys/`,
+  `test-keys/`, etc.).
 - Take extra care with code touching key derivation, encryption/decryption, or
   quorum/threshold logic — bugs there are security bugs, not just correctness bugs.
 

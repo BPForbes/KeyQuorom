@@ -58,3 +58,53 @@ fn malformed_public_key_is_rejected() {
     );
     assert!(matches!(result, Err(Error::InvalidPublicKey)));
 }
+
+#[test]
+fn sign_round_trips_through_verify() {
+    let (signing_key, public_key) = generate();
+    let message = b"file bytes";
+    let signature = sign(&signing_key.to_bytes(), message);
+    assert!(verify_signature(&public_key, message, &signature).is_ok());
+}
+
+#[test]
+fn bridge_dual_signature_binds_salts_and_rejects_wrong_message() {
+    let (bridge, bridge_pub) = generate();
+    let (personal, _) = generate();
+    let message = b"co-signed pdf";
+    let artifact = sign_with_bridge(
+        "abc",
+        1,
+        &[7u8; 16],
+        "M.A.2",
+        &bridge.to_bytes(),
+        &personal.to_bytes(),
+        message,
+    )
+    .expect("sign");
+    let personal_pub = personal.verifying_key().to_bytes();
+    assert!(verify_bridge_signature(&artifact, &bridge_pub, &personal_pub, message).is_ok());
+    assert!(matches!(
+        verify_bridge_signature(&artifact, &bridge_pub, &personal_pub, b"tampered"),
+        Err(Error::SignatureVerificationFailed)
+    ));
+    let (_, other_pub) = generate();
+    assert!(matches!(
+        verify_bridge_signature(&artifact, &bridge_pub, &other_pub, message),
+        Err(Error::SignatureVerificationFailed)
+    ));
+    let encoded = encode_bridge_signature(&artifact).expect("encode");
+    let decoded = decode_bridge_signature(&encoded).expect("decode");
+    assert_eq!(decoded, artifact);
+    let again = sign_with_bridge(
+        "abc",
+        1,
+        &[7u8; 16],
+        "M.A.2",
+        &bridge.to_bytes(),
+        &personal.to_bytes(),
+        message,
+    )
+    .expect("sign");
+    assert_ne!(artifact.signature_salt, again.signature_salt);
+}

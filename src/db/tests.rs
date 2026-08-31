@@ -11,7 +11,7 @@ fn schema_applies_cleanly() {
             |row| row.get(0),
         )
         .expect("query should succeed");
-    assert_eq!(table_count, 12);
+    assert_eq!(table_count, 16);
 }
 
 #[test]
@@ -180,6 +180,31 @@ fn opening_a_legacy_key_nodes_table_adds_is_active() {
         .expect("is_active should be readable after migrate");
     assert_eq!(is_active, 1);
     init(&conn).expect("a second init must be idempotent");
+}
+
+#[test]
+fn private_bridge_member_requires_a_signing_public_key() {
+    let conn = open_in_memory().expect("schema should apply");
+    conn.execute(
+        "INSERT INTO private_bridges (uid, generation, public_key, salt)
+         VALUES ('uid', 1, x'00', x'01')",
+        [],
+    )
+    .expect("bridge row");
+    let rejected = conn.execute(
+        "INSERT INTO private_bridge_members
+         (bridge_id, node_label, encryption_public_key, signing_public_key, role)
+         VALUES (1, 'M.S.2', x'02', NULL, 'member')",
+        [],
+    );
+    assert!(rejected.is_err());
+    let accepted = conn.execute(
+        "INSERT INTO private_bridge_members
+         (bridge_id, node_label, encryption_public_key, signing_public_key, role)
+         VALUES (1, 'M.S', x'03', NULL, 'supervisor')",
+        [],
+    );
+    assert!(accepted.is_ok());
 }
 
 #[test]

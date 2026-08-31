@@ -42,6 +42,8 @@ build/
 *.secret
 *.token
 *.kqkey
+*.kqpb
+*.kqbn
 secrets/
 keys/
 test-keys/

@@ -1,7 +1,8 @@
 //! Command-line interface over the KeyQuorum library: hardware-key
 //! registration, recursive key splitting, the password vault,
 //! password-locked and hardware-key-quorum-protected files (unified under
-//! `access`), signature verification, share links, and export bundles.
+//! `access`), signature verification and private-bridge signing, share
+//! links, and export bundles.
 //!
 //! Producing signatures, importing an export bundle, and turning a stored
 //! quorum share back into raw bytes all need a private key this project
@@ -13,9 +14,11 @@ use keyquorum::error::{Error, Result};
 use keyquorum::key_tree::{NodeSpec, TreeNodeSummary};
 use keyquorum::keys::KeyType;
 use keyquorum::pin::ResourceType;
-use keyquorum::{db, export, key_tree, keys, locked_files, pin, quorum, sharing, signing, vault};
+use keyquorum::{
+    db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, sharing, signing, vault,
+};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -73,8 +76,9 @@ enum Command {
     },
     /// List registered hardware keys and live split trees
     List,
-    /// Revoke a registered key. Always drops that token's pairings on
-    /// any live tree. Optional --evict PSS-refreshes the survivors.
+    /// Revoke a registered key. Always drops that token's pairings and
+    /// private-bridge membership on any live tree. Optional --evict
+    /// PSS-refreshes the survivors.
     Revoke {
         /// Hardware key id from `list`
         id: i64,
@@ -215,14 +219,37 @@ enum Command {
         #[command(subcommand)]
         command: AccessCommand,
     },
-    /// Verify an Ed25519 signature
+    /// Verify an Ed25519 signature (standalone or private-bridge)
     Verify {
-        #[arg(long)]
-        public_key_file: PathBuf,
+        #[arg(long, required_unless_present = "bridge_uid")]
+        public_key_file: Option<PathBuf>,
         #[arg(long)]
         message_file: PathBuf,
         #[arg(long)]
         signature_file: PathBuf,
+        /// Private-bridge uid (KQBS artifact + membership check)
+        #[arg(long)]
+        bridge_uid: Option<String>,
+        /// Local member verifying the artifact
+        #[arg(long, requires = "bridge_uid")]
+        as_node: Option<String>,
+    },
+    /// Sign a message with a private bridge plus a personal signing key
+    Sign {
+        #[arg(long)]
+        bridge_uid: String,
+        /// Local member label
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        signing_key_file: PathBuf,
+        /// Encryption private key that unwraps this store's sealed bridge secret
+        #[arg(long)]
+        share_file: String,
+        #[arg(long)]
+        message_file: PathBuf,
+        #[arg(long)]
+        signature_out: PathBuf,
     },
     /// Export a credential or file as a portable bundle for someone outside this database
     Export {
@@ -307,6 +334,77 @@ enum BridgeCommand {
     },
     /// List whitelist entries and established pairings
     List { key_id: i64 },
+    /// N-member private sign bridges. Each person (and each department
+    /// manager parent) has their own store; this command writes per-recipient
+    /// packages instead of sharing sealed secrets in one database.
+    Private {
+        #[command(subcommand)]
+        command: PrivateBridgeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrivateBridgeCommand {
+    /// Create a private sign bridge. Writes every .kqpb envelope first,
+    /// then commits this store. Either both land or neither does, so a
+    /// failure at any point can simply be retried.
+    Create {
+        key_id: i64,
+        /// Signing member as LABEL or LABEL=pub-file (repeatable).
+        /// Each label must already have a registered signing public key.
+        #[arg(long = "member", required = true)]
+        members: Vec<String>,
+        /// Department/CXO supervisor as LABEL or LABEL=pub-file.
+        /// Direct parents of --member are required (M.S.2 implies M.S).
+        #[arg(long = "supervisor")]
+        supervisors: Vec<String>,
+        /// Local node whose sealed copy stays in this database
+        #[arg(long = "self")]
+        self_node: Option<String>,
+        /// Directory for per-recipient .kqpb packages
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List private bridges (optionally for one split tree)
+    List {
+        #[arg(long)]
+        key_id: Option<i64>,
+    },
+    /// Show one private bridge by uid
+    Show { uid: String },
+    /// Print bridge-change events
+    Events {
+        #[arg(long)]
+        uid: Option<String>,
+        #[arg(long)]
+        since: Option<i64>,
+    },
+    /// Import a per-person package into this store
+    Import {
+        #[arg(long)]
+        file: PathBuf,
+        /// Encryption private key that opens this package
+        #[arg(long)]
+        share_file: String,
+    },
+    /// Drop a signing member. Writes rotation/destroy packages first,
+    /// then commits. Either both land or neither does, so a failure at
+    /// any point can simply be retried.
+    RemoveMember {
+        uid: String,
+        /// Member label to remove
+        #[arg(long)]
+        member: String,
+        /// Local remaining member that holds the sealed bridge secret
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        share_file: String,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -512,12 +610,51 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
             public_key_file,
             message_file,
             signature_file,
+            bridge_uid,
+            as_node,
         } => {
-            let public_key = read_key_array_32(&public_key_file)?;
             let message = fs::read(&message_file)?;
-            let signature = read_hex_array_64(&signature_file)?;
-            signing::verify_signature(&public_key, &message, &signature)?;
-            println!("Signature is valid");
+            if let Some(uid) = bridge_uid {
+                let as_node = as_node
+                    .unwrap_or_else(|| fatal_usage_error("verify --bridge-uid requires --as-node"));
+                let bytes = fs::read(&signature_file)?;
+                let artifact = signing::decode_bridge_signature(&bytes)?;
+                private_bridge::verify_message(&conn, &uid, &as_node, &message, &artifact)?;
+                println!("Private-bridge signature is valid");
+            } else {
+                let public_key_file = public_key_file.unwrap_or_else(|| {
+                    fatal_usage_error("verify requires --public-key-file or --bridge-uid")
+                });
+                let public_key = read_key_array_32(&public_key_file)?;
+                let signature = read_hex_array_64(&signature_file)?;
+                signing::verify_signature(&public_key, &message, &signature)?;
+                println!("Signature is valid");
+            }
+        }
+        Command::Sign {
+            bridge_uid,
+            node,
+            signing_key_file,
+            share_file,
+            message_file,
+            signature_out,
+        } => {
+            let encryption_sk = zeroize::Zeroizing::new(read_key_array_32(Path::new(&share_file))?);
+            let signing_sk = zeroize::Zeroizing::new(read_key_array_32(&signing_key_file)?);
+            let message = fs::read(&message_file)?;
+            let artifact = private_bridge::sign_message(
+                &conn,
+                &bridge_uid,
+                &node,
+                &encryption_sk,
+                &signing_sk,
+                &message,
+            )?;
+            locked_files::write_owner_only(
+                &signature_out,
+                &signing::encode_bridge_signature(&artifact)?,
+            )?;
+            println!("Wrote bridge signature to {}", signature_out.display());
         }
         Command::Export { command } => run_export(&conn, command)?,
         Command::Share { command } => run_share(&conn, command)?,
@@ -805,6 +942,7 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
         Command::Vault { .. }
         | Command::Access { .. }
         | Command::Verify { .. }
+        | Command::Sign { .. }
         | Command::Export { .. }
         | Command::Share { .. }
         | Command::Pin { .. } => unreachable!("non-tree commands are dispatched in run()"),
@@ -849,8 +987,275 @@ fn run_bridge(conn: &Connection, command: BridgeCommand) -> Result<()> {
                 }
             }
         }
+        BridgeCommand::Private { command } => run_private_bridge(conn, command)?,
     }
     Ok(())
+}
+
+fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Result<()> {
+    match command {
+        PrivateBridgeCommand::Create {
+            key_id,
+            members,
+            supervisors,
+            self_node,
+            output_dir,
+            label,
+        } => {
+            let member_parties = resolve_parties(conn, Some(key_id), &members, true)?;
+            let mut supervisor_parties = resolve_parties(conn, Some(key_id), &supervisors, false)?;
+            let member_labels: Vec<String> =
+                member_parties.iter().map(|p| p.label.clone()).collect();
+            for notify in private_bridge::notify_labels(member_labels.iter().map(|s| s.as_str())) {
+                if member_parties.iter().any(|p| p.label == notify) {
+                    continue;
+                }
+                if supervisor_parties.iter().any(|p| p.label == notify) {
+                    continue;
+                }
+                let pk = match private_bridge::encryption_public_for_label(
+                    conn,
+                    Some(key_id),
+                    &notify,
+                ) {
+                    Ok(pk) => pk,
+                    Err(_) => fatal_usage_error(&format!(
+                        "need an encryption public key for supervisor {notify} (parent of a --member). Pass --supervisor {notify}=FILE.pub"
+                    )),
+                };
+                supervisor_parties.push(private_bridge::BridgePartyInput {
+                    label: notify,
+                    encryption_public_key: pk,
+                    signing_public_key: None,
+                });
+            }
+            fs::create_dir_all(&output_dir)?;
+            let planned = private_bridge::plan_create(
+                Some(key_id),
+                label.as_deref(),
+                &member_parties,
+                &supervisor_parties,
+                self_node.as_deref(),
+            )?;
+            let pending = write_delivery_packages(&output_dir, &planned.created.packages)?;
+            // A commit failure here drops `pending`, deleting the envelopes:
+            // they name a bridge this store did not record, and leaving them
+            // would make `create` fail on retry with "file exists".
+            private_bridge::commit_planned_creation(conn, &planned)?;
+            let written = pending.keep();
+            let created = &planned.created;
+            println!(
+                "Created private bridge {} (generation {}). Notify {} store(s):",
+                created.uid,
+                created.generation,
+                created.packages.len()
+            );
+            for (pkg, path) in created.packages.iter().zip(&written) {
+                println!("  {} ({:?}) -> {}", pkg.label, pkg.role, path.display());
+            }
+        }
+        PrivateBridgeCommand::List { key_id } => {
+            let listing = private_bridge::list(conn, key_id)?;
+            if listing.is_empty() {
+                println!("(no private bridges)");
+            } else {
+                for bridge in listing {
+                    let status = if bridge.destroyed {
+                        "destroyed"
+                    } else {
+                        "live"
+                    };
+                    println!(
+                        "{}\tgen {}\t{}\t{}",
+                        bridge.uid,
+                        bridge.generation,
+                        status,
+                        bridge.label.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+        }
+        PrivateBridgeCommand::Show { uid } => {
+            print_bridge_summary(&private_bridge::get(conn, &uid)?);
+        }
+        PrivateBridgeCommand::Events { uid, since } => {
+            let events = private_bridge::events(conn, uid.as_deref(), since)?;
+            if events.is_empty() {
+                println!("(no events)");
+            } else {
+                for event in events {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        event.id, event.uid, event.event_type, event.detail
+                    );
+                }
+            }
+        }
+        PrivateBridgeCommand::Import { file, share_file } => {
+            let bytes = fs::read(&file)?;
+            let sk = zeroize::Zeroizing::new(read_key_array_32(Path::new(&share_file))?);
+            let summary = private_bridge::import_package(conn, &bytes, &sk)?;
+            println!("Imported private bridge {}", summary.uid);
+            print_bridge_summary(&summary);
+        }
+        PrivateBridgeCommand::RemoveMember {
+            uid,
+            member,
+            node,
+            share_file,
+            output_dir,
+        } => {
+            let sk = zeroize::Zeroizing::new(read_key_array_32(Path::new(&share_file))?);
+            fs::create_dir_all(&output_dir)?;
+            let planned = private_bridge::plan_remove_member(conn, &uid, &member, &node, &sk)?;
+            let pending = write_delivery_packages(&output_dir, &planned.outcome.packages)?;
+            // As in `create`: if the commit fails, this store stays on the old
+            // generation, so the rotation envelopes must go with it.
+            private_bridge::commit_planned_removal(conn, &planned)?;
+            let written = pending.keep();
+            let outcome = &planned.outcome;
+            if outcome.destroyed {
+                println!("Destroyed private bridge {uid}");
+            } else {
+                println!(
+                    "Removed {member} from {uid}; remaining {}",
+                    outcome.remaining_members.join(", ")
+                );
+            }
+            println!("Deliver these packages to each store:");
+            for (pkg, path) in outcome.packages.iter().zip(&written) {
+                println!("  {} ({:?}) -> {}", pkg.label, pkg.role, path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_parties(
+    conn: &Connection,
+    key_id: Option<i64>,
+    specs: &[String],
+    require_signing: bool,
+) -> Result<Vec<private_bridge::BridgePartyInput>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let (label, pk) = if let Some((label, path)) = spec.split_once('=') {
+            (label.to_string(), read_key_array_32(Path::new(path))?)
+        } else {
+            (
+                spec.clone(),
+                private_bridge::encryption_public_for_label(conn, key_id, spec)?,
+            )
+        };
+        let signing_public_key = if require_signing {
+            Some(private_bridge::signing_public_for_label(conn, &label)?)
+        } else {
+            None
+        };
+        out.push(private_bridge::BridgePartyInput {
+            label,
+            encryption_public_key: pk,
+            signing_public_key,
+        });
+    }
+    Ok(out)
+}
+
+/// Delivery envelopes written to disk ahead of the database commit they
+/// belong to.
+///
+/// `write_owner_only` refuses to overwrite an existing file, so envelopes
+/// left behind by a commit that failed after the write would block the very
+/// retry that failure calls for — and they describe a bridge this store
+/// never recorded, so they must not be delivered either. Dropping this
+/// guard without [`PendingDelivery::keep`] deletes every file it created,
+/// and only those.
+#[must_use = "the delivery files are removed unless the commit calls keep()"]
+#[derive(Debug)]
+struct PendingDelivery {
+    paths: Vec<PathBuf>,
+}
+
+impl PendingDelivery {
+    /// The commit succeeded: hand back the paths and leave them on disk.
+    fn keep(mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
+    }
+}
+
+impl Drop for PendingDelivery {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Writes one owner-only `.kqpb` per package into `output_dir`. The caller
+/// commits and then calls `keep()` on the returned guard; anything else —
+/// an error here, a failed commit, an early return — removes the files
+/// again so the command can simply be run once more.
+fn write_delivery_packages(
+    output_dir: &Path,
+    packages: &[private_bridge::DeliveryPackage],
+) -> Result<PendingDelivery> {
+    let mut planned = Vec::with_capacity(packages.len());
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    for pkg in packages {
+        let name = sanitize_label(&pkg.label)?;
+        let file = format!("{name}.kqpb");
+        if !claimed.insert(name) {
+            return Err(Error::AmbiguousDeliveryName(file));
+        }
+        planned.push((output_dir.join(file), pkg.bytes.as_slice()));
+    }
+
+    let mut pending = PendingDelivery { paths: Vec::new() };
+    for (path, bytes) in planned {
+        locked_files::write_owner_only(&path, bytes)?;
+        pending.paths.push(path);
+    }
+    Ok(pending)
+}
+
+fn sanitize_label(label: &str) -> Result<String> {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() || out.chars().all(|c| c == '.') {
+        return Err(Error::InvalidPath);
+    }
+    Ok(out)
+}
+
+fn print_bridge_summary(summary: &private_bridge::BridgeSummary) {
+    println!(
+        "{}  gen {}  {}",
+        summary.uid,
+        summary.generation,
+        if summary.destroyed {
+            "destroyed"
+        } else {
+            "live"
+        }
+    );
+    if let Some(label) = &summary.label {
+        println!("  label: {label}");
+    }
+    println!("  public: {}", hex::encode(summary.public_key));
+    println!("  salt:   {}", hex::encode(summary.salt));
+    println!("  parties:");
+    for party in &summary.parties {
+        println!(
+            "    {}  {:?}  local={}  sealed={}",
+            party.label, party.role, party.is_local, party.has_sealed_key
+        );
+    }
 }
 
 fn run_access(conn: &mut Connection, command: AccessCommand) -> Result<()> {
@@ -1152,6 +1557,7 @@ fn apply_hardware_revoke(conn: &mut Connection, args: HardwareRevokeArgs<'_>) ->
         );
     }
 
+    let mut evict_changes = Vec::new();
     if evict {
         let target = match (key_id, node_label) {
             (Some(key_id), Some(node_label)) => {
@@ -1171,12 +1577,52 @@ fn apply_hardware_revoke(conn: &mut Connection, args: HardwareRevokeArgs<'_>) ->
         };
         let summary = key_tree::describe(conn, target.0)?;
         let shares = collect_shares(conn, &summary.root, share_files)?;
-        key_tree::evict_and_refresh(conn, target.0, target.1, &shares)?;
+        let changes = key_tree::evict_and_refresh(conn, target.0, target.1, &shares)?;
         println!("Evicted node {}; survivor shares refreshed", target.1);
+        evict_changes = changes;
+    }
+
+    let hardware = keys::get_key(conn, hardware_id)?;
+    let mut labels = BTreeSet::new();
+    labels.insert(hardware.label.clone());
+    for leaf in &leaves {
+        labels.insert(leaf.label.clone());
+    }
+    let mut revoke_changes = Vec::new();
+    for label in labels {
+        revoke_changes.extend(private_bridge::on_member_revoked(conn, &label)?);
     }
 
     keys::revoke_key(conn, hardware_id)?;
     println!("Revoked key {hardware_id}");
+
+    write_bridge_change_notices(&evict_changes)?;
+    write_bridge_change_notices(&revoke_changes)?;
+    Ok(())
+}
+
+fn write_bridge_change_notices(changes: &[private_bridge::BridgeChange]) -> Result<()> {
+    for change in changes {
+        let kind = match change.kind {
+            private_bridge::BridgeChangeKind::NeedsMemberRotate => "remaining members must rotate",
+            private_bridge::BridgeChangeKind::Destroyed => "bridge destroyed",
+        };
+        println!(
+            "Private bridge {}: removed {}; {}.",
+            change.uid, change.removed_member, kind
+        );
+        println!(
+            "  Notify these stores (members + department managers): {}",
+            change.notify.join(", ")
+        );
+        let notice_path = format!(
+            "bridge-{}-removed-{}.kqbn",
+            change.uid,
+            sanitize_label(&change.removed_member)?
+        );
+        locked_files::write_owner_only(Path::new(&notice_path), &change.notice)?;
+        println!("  Wrote notice {notice_path}");
+    }
     Ok(())
 }
 

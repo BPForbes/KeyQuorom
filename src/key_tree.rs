@@ -990,7 +990,7 @@ pub fn evict_and_refresh(
     key_id: i64,
     evicted_node_id: i64,
     survivor_raw_shares: &HashMap<i64, Vec<u8>>,
-) -> Result<()> {
+) -> Result<Vec<crate::private_bridge::BridgeChange>> {
     let tx = conn.transaction()?;
     let tree = KeyQuorumTree::load(&tx, key_id)?;
     let evicted_idx = tree.index_by_db_id(evicted_node_id)?;
@@ -998,6 +998,7 @@ pub fn evict_and_refresh(
     if !evicted.is_active || evicted.hardware_key_id.is_none() {
         return Err(Error::CannotEvict);
     }
+    let evicted_label = evicted.id.clone();
     let parent_idx = evicted.parent_idx.ok_or(Error::CannotEvict)?;
     let parent = &tree.nodes[parent_idx];
     let threshold = parent.threshold.ok_or(Error::CannotEvict)?;
@@ -1046,6 +1047,7 @@ pub fn evict_and_refresh(
         params![evicted_node_id],
     )?;
     delete_node_bindings(&tx, key_id, evicted_node_id)?;
+    let bridge_changes = crate::private_bridge::on_leaf_removed(&tx, key_id, &evicted_label)?;
 
     for ((db_id, hardware_key), new_share) in share_meta.iter().zip(shares.iter()) {
         let wrapped_share = seal_share(hardware_key, new_share)?;
@@ -1056,7 +1058,7 @@ pub fn evict_and_refresh(
     }
 
     tx.commit()?;
-    Ok(())
+    Ok(bridge_changes)
 }
 
 /// Unseal one leaf's `wrapped_share` with that leaf's encryption secret.
