@@ -132,7 +132,27 @@ that set unless a member is itself a department manager.
 Members receive a sealed copy of a shared Ed25519 key (plus salts).
 Managers receive roster metadata only so they can track the live
 standard. This database never keeps another person's sealed secret;
-`create` / `remove-member` write one `.kqpb` package per store.
+`create` / `remove-member` write one `.kqpb` **envelope** per store.
+
+Each `.kqpb` is a cryptographic envelope (same idea as `KQXB` export
+bundles): the outside names the recipient’s X25519 public key; the inside
+is `crypto_box`-sealed so only that store’s encryption private key can
+open it. A mailbox, USB drop, or email can carry the envelope without
+being able to read the letter. `.kqbn` eviction notices are the
+exception — they are public routing slips, not sealed envelopes.
+
+```
+outside (anyone can see)     inside (recipient only)
+-------------------------    --------------------------------
+KQPB magic, kind             wrap_salt || bridge secret (members)
+recipient encryption pub     or roster + salts (managers)
+                             + rotate/destroy auth sig
+```
+
+Five people in the example means five envelopes, each addressed to a
+different pub. The next PR’s online server is an inbox of these
+envelopes: store and forward by recipient fingerprint; devices still
+`import` locally after opening with `--share-file`.
 
 ```sh
 # On any machine that can see the tree (and manager encryption pubs):
@@ -241,11 +261,12 @@ keyquorum share redeem-file
 
 ## Roadmap
 
-These are deliberately not implemented — not stubbed, just not yet built — because they
-all need a private-key custody model (a software file? the OS keychain? real hardware?)
-that hasn't been decided:
+Not built yet:
 
-- **Online mailbox server (next PR)** — a small relay that stores and forwards sealed `.kqpb` / `.kqbn` files to each device’s inbox. The server must not hold private keys or the org SQLite tree; devices still `import` locally. A web UI can wait until `relay push` / `pull` work.
+- **Online mailbox server (next PR)** — an inbox of sealed **envelopes** (`.kqpb`): store and forward by recipient encryption fingerprint. The server reads only the outside address, never the letter. Devices still `import` locally. A web UI can wait until `relay push` / `pull` work.
+
+These still need a private-key custody model (a software file, OS keychain, or real hardware) that hasn't been decided:
+
 - **Persisted private-key custody** for `generate` (today the private key only ever
   goes to stdout).
 - **`unwrap-share`** — turning a stored, sealed quorum share back into the raw share

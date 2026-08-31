@@ -4,7 +4,7 @@
 
 - **Crypto (1B):** Each private bridge owns a shared Ed25519 keypair. Members sign with the bridge private key and co-attribute with their personal signing public key. Verifiers check the bridge signature, the personal co-signature, and that both parties are current **members** (supervisors can track roster, not co-sign).
 - **Independent stores:** `M.S.2`, `M.S.3`, and `M.A.2` are three people. `M.S` and `M.A` are department-manager stores. Label depth: three segments = employee, two = manager, one (`M`) = CXO. A bridge of those three employees notifies **five** stores (members + each distinct direct parent). Grandparent `M` is not notified unless a member is a department manager.
-- **Notification:** Phase 1 writes per-recipient `.kqpb` packages (sealed to that person's encryption pub) plus local `bridge_events` and `.kqbn` eviction notices. Delivery between devices is out-of-band (operator copies files). **Next PR:** an online mailbox server that stores and forwards those sealed blobs only.
+- **Notification:** Phase 1 writes per-recipient `.kqpb` **envelopes** (sealed to that person's encryption pub) plus local `bridge_events` and public `.kqbn` eviction notices. Delivery between devices is out-of-band (operator copies files). **Next PR:** an online mailbox of those envelopes.
 - **Salts:** Every bridge generation, member wrap, and signed artifact carries its own random salt from `crypto::random_salt()` (16 bytes).
 
 ## Current gaps
@@ -138,14 +138,30 @@ Extend [`src/signing.rs`](src/signing.rs):
 - Same message signed twice yields different artifacts (different `signature_salt`) that both verify.
 - Update [`README.md`](README.md) cookbook; Roadmap: `sign` done for file-backed keys; Phase 2 bundles deferred.
 
+## Envelopes
+
+A `.kqpb` file is a **digital envelope**, not a shared database row:
+
+```
+KQPB | version | kind | recipient_x25519_pub (32) | len | crypto_box(letter)
+```
+
+- **Outside** (routing): who it is for. USB, email, or the next PR’s mailbox can read this and drop the file in that person’s inbox. Same pattern as [`src/export.rs`](src/export.rs) `KQXB` bundles.
+- **Inside** (letter): member invite/rotate includes `wrap_salt || bridge_ed25519_sk`; supervisor envelopes include roster + salts only; rotate/destroy letters also carry an auth signature under the previous bridge key.
+- **One envelope per store.** `M.S.2`, `M.S.3`, `M.A.2`, `M.S`, and `M.A` each get their own. Copying `M.A.2.kqpb` onto `M.S`’s machine does not let `M.S` open it.
+- **`.kqbn` is not an envelope.** Eviction notices are public routing slips so a manager can tell remaining members to rotate. The actual new secret still travels in sealed `.kqpb` envelopes from a remaining member after `remove-member`.
+
+The mailbox server should treat envelopes as opaque: index by recipient fingerprint, never unseal, never rewrite.
+
 ## Next PR: online mailbox server
 
-Not this change. A small relay that stores ciphertext only (`.kqpb` / `.kqbn` already sealed to a recipient encryption pub):
+Not this change. A small relay that is an **inbox of envelopes**:
 
-- `POST /inbox` upload, `GET /inbox` pull by authenticated encryption fingerprint
-- CLI `relay push` / `relay pull --import`
+- `POST /inbox` upload a `.kqpb` (route by the envelope’s `recipient_pub`)
+- `GET /inbox` pull envelopes for the authenticated encryption fingerprint
+- CLI `relay push` / `relay pull --import` (import still happens on the device with `--share-file`)
 - No org SQLite, no private keys, no decrypt-and-rewrite on the server
-- Rotate/destroy authenticity stays inside the package (previous bridge key)
+- Rotate/destroy authenticity stays **inside** the letter (previous bridge key)
 
 A browser UI can wait until push/pull works.
 

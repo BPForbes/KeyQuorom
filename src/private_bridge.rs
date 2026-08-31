@@ -15,6 +15,10 @@
 //! is never stored in more than one person's database in usable form: this
 //! store keeps at most the local member's sealed copy; everyone else is
 //! handed a per-recipient `KQPB` file.
+//!
+//! That file is a digital envelope: the header names the recipient's
+//! X25519 public key; `crypto_box` seals the letter. Carriers (USB, mail,
+//! a future mailbox server) can route the envelope without opening it.
 
 use crate::crypto::{random_salt, SALT_LEN};
 use crate::error::{Error, Result};
