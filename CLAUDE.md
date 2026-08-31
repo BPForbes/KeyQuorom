@@ -13,6 +13,9 @@ The project is a Rust Cargo crate (see `.gitignore` for Cargo-related patterns).
 Private sign bridges live in `src/private_bridge.rs` and the `keyquorum` CLI.
 `create` and `remove-member` generate delivery packages first and commit only after
 those files are written — do not persist a live bridge before the envelopes exist.
+The two must stay in step in both directions: if the commit fails, the CLI deletes
+the `.kqpb` files it just wrote, because `write_owner_only` refuses to overwrite and
+leftovers would block the retry.
 
 ## Working conventions
 

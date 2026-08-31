@@ -346,7 +346,8 @@ enum BridgeCommand {
 #[derive(Subcommand)]
 enum PrivateBridgeCommand {
     /// Create a private sign bridge. Writes every .kqpb envelope first,
-    /// then commits this store so a failed write leaves no live row.
+    /// then commits this store. Either both land or neither does, so a
+    /// failure at any point can simply be retried.
     Create {
         key_id: i64,
         /// Signing member as LABEL or LABEL=pub-file (repeatable).
@@ -389,7 +390,8 @@ enum PrivateBridgeCommand {
         share_file: String,
     },
     /// Drop a signing member. Writes rotation/destroy packages first,
-    /// then commits so a failed write can be retried.
+    /// then commits. Either both land or neither does, so a failure at
+    /// any point can simply be retried.
     RemoveMember {
         uid: String,
         /// Member label to remove
@@ -1035,8 +1037,12 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
                 &supervisor_parties,
                 self_node.as_deref(),
             )?;
-            write_delivery_packages(&output_dir, &planned.created.packages)?;
+            let pending = write_delivery_packages(&output_dir, &planned.created.packages)?;
+            // A commit failure here drops `pending`, deleting the envelopes:
+            // they name a bridge this store did not record, and leaving them
+            // would make `create` fail on retry with "file exists".
             private_bridge::commit_planned_creation(conn, &planned)?;
+            let written = pending.keep();
             let created = &planned.created;
             println!(
                 "Created private bridge {} (generation {}). Notify {} store(s):",
@@ -1044,14 +1050,8 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
                 created.generation,
                 created.packages.len()
             );
-            for pkg in &created.packages {
-                println!(
-                    "  {} ({:?}) -> {}/{}.kqpb",
-                    pkg.label,
-                    pkg.role,
-                    output_dir.display(),
-                    sanitize_label(&pkg.label)?
-                );
+            for (pkg, path) in created.packages.iter().zip(&written) {
+                println!("  {} ({:?}) -> {}", pkg.label, pkg.role, path.display());
             }
         }
         PrivateBridgeCommand::List { key_id } => {
@@ -1108,8 +1108,11 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
             let sk = zeroize::Zeroizing::new(read_key_array_32(Path::new(&share_file))?);
             fs::create_dir_all(&output_dir)?;
             let planned = private_bridge::plan_remove_member(conn, &uid, &member, &node, &sk)?;
-            write_delivery_packages(&output_dir, &planned.outcome.packages)?;
+            let pending = write_delivery_packages(&output_dir, &planned.outcome.packages)?;
+            // As in `create`: if the commit fails, this store stays on the old
+            // generation, so the rotation envelopes must go with it.
             private_bridge::commit_planned_removal(conn, &planned)?;
+            let written = pending.keep();
             let outcome = &planned.outcome;
             if outcome.destroyed {
                 println!("Destroyed private bridge {uid}");
@@ -1120,14 +1123,8 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
                 );
             }
             println!("Deliver these packages to each store:");
-            for pkg in &outcome.packages {
-                println!(
-                    "  {} ({:?}) -> {}/{}.kqpb",
-                    pkg.label,
-                    pkg.role,
-                    output_dir.display(),
-                    sanitize_label(&pkg.label)?
-                );
+            for (pkg, path) in outcome.packages.iter().zip(&written) {
+                println!("  {} ({:?}) -> {}", pkg.label, pkg.role, path.display());
             }
         }
     }
@@ -1164,28 +1161,61 @@ fn resolve_parties(
     Ok(out)
 }
 
+/// Delivery envelopes written to disk ahead of the database commit they
+/// belong to.
+///
+/// `write_owner_only` refuses to overwrite an existing file, so envelopes
+/// left behind by a commit that failed after the write would block the very
+/// retry that failure calls for — and they describe a bridge this store
+/// never recorded, so they must not be delivered either. Dropping this
+/// guard without [`PendingDelivery::keep`] deletes every file it created,
+/// and only those.
+#[must_use = "the delivery files are removed unless the commit calls keep()"]
+#[derive(Debug)]
+struct PendingDelivery {
+    paths: Vec<PathBuf>,
+}
+
+impl PendingDelivery {
+    /// The commit succeeded: hand back the paths and leave them on disk.
+    fn keep(mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
+    }
+}
+
+impl Drop for PendingDelivery {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Writes one owner-only `.kqpb` per package into `output_dir`. The caller
+/// commits and then calls `keep()` on the returned guard; anything else —
+/// an error here, a failed commit, an early return — removes the files
+/// again so the command can simply be run once more.
 fn write_delivery_packages(
     output_dir: &Path,
     packages: &[private_bridge::DeliveryPackage],
-) -> Result<()> {
-    let mut planned = Vec::new();
+) -> Result<PendingDelivery> {
+    let mut planned = Vec::with_capacity(packages.len());
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
     for pkg in packages {
-        let path = output_dir.join(format!("{}.kqpb", sanitize_label(&pkg.label)?));
-        planned.push((path, pkg.bytes.as_slice()));
-    }
-    let mut written = Vec::new();
-    for (path, bytes) in planned {
-        match locked_files::write_owner_only(&path, bytes) {
-            Ok(()) => written.push(path),
-            Err(err) => {
-                for path in &written {
-                    let _ = fs::remove_file(path);
-                }
-                return Err(err);
-            }
+        let name = sanitize_label(&pkg.label)?;
+        let file = format!("{name}.kqpb");
+        if !claimed.insert(name) {
+            return Err(Error::AmbiguousDeliveryName(file));
         }
+        planned.push((output_dir.join(file), pkg.bytes.as_slice()));
     }
-    Ok(())
+
+    let mut pending = PendingDelivery { paths: Vec::new() };
+    for (path, bytes) in planned {
+        locked_files::write_owner_only(&path, bytes)?;
+        pending.paths.push(path);
+    }
+    Ok(pending)
 }
 
 fn sanitize_label(label: &str) -> Result<String> {
