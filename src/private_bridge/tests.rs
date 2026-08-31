@@ -1,0 +1,359 @@
+use super::*;
+use crate::crypto::SALT_LEN;
+use crate::db;
+use crate::keys::KeyType;
+use std::collections::BTreeSet;
+
+fn enc(conn: &Connection, label: &str) -> (crypto_box::SecretKey, [u8; 32]) {
+    let secret = crypto_box::SecretKey::generate(&mut rand::rngs::OsRng);
+    let public = *secret.public_key().as_bytes();
+    keys::register_key(conn, label, KeyType::Encryption, &public).expect("register");
+    (secret, public)
+}
+
+fn party(label: &str, pk: [u8; 32]) -> BridgePartyInput {
+    BridgePartyInput {
+        label: label.to_string(),
+        encryption_public_key: pk,
+    }
+}
+
+fn five_party_keys(conn: &Connection) -> [(crypto_box::SecretKey, [u8; 32]); 5] {
+    [
+        enc(conn, "M.S.2"),
+        enc(conn, "M.S.3"),
+        enc(conn, "M.A.2"),
+        enc(conn, "M.S"),
+        enc(conn, "M.A"),
+    ]
+}
+
+#[test]
+fn notify_set_for_three_employees_is_five_stores() {
+    let labels = notify_labels(["M.S.2", "M.S.3", "M.A.2"]);
+    assert_eq!(
+        labels,
+        vec![
+            "M.A".to_string(),
+            "M.A.2".to_string(),
+            "M.S".to_string(),
+            "M.S.2".to_string(),
+            "M.S.3".to_string(),
+        ]
+    );
+    assert!(!labels.iter().any(|l| l == "M"));
+    assert_eq!(parent_node_label("M.S.2"), Some("M.S"));
+    assert_eq!(parent_node_label("M.S"), Some("M"));
+    assert_eq!(parent_node_label("M"), None);
+}
+
+#[test]
+fn create_emits_packages_for_members_and_department_managers() {
+    let conn = db::open_in_memory().expect("schema");
+    let [(_, pk_s2), (_, pk_s3), (_, pk_a2), (_, pk_s), (_, pk_a)] = five_party_keys(&conn);
+    let created = create(
+        &conn,
+        None,
+        Some("eng-acct"),
+        &[
+            party("M.S.2", pk_s2),
+            party("M.S.3", pk_s3),
+            party("M.A.2", pk_a2),
+        ],
+        &[party("M.S", pk_s), party("M.A", pk_a)],
+        Some("M.S.2"),
+    )
+    .expect("create");
+
+    assert_eq!(created.packages.len(), 5);
+    let mut labels: Vec<_> = created.packages.iter().map(|p| p.label.as_str()).collect();
+    labels.sort();
+    assert_eq!(labels, ["M.A", "M.A.2", "M.S", "M.S.2", "M.S.3"]);
+    assert_eq!(
+        created
+            .packages
+            .iter()
+            .filter(|p| p.role == PartyRole::Member)
+            .count(),
+        3
+    );
+    assert_eq!(
+        created
+            .packages
+            .iter()
+            .filter(|p| p.role == PartyRole::Supervisor)
+            .count(),
+        2
+    );
+
+    let summary = get(&conn, &created.uid).expect("get");
+    assert!(!summary.destroyed);
+    assert_eq!(summary.generation, 1);
+    assert_eq!(summary.salt.len(), SALT_LEN);
+    let local = summary
+        .parties
+        .iter()
+        .find(|p| p.label == "M.S.2")
+        .expect("local member");
+    assert!(local.is_local && local.has_sealed_key);
+    assert!(!summary
+        .parties
+        .iter()
+        .any(|p| p.label == "M.A.2" && p.has_sealed_key));
+}
+
+#[test]
+fn independent_stores_import_sign_and_verify() {
+    let creator = db::open_in_memory().expect("schema");
+    let [(_sk_s2, pk_s2), (sk_s3, pk_s3), (sk_a2, pk_a2), (sk_s, pk_s), (sk_a, pk_a)] =
+        five_party_keys(&creator);
+    let created = create(
+        &creator,
+        None,
+        Some("eng-acct"),
+        &[
+            party("M.S.2", pk_s2),
+            party("M.S.3", pk_s3),
+            party("M.A.2", pk_a2),
+        ],
+        &[party("M.S", pk_s), party("M.A", pk_a)],
+        Some("M.S.2"),
+    )
+    .expect("create");
+
+    let pkg = |label: &str| {
+        created
+            .packages
+            .iter()
+            .find(|p| p.label == label)
+            .expect("package")
+            .bytes
+            .clone()
+    };
+
+    let db_s3 = db::open_in_memory().expect("s3 db");
+    let db_a2 = db::open_in_memory().expect("a2 db");
+    let db_ms = db::open_in_memory().expect("ms db");
+    let db_ma = db::open_in_memory().expect("ma db");
+    import_package(&db_s3, &pkg("M.S.3"), &sk_s3.to_bytes()).expect("import s3");
+    import_package(&db_a2, &pkg("M.A.2"), &sk_a2.to_bytes()).expect("import a2");
+    let ms = import_package(&db_ms, &pkg("M.S"), &sk_s.to_bytes()).expect("import manager S");
+    let ma = import_package(&db_ma, &pkg("M.A"), &sk_a.to_bytes()).expect("import manager A");
+    assert!(!ms.parties.iter().any(|p| p.has_sealed_key));
+    assert!(!ma.parties.iter().any(|p| p.has_sealed_key));
+    assert!(ms
+        .parties
+        .iter()
+        .any(|p| p.label == "M.S" && p.role == PartyRole::Supervisor && p.is_local));
+
+    let (sign_sk, _) = keys::generate_signing_keypair();
+    let message = b"quarterly shared PDF";
+    let artifact = sign_message(
+        &db_a2,
+        &created.uid,
+        "M.A.2",
+        &sk_a2.to_bytes(),
+        &sign_sk,
+        message,
+    )
+    .expect("sign");
+    verify_message(&creator, &created.uid, "M.S.2", message, &artifact).expect("s2 verifies");
+    verify_message(&db_s3, &created.uid, "M.S.3", message, &artifact).expect("s3 verifies");
+    assert!(matches!(
+        verify_message(&db_ms, &created.uid, "M.S", message, &artifact),
+        Err(Error::NotBridgeMember)
+    ));
+
+    let again = sign_message(
+        &db_a2,
+        &created.uid,
+        "M.A.2",
+        &sk_a2.to_bytes(),
+        &sign_sk,
+        message,
+    )
+    .expect("sign again");
+    assert_ne!(artifact.signature_salt, again.signature_salt);
+    verify_message(&db_s3, &created.uid, "M.S.3", message, &again).expect("second sig");
+}
+
+#[test]
+fn remove_member_rotates_and_notifies_remaining_stores() {
+    let creator = db::open_in_memory().expect("schema");
+    let [(sk_s2, pk_s2), (sk_s3, pk_s3), (sk_a2, pk_a2), (_, pk_s), (_, pk_a)] =
+        five_party_keys(&creator);
+    let created = create(
+        &creator,
+        None,
+        Some("eng-acct"),
+        &[
+            party("M.S.2", pk_s2),
+            party("M.S.3", pk_s3),
+            party("M.A.2", pk_a2),
+        ],
+        &[party("M.S", pk_s), party("M.A", pk_a)],
+        Some("M.S.2"),
+    )
+    .expect("create");
+    let pkg = |label: &str| {
+        created
+            .packages
+            .iter()
+            .find(|p| p.label == label)
+            .unwrap()
+            .bytes
+            .clone()
+    };
+    let db_a2 = db::open_in_memory().expect("a2");
+    import_package(&db_a2, &pkg("M.A.2"), &sk_a2.to_bytes()).expect("import a2");
+    let db_s3 = db::open_in_memory().expect("s3");
+    import_package(&db_s3, &pkg("M.S.3"), &sk_s3.to_bytes()).expect("import s3");
+
+    let (sign_sk, _) = keys::generate_signing_keypair();
+    let old_sig = sign_message(
+        &creator,
+        &created.uid,
+        "M.S.2",
+        &sk_s2.to_bytes(),
+        &sign_sk,
+        b"old",
+    )
+    .expect("old sig");
+
+    let outcome =
+        remove_member(&creator, &created.uid, "M.S.3", "M.S.2", &sk_s2.to_bytes()).expect("remove");
+    assert!(!outcome.destroyed);
+    assert_eq!(
+        outcome.remaining_members,
+        vec!["M.A.2".to_string(), "M.S.2".to_string()]
+    );
+    let labels: BTreeSet<_> = outcome.packages.iter().map(|p| p.label.as_str()).collect();
+    assert!(labels.contains("M.A.2"));
+    assert!(labels.contains("M.S"));
+    assert!(labels.contains("M.A"));
+    assert!(labels.contains("M.S.3"));
+
+    let a2_rotate = outcome
+        .packages
+        .iter()
+        .find(|p| p.label == "M.A.2" && p.role == PartyRole::Member)
+        .expect("a2 rotate");
+    import_package(&db_a2, &a2_rotate.bytes, &sk_a2.to_bytes()).expect("a2 import rotate");
+
+    assert!(matches!(
+        verify_message(&db_a2, &created.uid, "M.A.2", b"old", &old_sig),
+        Err(Error::BridgeGenerationMismatch)
+    ));
+    let new_sig = sign_message(
+        &creator,
+        &created.uid,
+        "M.S.2",
+        &sk_s2.to_bytes(),
+        &sign_sk,
+        b"new",
+    )
+    .expect("new sig");
+    verify_message(&db_a2, &created.uid, "M.A.2", b"new", &new_sig).expect("new verifies");
+    assert!(matches!(
+        verify_message(&db_s3, &created.uid, "M.S.3", b"new", &new_sig),
+        Err(Error::NotBridgeMember) | Err(Error::BridgeGenerationMismatch)
+    ));
+
+    let s3_destroy = outcome
+        .packages
+        .iter()
+        .find(|p| p.label == "M.S.3")
+        .expect("s3 destroy");
+    import_package(&db_s3, &s3_destroy.bytes, &sk_s3.to_bytes()).expect("s3 ingest destroy");
+    assert!(get(&db_s3, &created.uid).unwrap().destroyed);
+}
+
+#[test]
+fn two_member_bridge_is_destroyed_when_one_leaves() {
+    let conn = db::open_in_memory().expect("schema");
+    let (sk_s3, pk_s3) = enc(&conn, "M.S.3");
+    let (_, pk_a1) = enc(&conn, "M.A.1");
+    let (_, pk_s) = enc(&conn, "M.S");
+    let (_, pk_a) = enc(&conn, "M.A");
+    let created = create(
+        &conn,
+        None,
+        None,
+        &[party("M.S.3", pk_s3), party("M.A.1", pk_a1)],
+        &[party("M.S", pk_s), party("M.A", pk_a)],
+        Some("M.S.3"),
+    )
+    .expect("create");
+    let outcome =
+        remove_member(&conn, &created.uid, "M.A.1", "M.S.3", &sk_s3.to_bytes()).expect("destroy");
+    assert!(outcome.destroyed);
+    assert!(get(&conn, &created.uid).unwrap().destroyed);
+    let notify = notify_labels(["M.S.3", "M.A.1"]);
+    assert_eq!(notify.len(), 4);
+}
+
+#[test]
+fn create_requires_department_manager_pubs() {
+    let conn = db::open_in_memory().expect("schema");
+    let (_, pk_s2) = enc(&conn, "M.S.2");
+    let (_, pk_a2) = enc(&conn, "M.A.2");
+    let err = create(
+        &conn,
+        None,
+        None,
+        &[party("M.S.2", pk_s2), party("M.A.2", pk_a2)],
+        &[],
+        Some("M.S.2"),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::NodeNotFound));
+}
+
+#[test]
+fn coordinator_evict_notice_lists_five_stakeholders() {
+    let mut conn = db::open_in_memory().expect("schema");
+    let (_, pk_s2) = enc(&conn, "M.S.2");
+    let (_, pk_s3) = enc(&conn, "M.S.3");
+    let (_, pk_a2) = enc(&conn, "M.A.2");
+    let (_, pk_s) = enc(&conn, "M.S");
+    let (_, pk_a) = enc(&conn, "M.A");
+    let id_s2 = keys::list_keys(&conn)
+        .unwrap()
+        .into_iter()
+        .find(|k| k.label == "M.S.2")
+        .unwrap()
+        .id;
+    let id_s3 = keys::list_keys(&conn)
+        .unwrap()
+        .into_iter()
+        .find(|k| k.label == "M.S.3")
+        .unwrap()
+        .id;
+    let spec = crate::key_tree::NodeSpec::flat_split(
+        "root",
+        2,
+        vec![("M.S.2".into(), id_s2), ("M.S.3".into(), id_s3)],
+    );
+    let secret = b"company master secret 32 bytes!";
+    let key_id = crate::key_tree::split(&mut conn, "org", secret, &spec).expect("split");
+    create(
+        &conn,
+        Some(key_id),
+        Some("eng-acct"),
+        &[
+            party("M.S.2", pk_s2),
+            party("M.S.3", pk_s3),
+            party("M.A.2", pk_a2),
+        ],
+        &[party("M.S", pk_s), party("M.A", pk_a)],
+        None,
+    )
+    .expect("create coordinator view");
+
+    let changes = on_leaf_removed(&conn, key_id, "M.S.3").expect("notice");
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, BridgeChangeKind::NeedsMemberRotate);
+    assert_eq!(changes[0].notify.len(), 5);
+    assert!(changes[0].notify.iter().any(|l| l == "M.A"));
+    assert!(changes[0].notify.iter().any(|l| l == "M.S"));
+}

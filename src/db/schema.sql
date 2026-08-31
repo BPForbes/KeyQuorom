@@ -207,3 +207,59 @@ CREATE TABLE IF NOT EXISTS pins (
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (resource_type, resource_id)
 );
+
+-- Private N-member sign bridges. Each person owns their node keys in their
+-- own storage: this database holds public roster metadata plus at most the
+-- sealed bridge secret for *local* members. Other members receive a
+-- per-recipient package (KQPB) sealed to their encryption public key.
+-- `uid` is stable across machines and key rotations; `salt` is redrawn
+-- with the Ed25519 keypair on every membership-loss rotation.
+CREATE TABLE IF NOT EXISTS private_bridges (
+    id            INTEGER PRIMARY KEY,
+    uid           TEXT NOT NULL UNIQUE,
+    key_id        INTEGER REFERENCES keys(id) ON DELETE SET NULL,
+    label         TEXT,
+    generation    INTEGER NOT NULL CHECK (generation > 0),
+    public_key    BLOB NOT NULL,
+    salt          BLOB NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    destroyed_at  TEXT
+);
+
+-- Signing members (`member`) and department/CXO supervisors who must be
+-- notified but do not hold the shared signing secret (`supervisor`).
+-- Direct parents of members are always on this roster (e.g. M.S.2 implies M.S).
+CREATE TABLE IF NOT EXISTS private_bridge_members (
+    bridge_id               INTEGER NOT NULL REFERENCES private_bridges(id) ON DELETE CASCADE,
+    node_label              TEXT NOT NULL,
+    encryption_public_key   BLOB NOT NULL,
+    role                    TEXT NOT NULL CHECK (role IN ('member', 'supervisor')),
+    is_local                INTEGER NOT NULL DEFAULT 0 CHECK (is_local IN (0, 1)),
+    PRIMARY KEY (bridge_id, node_label)
+);
+
+-- Sealed `wrap_salt || bridge_ed25519_sk` for a local member only.
+-- wrap_salt binds the ciphertext to this member row so a copied blob fails.
+CREATE TABLE IF NOT EXISTS private_bridge_sealed_keys (
+    bridge_id       INTEGER NOT NULL,
+    node_label      TEXT NOT NULL,
+    wrap_salt       BLOB NOT NULL,
+    wrapped_secret  BLOB NOT NULL,
+    PRIMARY KEY (bridge_id, node_label),
+    FOREIGN KEY (bridge_id, node_label)
+        REFERENCES private_bridge_members(bridge_id, node_label)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS bridge_events (
+    id            INTEGER PRIMARY KEY,
+    bridge_id     INTEGER NOT NULL REFERENCES private_bridges(id) ON DELETE CASCADE,
+    event_type    TEXT NOT NULL CHECK (event_type IN (
+        'created', 'imported', 'member_removed', 'rotated', 'destroyed'
+    )),
+    detail        TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_private_bridges_key ON private_bridges (key_id);
+CREATE INDEX IF NOT EXISTS idx_bridge_events_bridge ON bridge_events (bridge_id);

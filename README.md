@@ -120,6 +120,53 @@ keyquorum bridge deny 1 --node alice --peer it
 tear down an established pairing (add requires a whitelist hit on either
 side; deny also drops any pairing).
 
+### Private sign bridges (per-person stores)
+
+A private sign bridge is an N-person group that can co-sign files. Each
+node is its own storage: `M.A.1` is an employee, `M.A` is the accounting
+manager, `M` is a cross-department manager (CXO). A bridge of `M.S.2`,
+`M.S.3`, and `M.A.2` therefore notifies **five** stores — those three
+employees plus department managers `M.S` and `M.A`. The CXO is not in
+that set unless a member is itself a department manager.
+
+Members receive a sealed copy of a shared Ed25519 key (plus salts).
+Managers receive roster metadata only so they can track the live
+standard. This database never keeps another person's sealed secret;
+`create` / `remove-member` write one `.kqpb` package per store.
+
+```sh
+# On any machine that can see the tree (and manager encryption pubs):
+keyquorum bridge private create 1 \
+  --member M.S.2 --member M.S.3 --member M.A.2 \
+  --supervisor M.S=SoftwareManager.pub --supervisor M.A=AccountingManager.pub \
+  --self M.S.2 --output-dir ./bridge-packages --label eng-acct
+
+# Each other person imports into *their* database:
+keyquorum --db ma2.sqlite bridge private import \
+  --file ./bridge-packages/M.A.2.kqpb --share-file Accounting2.key
+
+# Sign with the bridge key + the member's personal signing key:
+keyquorum sign --bridge-uid <uid> --node M.A.2 \
+  --signing-key-file Accounting2.sign.key --share-file Accounting2.key \
+  --message-file report.pdf --signature-out report.kqbs
+
+# Peer verifies with their membership and the artifact:
+keyquorum --db ms2.sqlite verify --bridge-uid <uid> --as-node M.S.2 \
+  --message-file report.pdf --signature-file report.kqbs
+```
+
+If `M.S` evicts `M.S.3`, remaining members must rotate (the departed
+person still holds the old bridge secret). `revoke --evict` prints the
+notify list and writes a `.kqbn` notice. A remaining member then:
+
+```sh
+keyquorum bridge private remove-member <uid> --member M.S.3 \
+  --node M.S.2 --share-file Software2.key --output-dir ./bridge-packages
+# Send the new packages to M.S.2, M.A.2, M.S, M.A, and M.S.3.
+```
+
+A two-person bridge is destroyed when one member is removed.
+
 Banning a hardware key is `revoke <hardware-id>`. That always drops
 pairings and whitelist rows for every live leaf sealed to that token.
 `--evict` PSS-refreshes survivors of that leaf (`--key-id` / `--node`,
@@ -178,6 +225,11 @@ window early with, for example, `keyquorum pin relock --resource credential --id
 
 ```sh
 keyquorum verify --public-key-file signer.pub --message-file msg.txt --signature-file msg.sig
+keyquorum sign --bridge-uid <uid> --node M.A.2 \
+  --signing-key-file ma2.sign.key --share-file ma2.key \
+  --message-file msg.txt --signature-out msg.kqbs
+keyquorum verify --bridge-uid <uid> --as-node M.S.2 \
+  --message-file msg.txt --signature-file msg.kqbs
 
 keyquorum export credential 1 --recipient-key-file bob.pub --output cred.kqxb
 keyquorum export file 1 --recipient-key-file bob.pub --output file.kqxb
@@ -196,9 +248,11 @@ that hasn't been decided:
   goes to stdout).
 - **`unwrap-share`** — turning a stored, sealed quorum share back into the raw share
   a hardware key's own private key would produce.
-- **`sign`** — producing a signature (`verify` is implemented).
-- **`import`** — opening an `export` bundle on the receiving end (the bundle format and
-  encoder are already final).
+- **`import`** of password-vault / locked-file `export` bundles (the bundle format
+  and encoder are already final). Private-bridge `.kqpb` import is implemented.
+- Out-of-band **signed bridge-update bundles for operators who share no live
+  database** are the next step beyond today's per-person `.kqpb` packages and
+  `.kqbn` eviction notices.
 
 ## Security
 

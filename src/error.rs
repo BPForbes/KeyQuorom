@@ -32,6 +32,12 @@ pub enum Error {
     CannotEvict,
     CannotAddLeaf,
     ShareShapeMismatch,
+    InvalidBridgePackage,
+    NotBridgeMember,
+    TooFewBridgeMembers,
+    BridgeDestroyed,
+    BridgeGenerationMismatch,
+    SealedKeyNotHeld,
 }
 
 impl fmt::Display for Error {
@@ -93,6 +99,31 @@ impl fmt::Display for Error {
             }
             Error::ShareShapeMismatch => {
                 write!(f, "shares must share an x-coordinate and y-length")
+            }
+            Error::InvalidBridgePackage => {
+                write!(f, "private-bridge package is malformed or not for this key")
+            }
+            Error::NotBridgeMember => {
+                write!(f, "that node is not a member of this private bridge")
+            }
+            Error::TooFewBridgeMembers => {
+                write!(
+                    f,
+                    "a private sign bridge needs at least two distinct members"
+                )
+            }
+            Error::BridgeDestroyed => write!(f, "this private bridge has been destroyed"),
+            Error::BridgeGenerationMismatch => {
+                write!(
+                    f,
+                    "private-bridge package generation does not match local state"
+                )
+            }
+            Error::SealedKeyNotHeld => {
+                write!(
+                    f,
+                    "this store does not hold a sealed bridge secret for that member"
+                )
             }
         }
     }
