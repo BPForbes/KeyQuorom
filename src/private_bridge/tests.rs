@@ -399,7 +399,7 @@ fn coordinator_evict_notice_lists_five_stakeholders() {
 fn verify_rejects_impersonation_with_unrelated_personal_key() {
     let creator = db::open_in_memory().expect("schema");
     let [(sk_s2, pk_s2), (_, pk_s3), (_, pk_a2), (_, pk_s), (_, pk_a)] = five_party_keys(&creator);
-    let [(_, spk_s2), (_, spk_s3), (_, spk_a2)] = [
+    let [(sign_s2, spk_s2), (_, spk_s3), (sign_a2, spk_a2)] = [
         sign_key(&creator, "M.S.2"),
         sign_key(&creator, "M.S.3"),
         sign_key(&creator, "M.A.2"),
@@ -447,4 +447,46 @@ fn verify_rejects_impersonation_with_unrelated_personal_key() {
         ),
         Err(Error::IntegrityCheckFailed)
     ));
+
+    let valid = crate::signing::sign_with_bridge(
+        &created.uid,
+        created.generation,
+        &created.salt,
+        "M.A.2",
+        &bridge_sk,
+        &sign_a2,
+        b"ok",
+    )
+    .expect("roster-bound artifact");
+    verify_message(&creator, &created.uid, "M.S.2", b"ok", &valid).expect("roster key verifies");
+
+    replace_registered_signing_key(&creator, "M.A.2");
+    assert!(matches!(
+        verify_message(&creator, &created.uid, "M.S.2", b"ok", &valid),
+        Err(Error::IntegrityCheckFailed)
+    ));
+
+    replace_registered_signing_key(&creator, "M.S.2");
+    assert!(matches!(
+        sign_message(
+            &creator,
+            &created.uid,
+            "M.S.2",
+            &sk_s2.to_bytes(),
+            &sign_s2,
+            b"later",
+        ),
+        Err(Error::IntegrityCheckFailed)
+    ));
+}
+
+fn replace_registered_signing_key(conn: &Connection, label: &str) {
+    let old = keys::list_keys(conn)
+        .expect("list")
+        .into_iter()
+        .find(|k| k.label == label && k.key_type == KeyType::Signing && k.revoked_at.is_none())
+        .expect("active signing key");
+    keys::revoke_key(conn, old.id).expect("revoke old signing key");
+    let (_, replacement) = keys::generate_signing_keypair();
+    keys::register_key(conn, label, KeyType::Signing, &replacement).expect("register replacement");
 }

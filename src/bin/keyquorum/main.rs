@@ -1583,7 +1583,7 @@ fn write_bridge_change_notices(changes: &[private_bridge::BridgeChange]) -> Resu
             change.uid,
             sanitize_label(&change.removed_member)?
         );
-        fs::write(&notice_path, &change.notice)?;
+        locked_files::write_owner_only(Path::new(&notice_path), &change.notice)?;
         println!("  Wrote notice {notice_path}");
     }
     Ok(())

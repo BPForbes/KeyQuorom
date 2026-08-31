@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 
 const PACKAGE_MAGIC: &[u8; 4] = b"KQPB";
 const NOTICE_MAGIC: &[u8; 4] = b"KQBN";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const KIND_INVITE: u8 = 1;
 const KIND_ROTATE: u8 = 2;
 const KIND_DESTROY: u8 = 3;
@@ -190,6 +190,7 @@ enum PlannedRemovalKind {
         removed_label: String,
         notify: Vec<String>,
         local_label: String,
+        expected_generation: u32,
         new_generation: u32,
         new_public: [u8; 32],
         new_salt: [u8; SALT_LEN],
@@ -616,6 +617,7 @@ pub fn plan_remove_member(
             removed_label: removed_label.to_string(),
             notify,
             local_label: local_label.to_string(),
+            expected_generation: summary.generation,
             new_generation,
             new_public,
             new_salt,
@@ -664,6 +666,7 @@ pub fn commit_planned_removal(conn: &Connection, planned: &PlannedRemoval) -> Re
             removed_label,
             notify,
             local_label,
+            expected_generation,
             new_generation,
             new_public,
             new_salt,
@@ -675,6 +678,7 @@ pub fn commit_planned_removal(conn: &Connection, planned: &PlannedRemoval) -> Re
                 conn,
                 uid,
                 *bridge_id,
+                *expected_generation,
                 *new_generation,
                 new_public,
                 new_salt,
@@ -1018,6 +1022,7 @@ fn persist_rotation(
     conn: &Connection,
     uid: &str,
     bridge_id: i64,
+    expected_generation: u32,
     generation: u32,
     public_key: &[u8; 32],
     salt: &[u8; SALT_LEN],
@@ -1026,15 +1031,20 @@ fn persist_rotation(
     local_label: &str,
     secret: &[u8; 32],
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3 WHERE uid = ?4",
+    let updated = conn.execute(
+        "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3
+         WHERE uid = ?4 AND generation = ?5 AND destroyed_at IS NULL",
         params![
             generation as i64,
             public_key.as_slice(),
             salt.as_slice(),
-            uid
+            uid,
+            expected_generation as i64
         ],
     )?;
+    if updated != 1 {
+        return Err(Error::BridgeGenerationMismatch);
+    }
     conn.execute(
         "DELETE FROM private_bridge_members WHERE bridge_id = ?1",
         params![bridge_id],
@@ -1289,7 +1299,7 @@ fn encode_package(f: PackageFields<'_>) -> Result<Vec<u8>> {
             f.members,
             f.supervisors,
             f.removed_label,
-        );
+        )?;
         payload.extend_from_slice(&signing::sign(&signing_key.to_bytes(), &preimage));
     }
 
@@ -1546,7 +1556,7 @@ fn verify_update_auth(decoded: &DecodedPackage, old_public: &[u8; 32]) -> Result
         &decoded.members,
         &decoded.supervisors,
         &decoded.removed_label,
-    );
+    )?;
     signing::verify_signature(old_public, &preimage, &sig)
 }
 
@@ -1573,36 +1583,42 @@ fn drop_member_on_coordinator(
             .map(|p| p.label.as_str()),
     );
     let bridge_id = last_bridge_id(conn, uid)?;
-    conn.execute(
-        "DELETE FROM private_bridge_members WHERE bridge_id = ?1 AND node_label = ?2",
-        params![bridge_id, removed_label],
-    )?;
     let kind = if remaining.len() < 2 {
-        conn.execute(
-            "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE uid = ?1",
-            params![uid],
-        )?;
-        conn.execute(
-            "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
-            params![bridge_id],
-        )?;
-        insert_event(
-            conn,
-            bridge_id,
-            "destroyed",
-            json!({"uid": uid, "removed": removed_label, "notify": notify}),
-        )?;
         BridgeChangeKind::Destroyed
     } else {
-        insert_event(
-            conn,
-            bridge_id,
-            "member_removed",
-            json!({"uid": uid, "removed": removed_label, "notify": notify}),
-        )?;
         BridgeChangeKind::NeedsMemberRotate
     };
+    with_immediate_transaction(conn, |conn| {
+        conn.execute(
+            "DELETE FROM private_bridge_members WHERE bridge_id = ?1 AND node_label = ?2",
+            params![bridge_id, removed_label],
+        )?;
+        if kind == BridgeChangeKind::Destroyed {
+            conn.execute(
+                "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE uid = ?1",
+                params![uid],
+            )?;
+            conn.execute(
+                "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
+                params![bridge_id],
+            )?;
+            insert_event(
+                conn,
+                bridge_id,
+                "destroyed",
+                json!({"uid": uid, "removed": removed_label, "notify": notify}),
+            )?;
+        } else {
+            insert_event(
+                conn,
+                bridge_id,
+                "member_removed",
+                json!({"uid": uid, "removed": removed_label, "notify": notify}),
+            )?;
+        }
+        Ok(())
+    })?;
     let notice = encode_notice(uid, removed_label, &remaining, &notify, kind)?;
     Ok(Some(BridgeChange {
         uid: uid.to_string(),
@@ -1696,26 +1712,47 @@ fn update_auth_preimage(
     members: &BTreeMap<String, MemberKeys>,
     supervisors: &BTreeMap<String, [u8; 32]>,
     removed_label: &str,
-) -> [u8; 32] {
+) -> Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(UPDATE_DOMAIN);
-    hasher.update(uid.as_bytes());
+    hash_len_prefixed(&mut hasher, uid.as_bytes())?;
     hasher.update(generation.to_be_bytes());
     hasher.update([kind]);
     hasher.update(public_key);
     hasher.update(salt);
-    hasher.update(recipient_label.as_bytes());
-    hasher.update(removed_label.as_bytes());
+    hash_len_prefixed(&mut hasher, recipient_label.as_bytes())?;
+    hash_len_prefixed(&mut hasher, removed_label.as_bytes())?;
+    hash_u16_count(&mut hasher, members.len())?;
     for (label, keys) in members {
-        hasher.update(label.as_bytes());
+        if label.is_empty() {
+            return Err(Error::InvalidBridgePackage);
+        }
+        hash_len_prefixed(&mut hasher, label.as_bytes())?;
         hasher.update(keys.encryption);
         hasher.update(keys.signing);
     }
+    hash_u16_count(&mut hasher, supervisors.len())?;
     for (label, pk) in supervisors {
-        hasher.update(label.as_bytes());
+        if label.is_empty() {
+            return Err(Error::InvalidBridgePackage);
+        }
+        hash_len_prefixed(&mut hasher, label.as_bytes())?;
         hasher.update(pk);
     }
-    hasher.finalize().into()
+    Ok(hasher.finalize().into())
+}
+
+fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) -> Result<()> {
+    let len = u16::try_from(bytes.len()).map_err(|_| Error::BundleFieldTooLarge)?;
+    hasher.update(len.to_be_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_u16_count(hasher: &mut Sha256, n: usize) -> Result<()> {
+    let n = u16::try_from(n).map_err(|_| Error::BundleFieldTooLarge)?;
+    hasher.update(n.to_be_bytes());
+    Ok(())
 }
 
 fn last_bridge_id(conn: &Connection, uid: &str) -> Result<i64> {
@@ -1780,6 +1817,9 @@ fn with_immediate_transaction(
     conn: &Connection,
     f: impl FnOnce(&Connection) -> Result<()>,
 ) -> Result<()> {
+    if !conn.is_autocommit() {
+        return f(conn);
+    }
     conn.execute("BEGIN IMMEDIATE", [])?;
     match f(conn) {
         Ok(()) => {

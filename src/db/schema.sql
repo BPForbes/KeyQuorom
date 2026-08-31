@@ -238,7 +238,8 @@ CREATE TABLE IF NOT EXISTS private_bridge_members (
     is_local                INTEGER NOT NULL DEFAULT 0 CHECK (is_local IN (0, 1)),
     PRIMARY KEY (bridge_id, node_label),
     CHECK (
-        (role = 'member' AND length(signing_public_key) = 32)
+        (role = 'member' AND signing_public_key IS NOT NULL
+            AND length(signing_public_key) = 32)
         OR (role = 'supervisor' AND signing_public_key IS NULL)
     )
 );
