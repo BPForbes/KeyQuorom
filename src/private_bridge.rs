@@ -24,7 +24,7 @@ use crate::crypto::{random_salt, SALT_LEN};
 use crate::error::{Error, Result};
 use crate::keys;
 use crate::signing::{self, BridgeSignature};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -101,10 +101,17 @@ where
     out.into_iter().collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemberKeys {
+    encryption: [u8; 32],
+    signing: [u8; 32],
+}
+
 #[derive(Clone, Debug)]
 pub struct BridgePartyInput {
     pub label: String,
     pub encryption_public_key: [u8; 32],
+    pub signing_public_key: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +135,7 @@ pub struct CreatedBridge {
 pub struct BridgeParty {
     pub label: String,
     pub encryption_public_key: [u8; 32],
+    pub signing_public_key: Option<[u8; 32]>,
     pub role: PartyRole,
     pub is_local: bool,
     pub has_sealed_key: bool,
@@ -162,6 +170,35 @@ pub struct RemoveMemberOutcome {
     pub packages: Vec<DeliveryPackage>,
 }
 
+/// Membership/key mutation produced by [`plan_remove_member`]. Packages are
+/// generated first so callers can persist them before this store commits.
+pub struct PlannedRemoval {
+    pub outcome: RemoveMemberOutcome,
+    kind: PlannedRemovalKind,
+}
+
+enum PlannedRemovalKind {
+    Destroy {
+        uid: String,
+        bridge_id: i64,
+        removed_label: String,
+        notify: Vec<String>,
+    },
+    Rotate {
+        uid: String,
+        bridge_id: i64,
+        removed_label: String,
+        notify: Vec<String>,
+        local_label: String,
+        new_generation: u32,
+        new_public: [u8; 32],
+        new_salt: [u8; SALT_LEN],
+        members: BTreeMap<String, MemberKeys>,
+        supervisors: BTreeMap<String, [u8; 32]>,
+        new_secret: Zeroizing<[u8; 32]>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BridgeChangeKind {
     NeedsMemberRotate,
@@ -186,11 +223,11 @@ pub fn create(
     supervisors: &[BridgePartyInput],
     local_label: Option<&str>,
 ) -> Result<CreatedBridge> {
-    let members = unique_parties(members, PartyRole::Member)?;
+    let members = unique_members(members)?;
     if members.len() < 2 {
         return Err(Error::TooFewBridgeMembers);
     }
-    let mut supervisors = unique_parties(supervisors, PartyRole::Supervisor)?;
+    let mut supervisors = unique_supervisors(supervisors)?;
     fill_implied_supervisors(&members, &mut supervisors)?;
 
     if let Some(local) = local_label {
@@ -204,33 +241,35 @@ pub fn create(
     let (secret, public_key) = keys::generate_signing_keypair();
     let generation = 1u32;
 
-    persist_new_bridge(
-        conn,
-        &uid,
-        key_id,
-        label,
-        generation,
-        &public_key,
-        &salt,
-        &members,
-        &supervisors,
-        local_label,
-        &secret,
-    )?;
-
-    insert_event(
-        conn,
-        last_bridge_id(conn, &uid)?,
-        "created",
-        json!({
-            "uid": uid,
-            "generation": generation,
-            "members": sorted_keys(&members),
-            "supervisors": sorted_keys(&supervisors),
-            "notify": notify_labels(members.keys().map(|s| s.as_str())),
-            "salt": hex::encode(salt),
-        }),
-    )?;
+    with_immediate_transaction(conn, |conn| {
+        persist_new_bridge(
+            conn,
+            &uid,
+            key_id,
+            label,
+            generation,
+            &public_key,
+            &salt,
+            &members,
+            &supervisors,
+            local_label,
+            &secret,
+        )?;
+        insert_event(
+            conn,
+            last_bridge_id(conn, &uid)?,
+            "created",
+            json!({
+                "uid": uid,
+                "generation": generation,
+                "members": sorted_keys(&members),
+                "supervisors": sorted_keys(&supervisors),
+                "notify": notify_labels(members.keys().map(|s| s.as_str())),
+                "salt": hex::encode(salt),
+            }),
+        )?;
+        Ok(())
+    })?;
 
     let secret_bytes: &[u8; 32] = &secret;
     let packages = packages_for_roster(
@@ -325,7 +364,7 @@ pub fn get(conn: &Connection, uid: &str) -> Result<BridgeSummary> {
         .ok_or(Error::BridgeNotFound)?;
 
     let mut stmt = conn.prepare(
-        "SELECT m.node_label, m.encryption_public_key, m.role, m.is_local,
+        "SELECT m.node_label, m.encryption_public_key, m.signing_public_key, m.role, m.is_local,
                 (SELECT COUNT(*) FROM private_bridge_sealed_keys s
                  WHERE s.bridge_id = m.bridge_id AND s.node_label = m.node_label)
          FROM private_bridge_members m
@@ -334,12 +373,13 @@ pub fn get(conn: &Connection, uid: &str) -> Result<BridgeSummary> {
     )?;
     let parties = stmt
         .query_map(params![id], |row| {
-            let role: String = row.get(2)?;
-            let is_local: i64 = row.get(3)?;
-            let sealed: i64 = row.get(4)?;
+            let role: String = row.get(3)?;
+            let is_local: i64 = row.get(4)?;
+            let sealed: i64 = row.get(5)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
                 role,
                 is_local != 0,
                 sealed != 0,
@@ -349,10 +389,11 @@ pub fn get(conn: &Connection, uid: &str) -> Result<BridgeSummary> {
 
     let parties = parties
         .into_iter()
-        .map(|(label, pk, role, is_local, has_sealed_key)| {
+        .map(|(label, pk, signing_pk, role, is_local, has_sealed_key)| {
             Ok(BridgeParty {
                 label,
                 encryption_public_key: vec_to_32(&pk)?,
+                signing_public_key: signing_pk.as_deref().map(vec_to_32).transpose()?,
                 role: PartyRole::from_db(&role)?,
                 is_local,
                 has_sealed_key,
@@ -426,6 +467,9 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<BridgeEvent> {
 /// rotates (or destroys if fewer than two members remain), and returns
 /// per-person packages for every remaining stakeholder plus the removed
 /// employee (so their store can drop the old standard).
+///
+/// Library callers that do not write packages to disk can use this helper,
+/// which commits immediately. The CLI plans, writes envelopes, then commits.
 pub fn remove_member(
     conn: &Connection,
     uid: &str,
@@ -433,6 +477,19 @@ pub fn remove_member(
     local_label: &str,
     encryption_sk: &[u8; 32],
 ) -> Result<RemoveMemberOutcome> {
+    let planned = plan_remove_member(conn, uid, removed_label, local_label, encryption_sk)?;
+    commit_planned_removal(conn, &planned)?;
+    Ok(planned.outcome)
+}
+
+/// Build rotation/destruction packages without mutating this store.
+pub fn plan_remove_member(
+    conn: &Connection,
+    uid: &str,
+    removed_label: &str,
+    local_label: &str,
+    encryption_sk: &[u8; 32],
+) -> Result<PlannedRemoval> {
     let summary = get(conn, uid)?;
     if summary.destroyed {
         return Err(Error::BridgeDestroyed);
@@ -457,12 +514,7 @@ pub fn remove_member(
     }
 
     let secret = unseal_local_secret(conn, uid, local_label, encryption_sk)?;
-    let members: BTreeMap<String, [u8; 32]> = summary
-        .parties
-        .iter()
-        .filter(|p| p.role == PartyRole::Member && p.label != removed_label)
-        .map(|p| (p.label.clone(), p.encryption_public_key))
-        .collect();
+    let members = remaining_members(&summary, removed_label)?;
 
     let notify = notify_labels(
         summary
@@ -477,25 +529,7 @@ pub fn remove_member(
     let remaining_member_list = sorted_keys(&members);
 
     if members.len() < 2 {
-        conn.execute(
-            "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE uid = ?1",
-            params![uid],
-        )?;
-        conn.execute(
-            "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
-            params![bridge_id],
-        )?;
-        insert_event(
-            conn,
-            bridge_id,
-            "destroyed",
-            json!({
-                "uid": uid,
-                "removed": removed_label,
-                "notify": notify,
-            }),
-        )?;
+        let supervisors = supervisor_pubs_for(&members, &summary.parties);
         let mut packages = Vec::new();
         for party in &summary.parties {
             packages.push(destroy_package_for(
@@ -505,7 +539,7 @@ pub fn remove_member(
                 &old_public,
                 &summary.salt,
                 &members,
-                &supervisor_pubs_for(&members, &summary.parties),
+                &supervisors,
                 removed_label,
                 &party.label,
                 party.encryption_public_key,
@@ -513,11 +547,19 @@ pub fn remove_member(
                 &old_signing,
             )?);
         }
-        return Ok(RemoveMemberOutcome {
-            uid: uid.to_string(),
-            destroyed: true,
-            remaining_members: remaining_member_list,
-            packages,
+        return Ok(PlannedRemoval {
+            outcome: RemoveMemberOutcome {
+                uid: uid.to_string(),
+                destroyed: true,
+                remaining_members: remaining_member_list,
+                packages,
+            },
+            kind: PlannedRemovalKind::Destroy {
+                uid: uid.to_string(),
+                bridge_id,
+                removed_label: removed_label.to_string(),
+                notify,
+            },
         });
     }
 
@@ -525,58 +567,6 @@ pub fn remove_member(
     let (new_secret, new_public) = keys::generate_signing_keypair();
     let new_generation = summary.generation + 1;
     let supervisors = supervisor_pubs_for(&members, &summary.parties);
-
-    conn.execute(
-        "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3 WHERE uid = ?4",
-        params![
-            new_generation as i64,
-            new_public.as_slice(),
-            new_salt.as_slice(),
-            uid
-        ],
-    )?;
-    conn.execute(
-        "DELETE FROM private_bridge_members WHERE bridge_id = ?1",
-        params![bridge_id],
-    )?;
-    insert_parties(
-        conn,
-        bridge_id,
-        &members,
-        PartyRole::Member,
-        Some(local_label),
-    )?;
-    insert_parties(
-        conn,
-        bridge_id,
-        &supervisors,
-        PartyRole::Supervisor,
-        Some(local_label),
-    )?;
-    conn.execute(
-        "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
-        params![bridge_id],
-    )?;
-    seal_local_if_member(conn, bridge_id, local_label, &members, &new_secret)?;
-
-    insert_event(
-        conn,
-        bridge_id,
-        "member_removed",
-        json!({"uid": uid, "removed": removed_label, "notify": notify}),
-    )?;
-    insert_event(
-        conn,
-        bridge_id,
-        "rotated",
-        json!({
-            "uid": uid,
-            "generation": new_generation,
-            "members": sorted_keys(&members),
-            "supervisors": sorted_keys(&supervisors),
-            "salt": hex::encode(new_salt),
-        }),
-    )?;
 
     let new_secret_bytes: &[u8; 32] = &new_secret;
     let mut packages = packages_for_roster(
@@ -613,12 +603,107 @@ pub fn remove_member(
         &old_signing,
     )?);
 
-    Ok(RemoveMemberOutcome {
-        uid: uid.to_string(),
-        destroyed: false,
-        remaining_members: sorted_keys(&members),
-        packages,
+    Ok(PlannedRemoval {
+        outcome: RemoveMemberOutcome {
+            uid: uid.to_string(),
+            destroyed: false,
+            remaining_members: remaining_member_list,
+            packages,
+        },
+        kind: PlannedRemovalKind::Rotate {
+            uid: uid.to_string(),
+            bridge_id,
+            removed_label: removed_label.to_string(),
+            notify,
+            local_label: local_label.to_string(),
+            new_generation,
+            new_public,
+            new_salt,
+            members,
+            supervisors,
+            new_secret,
+        },
     })
+}
+
+/// Apply a previously planned removal. Callers that write delivery packages
+/// should persist those files first so a later disk failure does not strand
+/// other stores on the old generation.
+pub fn commit_planned_removal(conn: &Connection, planned: &PlannedRemoval) -> Result<()> {
+    match &planned.kind {
+        PlannedRemovalKind::Destroy {
+            uid,
+            bridge_id,
+            removed_label,
+            notify,
+        } => with_immediate_transaction(conn, |conn| {
+            conn.execute(
+                "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE uid = ?1",
+                params![uid],
+            )?;
+            conn.execute(
+                "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
+                params![bridge_id],
+            )?;
+            insert_event(
+                conn,
+                *bridge_id,
+                "destroyed",
+                json!({
+                    "uid": uid,
+                    "removed": removed_label,
+                    "notify": notify,
+                }),
+            )?;
+            Ok(())
+        }),
+        PlannedRemovalKind::Rotate {
+            uid,
+            bridge_id,
+            removed_label,
+            notify,
+            local_label,
+            new_generation,
+            new_public,
+            new_salt,
+            members,
+            supervisors,
+            new_secret,
+        } => with_immediate_transaction(conn, |conn| {
+            persist_rotation(
+                conn,
+                uid,
+                *bridge_id,
+                *new_generation,
+                new_public,
+                new_salt,
+                members,
+                supervisors,
+                local_label,
+                new_secret,
+            )?;
+            insert_event(
+                conn,
+                *bridge_id,
+                "member_removed",
+                json!({"uid": uid, "removed": removed_label, "notify": notify}),
+            )?;
+            insert_event(
+                conn,
+                *bridge_id,
+                "rotated",
+                json!({
+                    "uid": uid,
+                    "generation": new_generation,
+                    "members": sorted_keys(members),
+                    "supervisors": sorted_keys(supervisors),
+                    "salt": hex::encode(new_salt),
+                }),
+            )?;
+            Ok(())
+        }),
+    }
 }
 
 /// Coordinator-side membership drop used by tree eviction. Does not rotate
@@ -637,6 +722,28 @@ pub fn on_leaf_removed(
     )?;
     let uids: Vec<String> = stmt
         .query_map(params![key_id, node_label], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut changes = Vec::new();
+    for uid in uids {
+        if let Some(change) = drop_member_on_coordinator(conn, &uid, node_label)? {
+            changes.push(change);
+        }
+    }
+    Ok(changes)
+}
+
+/// Drop a revoked employee from every live private bridge they belong to,
+/// including bridges not tied to a specific tree `key_id`.
+pub fn on_member_revoked(conn: &Connection, node_label: &str) -> Result<Vec<BridgeChange>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.uid FROM private_bridges b
+         JOIN private_bridge_members m ON m.bridge_id = b.id
+         WHERE b.destroyed_at IS NULL
+           AND m.node_label = ?1 AND m.role = 'member'",
+    )?;
+    let uids: Vec<String> = stmt
+        .query_map(params![node_label], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
     let mut changes = Vec::new();
@@ -671,6 +778,18 @@ pub fn sign_message(
     if keys::encryption_public_from_secret(encryption_sk) != member.encryption_public_key {
         return Err(Error::IntegrityCheckFailed);
     }
+    let roster_signing = member.signing_public_key.ok_or(Error::InvalidBridge)?;
+    let provided_signing = SigningKey::from_bytes(signing_sk)
+        .verifying_key()
+        .to_bytes();
+    if provided_signing != roster_signing {
+        return Err(Error::IntegrityCheckFailed);
+    }
+    match signing_public_for_label(conn, local_label) {
+        Ok(local) if local != roster_signing => return Err(Error::IntegrityCheckFailed),
+        Ok(_) | Err(Error::NodeNotFound) => {}
+        Err(err) => return Err(err),
+    }
     let bridge_sk = unseal_local_secret(conn, uid, local_label, encryption_sk)?;
     signing::sign_with_bridge(
         uid,
@@ -700,18 +819,25 @@ pub fn verify_message(
     if artifact.bridge_salt != summary.salt {
         return Err(Error::BridgeGenerationMismatch);
     }
-    let signer_ok = summary
+    let signer = summary
         .parties
         .iter()
-        .any(|p| p.role == PartyRole::Member && p.label == artifact.signer_label);
+        .find(|p| p.role == PartyRole::Member && p.label == artifact.signer_label)
+        .ok_or(Error::NotBridgeMember)?;
     let verifier_ok = summary
         .parties
         .iter()
         .any(|p| p.role == PartyRole::Member && p.label == verifier_label);
-    if !signer_ok || !verifier_ok {
+    if !verifier_ok {
         return Err(Error::NotBridgeMember);
     }
-    signing::verify_bridge_signature(artifact, &summary.public_key, message)
+    let roster_signing = signer.signing_public_key.ok_or(Error::InvalidBridge)?;
+    match signing_public_for_label(conn, &artifact.signer_label) {
+        Ok(local) if local != roster_signing => return Err(Error::IntegrityCheckFailed),
+        Ok(_) | Err(Error::NodeNotFound) => {}
+        Err(err) => return Err(err),
+    }
+    signing::verify_bridge_signature(artifact, &summary.public_key, &roster_signing, message)
 }
 
 pub fn encryption_public_for_label(
@@ -724,7 +850,8 @@ pub fn encryption_public_for_label(
             .query_row(
                 "SELECT h.public_key FROM key_nodes n
                  JOIN hardware_keys h ON h.id = n.hardware_key_id
-                 WHERE n.key_id = ?1 AND n.label = ?2 AND n.is_active = 1",
+                 WHERE n.key_id = ?1 AND n.label = ?2 AND n.is_active = 1
+                   AND h.revoked_at IS NULL",
                 params![key_id, label],
                 |row| row.get(0),
             )
@@ -748,10 +875,54 @@ pub fn encryption_public_for_label(
     }
 }
 
-fn unique_parties(
-    parties: &[BridgePartyInput],
-    _role: PartyRole,
-) -> Result<BTreeMap<String, [u8; 32]>> {
+pub fn signing_public_for_label(conn: &Connection, label: &str) -> Result<[u8; 32]> {
+    let mut stmt = conn.prepare(
+        "SELECT public_key FROM hardware_keys
+         WHERE label = ?1 AND key_type = 'signing' AND revoked_at IS NULL
+         ORDER BY id",
+    )?;
+    let keys: Vec<Vec<u8>> = stmt
+        .query_map(params![label], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    match keys.as_slice() {
+        [pk] => {
+            let pk = vec_to_32(pk)?;
+            VerifyingKey::from_bytes(&pk).map_err(|_| Error::InvalidPublicKey)?;
+            Ok(pk)
+        }
+        [] => Err(Error::NodeNotFound),
+        _ => Err(Error::InvalidBridge),
+    }
+}
+
+fn unique_members(parties: &[BridgePartyInput]) -> Result<BTreeMap<String, MemberKeys>> {
+    let mut map = BTreeMap::new();
+    for party in parties {
+        if party.label.is_empty() {
+            return Err(Error::InvalidBridge);
+        }
+        if is_weak_x25519_public_key(&party.encryption_public_key) {
+            return Err(Error::InvalidPublicKey);
+        }
+        let signing = party.signing_public_key.ok_or(Error::InvalidPublicKey)?;
+        VerifyingKey::from_bytes(&signing).map_err(|_| Error::InvalidPublicKey)?;
+        if map
+            .insert(
+                party.label.clone(),
+                MemberKeys {
+                    encryption: party.encryption_public_key,
+                    signing,
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::DuplicateNodeLabel);
+        }
+    }
+    Ok(map)
+}
+
+fn unique_supervisors(parties: &[BridgePartyInput]) -> Result<BTreeMap<String, [u8; 32]>> {
     let mut map = BTreeMap::new();
     for party in parties {
         if party.label.is_empty() {
@@ -771,7 +942,7 @@ fn unique_parties(
 }
 
 fn fill_implied_supervisors(
-    members: &BTreeMap<String, [u8; 32]>,
+    members: &BTreeMap<String, MemberKeys>,
     supervisors: &mut BTreeMap<String, [u8; 32]>,
 ) -> Result<()> {
     for member in members.keys() {
@@ -789,7 +960,7 @@ fn fill_implied_supervisors(
 }
 
 fn supervisor_pubs_for(
-    members: &BTreeMap<String, [u8; 32]>,
+    members: &BTreeMap<String, MemberKeys>,
     previous: &[BridgeParty],
 ) -> BTreeMap<String, [u8; 32]> {
     let mut needed: BTreeSet<String> = BTreeSet::new();
@@ -818,7 +989,7 @@ fn persist_new_bridge(
     generation: u32,
     public_key: &[u8; 32],
     salt: &[u8; SALT_LEN],
-    members: &BTreeMap<String, [u8; 32]>,
+    members: &BTreeMap<String, MemberKeys>,
     supervisors: &BTreeMap<String, [u8; 32]>,
     local_label: Option<&str>,
     secret: &[u8; 32],
@@ -836,38 +1007,85 @@ fn persist_new_bridge(
         ],
     )?;
     let bridge_id = conn.last_insert_rowid();
-    insert_parties(conn, bridge_id, members, PartyRole::Member, local_label)?;
-    insert_parties(
-        conn,
-        bridge_id,
-        supervisors,
-        PartyRole::Supervisor,
-        local_label,
-    )?;
+    insert_member_parties(conn, bridge_id, members, local_label)?;
+    insert_supervisor_parties(conn, bridge_id, supervisors, local_label)?;
     seal_local_if_member(conn, bridge_id, local_label.unwrap_or(""), members, secret)?;
     Ok(())
 }
 
-fn insert_parties(
+#[allow(clippy::too_many_arguments)]
+fn persist_rotation(
+    conn: &Connection,
+    uid: &str,
+    bridge_id: i64,
+    generation: u32,
+    public_key: &[u8; 32],
+    salt: &[u8; SALT_LEN],
+    members: &BTreeMap<String, MemberKeys>,
+    supervisors: &BTreeMap<String, [u8; 32]>,
+    local_label: &str,
+    secret: &[u8; 32],
+) -> Result<()> {
+    conn.execute(
+        "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3 WHERE uid = ?4",
+        params![
+            generation as i64,
+            public_key.as_slice(),
+            salt.as_slice(),
+            uid
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM private_bridge_members WHERE bridge_id = ?1",
+        params![bridge_id],
+    )?;
+    insert_member_parties(conn, bridge_id, members, Some(local_label))?;
+    insert_supervisor_parties(conn, bridge_id, supervisors, Some(local_label))?;
+    conn.execute(
+        "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
+        params![bridge_id],
+    )?;
+    seal_local_if_member(conn, bridge_id, local_label, members, secret)?;
+    Ok(())
+}
+
+fn insert_member_parties(
     conn: &Connection,
     bridge_id: i64,
-    parties: &BTreeMap<String, [u8; 32]>,
-    role: PartyRole,
+    members: &BTreeMap<String, MemberKeys>,
     local_label: Option<&str>,
 ) -> Result<()> {
-    for (label, pk) in parties {
+    for (label, keys) in members {
         let is_local = local_label == Some(label.as_str());
         conn.execute(
             "INSERT INTO private_bridge_members
-             (bridge_id, node_label, encryption_public_key, role, is_local)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (bridge_id, node_label, encryption_public_key, signing_public_key, role, is_local)
+             VALUES (?1, ?2, ?3, ?4, 'member', ?5)",
             params![
                 bridge_id,
                 label,
-                pk.as_slice(),
-                role.as_str(),
+                keys.encryption.as_slice(),
+                keys.signing.as_slice(),
                 is_local as i64
             ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_supervisor_parties(
+    conn: &Connection,
+    bridge_id: i64,
+    supervisors: &BTreeMap<String, [u8; 32]>,
+    local_label: Option<&str>,
+) -> Result<()> {
+    for (label, pk) in supervisors {
+        let is_local = local_label == Some(label.as_str());
+        conn.execute(
+            "INSERT INTO private_bridge_members
+             (bridge_id, node_label, encryption_public_key, signing_public_key, role, is_local)
+             VALUES (?1, ?2, ?3, NULL, 'supervisor', ?4)",
+            params![bridge_id, label, pk.as_slice(), is_local as i64],
         )?;
     }
     Ok(())
@@ -877,14 +1095,14 @@ fn seal_local_if_member(
     conn: &Connection,
     bridge_id: i64,
     local_label: &str,
-    members: &BTreeMap<String, [u8; 32]>,
+    members: &BTreeMap<String, MemberKeys>,
     secret: &[u8; 32],
 ) -> Result<()> {
-    let Some(pk) = members.get(local_label) else {
+    let Some(keys) = members.get(local_label) else {
         return Ok(());
     };
     let wrap_salt = random_salt();
-    let wrapped = seal_secret(pk, &wrap_salt, secret)?;
+    let wrapped = seal_secret(&keys.encryption, &wrap_salt, secret)?;
     conn.execute(
         "INSERT INTO private_bridge_sealed_keys
          (bridge_id, node_label, wrap_salt, wrapped_secret)
@@ -903,19 +1121,19 @@ fn packages_for_roster(
     bridge_label: &str,
     public_key: &[u8; 32],
     salt: &[u8; SALT_LEN],
-    members: &BTreeMap<String, [u8; 32]>,
+    members: &BTreeMap<String, MemberKeys>,
     supervisors: &BTreeMap<String, [u8; 32]>,
     removed_label: &str,
     secret: Option<&[u8; 32]>,
     old_signing: Option<&SigningKey>,
 ) -> Result<Vec<DeliveryPackage>> {
     let mut packages = Vec::new();
-    for (label, pk) in members {
+    for (label, keys) in members {
         let wrap = secret.map(|_| random_salt());
         packages.push(DeliveryPackage {
             label: label.clone(),
             role: PartyRole::Member,
-            recipient_public_key: *pk,
+            recipient_public_key: keys.encryption,
             bytes: encode_package(PackageFields {
                 kind: member_kind,
                 uid,
@@ -924,7 +1142,7 @@ fn packages_for_roster(
                 public_key,
                 salt,
                 recipient_label: label,
-                recipient_public_key: pk,
+                recipient_public_key: &keys.encryption,
                 role: PartyRole::Member,
                 members,
                 supervisors,
@@ -969,7 +1187,7 @@ fn destroy_package_for(
     bridge_label: &str,
     public_key: &[u8; 32],
     salt: &[u8; SALT_LEN],
-    members: &BTreeMap<String, [u8; 32]>,
+    members: &BTreeMap<String, MemberKeys>,
     supervisors: &BTreeMap<String, [u8; 32]>,
     removed_label: &str,
     recipient_label: &str,
@@ -1011,7 +1229,7 @@ struct PackageFields<'a> {
     recipient_label: &'a str,
     recipient_public_key: &'a [u8; 32],
     role: PartyRole,
-    members: &'a BTreeMap<String, [u8; 32]>,
+    members: &'a BTreeMap<String, MemberKeys>,
     supervisors: &'a BTreeMap<String, [u8; 32]>,
     removed_label: &'a str,
     wrap_salt: Option<&'a [u8; SALT_LEN]>,
@@ -1029,7 +1247,7 @@ struct DecodedPackage {
     recipient_label: String,
     recipient_public_key: [u8; 32],
     role: PartyRole,
-    members: BTreeMap<String, [u8; 32]>,
+    members: BTreeMap<String, MemberKeys>,
     supervisors: BTreeMap<String, [u8; 32]>,
     removed_label: String,
     wrap_salt: Option<[u8; SALT_LEN]>,
@@ -1049,7 +1267,7 @@ fn encode_package(f: PackageFields<'_>) -> Result<Vec<u8>> {
     payload.extend_from_slice(f.salt);
     push_len_prefixed(&mut payload, f.recipient_label.as_bytes())?;
     payload.push(f.role.to_u8());
-    push_party_map(&mut payload, f.members)?;
+    push_member_map(&mut payload, f.members)?;
     push_party_map(&mut payload, f.supervisors)?;
     push_len_prefixed(&mut payload, f.removed_label.as_bytes())?;
     let has_secret = f.secret.is_some();
@@ -1116,7 +1334,7 @@ fn decode_package(bytes: &[u8], recipient_sk: &[u8; 32]) -> Result<DecodedPackag
     let salt = take_array::<SALT_LEN>(&mut payload)?;
     let recipient_label = utf8(take_len_prefixed(&mut payload)?)?;
     let role = PartyRole::from_u8(take_u8(&mut payload)?)?;
-    let members = take_party_map(&mut payload)?;
+    let members = take_member_map(&mut payload)?;
     let supervisors = take_party_map(&mut payload)?;
     let removed_label = utf8(take_len_prefixed(&mut payload)?)?;
     let has_secret = take_u8(&mut payload)? != 0;
@@ -1156,66 +1374,41 @@ fn decode_package(bytes: &[u8], recipient_sk: &[u8; 32]) -> Result<DecodedPackag
 }
 
 fn insert_from_invite(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
+    validate_decoded_recipient(decoded)?;
     if get_optional(conn, &decoded.uid)?.is_some() {
         return Err(Error::InvalidBridge);
     }
-    conn.execute(
-        "INSERT INTO private_bridges (uid, label, generation, public_key, salt)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            decoded.uid,
-            empty_to_none(&decoded.bridge_label),
-            decoded.generation as i64,
-            decoded.public_key.as_slice(),
-            decoded.salt.as_slice()
-        ],
-    )?;
-    let bridge_id = conn.last_insert_rowid();
-    insert_parties(
-        conn,
-        bridge_id,
-        &decoded.members,
-        PartyRole::Member,
-        Some(&decoded.recipient_label),
-    )?;
-    insert_parties(
-        conn,
-        bridge_id,
-        &decoded.supervisors,
-        PartyRole::Supervisor,
-        Some(&decoded.recipient_label),
-    )?;
-    if let (Some(wrap_salt), Some(secret), PartyRole::Member) =
-        (decoded.wrap_salt, decoded.secret.as_ref(), decoded.role)
-    {
-        let wrapped = seal_secret(&decoded.recipient_public_key, &wrap_salt, secret)?;
+    with_immediate_transaction(conn, |conn| {
         conn.execute(
-            "INSERT INTO private_bridge_sealed_keys
-             (bridge_id, node_label, wrap_salt, wrapped_secret)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO private_bridges (uid, label, generation, public_key, salt)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                bridge_id,
-                decoded.recipient_label,
-                wrap_salt.as_slice(),
-                wrapped
+                decoded.uid,
+                empty_to_none(&decoded.bridge_label),
+                decoded.generation as i64,
+                decoded.public_key.as_slice(),
+                decoded.salt.as_slice()
             ],
         )?;
-    }
-    insert_event(
-        conn,
-        bridge_id,
-        "imported",
-        json!({
-            "uid": decoded.uid,
-            "role": decoded.role.as_str(),
-            "node": decoded.recipient_label,
-            "generation": decoded.generation,
-        }),
-    )?;
-    Ok(())
+        let bridge_id = conn.last_insert_rowid();
+        replace_roster_and_secret(conn, bridge_id, decoded)?;
+        insert_event(
+            conn,
+            bridge_id,
+            "imported",
+            json!({
+                "uid": decoded.uid,
+                "role": decoded.role.as_str(),
+                "node": decoded.recipient_label,
+                "generation": decoded.generation,
+            }),
+        )?;
+        Ok(())
+    })
 }
 
 fn apply_rotate(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
+    validate_decoded_recipient(decoded)?;
     let summary = get(conn, &decoded.uid)?;
     if summary.destroyed {
         return Err(Error::BridgeDestroyed);
@@ -1225,38 +1418,57 @@ fn apply_rotate(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
     }
     verify_update_auth(decoded, &summary.public_key)?;
     let bridge_id = last_bridge_id(conn, &decoded.uid)?;
-    conn.execute(
-        "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3, label = COALESCE(?4, label)
-         WHERE uid = ?5",
-        params![
-            decoded.generation as i64,
-            decoded.public_key.as_slice(),
-            decoded.salt.as_slice(),
-            empty_to_none(&decoded.bridge_label),
-            decoded.uid
-        ],
-    )?;
-    conn.execute(
-        "DELETE FROM private_bridge_members WHERE bridge_id = ?1",
-        params![bridge_id],
-    )?;
-    insert_parties(
+    with_immediate_transaction(conn, |conn| {
+        conn.execute(
+            "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3, label = COALESCE(?4, label)
+             WHERE uid = ?5",
+            params![
+                decoded.generation as i64,
+                decoded.public_key.as_slice(),
+                decoded.salt.as_slice(),
+                empty_to_none(&decoded.bridge_label),
+                decoded.uid
+            ],
+        )?;
+        conn.execute(
+            "DELETE FROM private_bridge_members WHERE bridge_id = ?1",
+            params![bridge_id],
+        )?;
+        conn.execute(
+            "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
+            params![bridge_id],
+        )?;
+        replace_roster_and_secret(conn, bridge_id, decoded)?;
+        insert_event(
+            conn,
+            bridge_id,
+            "rotated",
+            json!({
+                "uid": decoded.uid,
+                "generation": decoded.generation,
+                "node": decoded.recipient_label,
+            }),
+        )?;
+        Ok(())
+    })
+}
+
+fn replace_roster_and_secret(
+    conn: &Connection,
+    bridge_id: i64,
+    decoded: &DecodedPackage,
+) -> Result<()> {
+    insert_member_parties(
         conn,
         bridge_id,
         &decoded.members,
-        PartyRole::Member,
         Some(&decoded.recipient_label),
     )?;
-    insert_parties(
+    insert_supervisor_parties(
         conn,
         bridge_id,
         &decoded.supervisors,
-        PartyRole::Supervisor,
         Some(&decoded.recipient_label),
-    )?;
-    conn.execute(
-        "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
-        params![bridge_id],
     )?;
     if let (Some(wrap_salt), Some(secret), PartyRole::Member) =
         (decoded.wrap_salt, decoded.secret.as_ref(), decoded.role)
@@ -1274,16 +1486,26 @@ fn apply_rotate(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
             ],
         )?;
     }
-    insert_event(
-        conn,
-        bridge_id,
-        "rotated",
-        json!({
-            "uid": decoded.uid,
-            "generation": decoded.generation,
-            "node": decoded.recipient_label,
-        }),
-    )?;
+    Ok(())
+}
+
+fn validate_decoded_recipient(decoded: &DecodedPackage) -> Result<()> {
+    let in_members = decoded.members.contains_key(&decoded.recipient_label);
+    let in_supervisors = decoded.supervisors.contains_key(&decoded.recipient_label);
+    let role_matches = match decoded.role {
+        PartyRole::Member => in_members,
+        PartyRole::Supervisor => in_supervisors,
+    };
+    if !role_matches {
+        return Err(Error::InvalidBridgePackage);
+    }
+    let expected_pk = match decoded.role {
+        PartyRole::Member => decoded.members[&decoded.recipient_label].encryption,
+        PartyRole::Supervisor => decoded.supervisors[&decoded.recipient_label],
+    };
+    if expected_pk != decoded.recipient_public_key {
+        return Err(Error::InvalidBridgePackage);
+    }
     Ok(())
 }
 
@@ -1471,7 +1693,7 @@ fn update_auth_preimage(
     public_key: &[u8; 32],
     salt: &[u8; SALT_LEN],
     recipient_label: &str,
-    members: &BTreeMap<String, [u8; 32]>,
+    members: &BTreeMap<String, MemberKeys>,
     supervisors: &BTreeMap<String, [u8; 32]>,
     removed_label: &str,
 ) -> [u8; 32] {
@@ -1484,11 +1706,14 @@ fn update_auth_preimage(
     hasher.update(salt);
     hasher.update(recipient_label.as_bytes());
     hasher.update(removed_label.as_bytes());
-    for label in members.keys() {
+    for (label, keys) in members {
         hasher.update(label.as_bytes());
+        hasher.update(keys.encryption);
+        hasher.update(keys.signing);
     }
-    for label in supervisors.keys() {
+    for (label, pk) in supervisors {
         hasher.update(label.as_bytes());
+        hasher.update(pk);
     }
     hasher.finalize().into()
 }
@@ -1526,8 +1751,46 @@ fn insert_event(
     Ok(())
 }
 
-fn sorted_keys(map: &BTreeMap<String, [u8; 32]>) -> Vec<String> {
+fn sorted_keys<T>(map: &BTreeMap<String, T>) -> Vec<String> {
     map.keys().cloned().collect()
+}
+
+fn remaining_members(
+    summary: &BridgeSummary,
+    removed_label: &str,
+) -> Result<BTreeMap<String, MemberKeys>> {
+    let mut members = BTreeMap::new();
+    for party in &summary.parties {
+        if party.role != PartyRole::Member || party.label == removed_label {
+            continue;
+        }
+        let signing = party.signing_public_key.ok_or(Error::InvalidBridge)?;
+        members.insert(
+            party.label.clone(),
+            MemberKeys {
+                encryption: party.encryption_public_key,
+                signing,
+            },
+        );
+    }
+    Ok(members)
+}
+
+fn with_immediate_transaction(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    match f(conn) {
+        Ok(()) => {
+            conn.execute("COMMIT", [])?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(err)
+        }
+    }
 }
 
 fn empty_to_none(s: &str) -> Option<&str> {
@@ -1567,6 +1830,17 @@ fn push_party_map(out: &mut Vec<u8>, map: &BTreeMap<String, [u8; 32]>) -> Result
     Ok(())
 }
 
+fn push_member_map(out: &mut Vec<u8>, map: &BTreeMap<String, MemberKeys>) -> Result<()> {
+    let n = u16::try_from(map.len()).map_err(|_| Error::BundleFieldTooLarge)?;
+    out.extend_from_slice(&n.to_be_bytes());
+    for (label, keys) in map {
+        push_len_prefixed(out, label.as_bytes())?;
+        out.extend_from_slice(&keys.encryption);
+        out.extend_from_slice(&keys.signing);
+    }
+    Ok(())
+}
+
 fn take_u8(data: &mut &[u8]) -> Result<u8> {
     let (b, rest) = data.split_first().ok_or(Error::InvalidBridgePackage)?;
     *data = rest;
@@ -1600,6 +1874,25 @@ fn take_party_map(data: &mut &[u8]) -> Result<BTreeMap<String, [u8; 32]>> {
         let label = utf8(take_len_prefixed(data)?)?;
         let pk = take_array::<32>(data)?;
         map.insert(label, pk);
+    }
+    Ok(map)
+}
+
+fn take_member_map(data: &mut &[u8]) -> Result<BTreeMap<String, MemberKeys>> {
+    let n = u16::from_be_bytes(take_array(data)?) as usize;
+    let mut map = BTreeMap::new();
+    for _ in 0..n {
+        let label = utf8(take_len_prefixed(data)?)?;
+        let encryption = take_array::<32>(data)?;
+        let signing = take_array::<32>(data)?;
+        VerifyingKey::from_bytes(&signing).map_err(|_| Error::InvalidBridgePackage)?;
+        map.insert(
+            label,
+            MemberKeys {
+                encryption,
+                signing,
+            },
+        );
     }
     Ok(map)
 }

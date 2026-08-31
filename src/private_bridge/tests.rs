@@ -11,10 +11,25 @@ fn enc(conn: &Connection, label: &str) -> (crypto_box::SecretKey, [u8; 32]) {
     (secret, public)
 }
 
-fn party(label: &str, pk: [u8; 32]) -> BridgePartyInput {
+fn sign_key(conn: &Connection, label: &str) -> (zeroize::Zeroizing<[u8; 32]>, [u8; 32]) {
+    let (secret, public) = keys::generate_signing_keypair();
+    keys::register_key(conn, label, KeyType::Signing, &public).expect("register signing");
+    (secret, public)
+}
+
+fn party(label: &str, pk: [u8; 32], signing_pk: [u8; 32]) -> BridgePartyInput {
     BridgePartyInput {
         label: label.to_string(),
         encryption_public_key: pk,
+        signing_public_key: Some(signing_pk),
+    }
+}
+
+fn supervisor(label: &str, pk: [u8; 32]) -> BridgePartyInput {
+    BridgePartyInput {
+        label: label.to_string(),
+        encryption_public_key: pk,
+        signing_public_key: None,
     }
 }
 
@@ -51,16 +66,21 @@ fn notify_set_for_three_employees_is_five_stores() {
 fn create_emits_packages_for_members_and_department_managers() {
     let conn = db::open_in_memory().expect("schema");
     let [(_, pk_s2), (_, pk_s3), (_, pk_a2), (_, pk_s), (_, pk_a)] = five_party_keys(&conn);
+    let [(_, spk_s2), (_, spk_s3), (_, spk_a2)] = [
+        sign_key(&conn, "M.S.2"),
+        sign_key(&conn, "M.S.3"),
+        sign_key(&conn, "M.A.2"),
+    ];
     let created = create(
         &conn,
         None,
         Some("eng-acct"),
         &[
-            party("M.S.2", pk_s2),
-            party("M.S.3", pk_s3),
-            party("M.A.2", pk_a2),
+            party("M.S.2", pk_s2, spk_s2),
+            party("M.S.3", pk_s3, spk_s3),
+            party("M.A.2", pk_a2, spk_a2),
         ],
-        &[party("M.S", pk_s), party("M.A", pk_a)],
+        &[supervisor("M.S", pk_s), supervisor("M.A", pk_a)],
         Some("M.S.2"),
     )
     .expect("create");
@@ -107,16 +127,21 @@ fn independent_stores_import_sign_and_verify() {
     let creator = db::open_in_memory().expect("schema");
     let [(_sk_s2, pk_s2), (sk_s3, pk_s3), (sk_a2, pk_a2), (sk_s, pk_s), (sk_a, pk_a)] =
         five_party_keys(&creator);
+    let [(_, spk_s2), (_, spk_s3), (sign_a2, spk_a2)] = [
+        sign_key(&creator, "M.S.2"),
+        sign_key(&creator, "M.S.3"),
+        sign_key(&creator, "M.A.2"),
+    ];
     let created = create(
         &creator,
         None,
         Some("eng-acct"),
         &[
-            party("M.S.2", pk_s2),
-            party("M.S.3", pk_s3),
-            party("M.A.2", pk_a2),
+            party("M.S.2", pk_s2, spk_s2),
+            party("M.S.3", pk_s3, spk_s3),
+            party("M.A.2", pk_a2, spk_a2),
         ],
-        &[party("M.S", pk_s), party("M.A", pk_a)],
+        &[supervisor("M.S", pk_s), supervisor("M.A", pk_a)],
         Some("M.S.2"),
     )
     .expect("create");
@@ -146,7 +171,7 @@ fn independent_stores_import_sign_and_verify() {
         .iter()
         .any(|p| p.label == "M.S" && p.role == PartyRole::Supervisor && p.is_local));
 
-    let (sign_sk, _) = keys::generate_signing_keypair();
+    let sign_sk = sign_a2;
     let message = b"quarterly shared PDF";
     let artifact = sign_message(
         &db_a2,
@@ -182,16 +207,21 @@ fn remove_member_rotates_and_notifies_remaining_stores() {
     let creator = db::open_in_memory().expect("schema");
     let [(sk_s2, pk_s2), (sk_s3, pk_s3), (sk_a2, pk_a2), (_, pk_s), (_, pk_a)] =
         five_party_keys(&creator);
+    let [(sign_s2, spk_s2), (_, spk_s3), (_, spk_a2)] = [
+        sign_key(&creator, "M.S.2"),
+        sign_key(&creator, "M.S.3"),
+        sign_key(&creator, "M.A.2"),
+    ];
     let created = create(
         &creator,
         None,
         Some("eng-acct"),
         &[
-            party("M.S.2", pk_s2),
-            party("M.S.3", pk_s3),
-            party("M.A.2", pk_a2),
+            party("M.S.2", pk_s2, spk_s2),
+            party("M.S.3", pk_s3, spk_s3),
+            party("M.A.2", pk_a2, spk_a2),
         ],
-        &[party("M.S", pk_s), party("M.A", pk_a)],
+        &[supervisor("M.S", pk_s), supervisor("M.A", pk_a)],
         Some("M.S.2"),
     )
     .expect("create");
@@ -209,7 +239,7 @@ fn remove_member_rotates_and_notifies_remaining_stores() {
     let db_s3 = db::open_in_memory().expect("s3");
     import_package(&db_s3, &pkg("M.S.3"), &sk_s3.to_bytes()).expect("import s3");
 
-    let (sign_sk, _) = keys::generate_signing_keypair();
+    let sign_sk = sign_s2;
     let old_sig = sign_message(
         &creator,
         &created.uid,
@@ -275,12 +305,14 @@ fn two_member_bridge_is_destroyed_when_one_leaves() {
     let (_, pk_a1) = enc(&conn, "M.A.1");
     let (_, pk_s) = enc(&conn, "M.S");
     let (_, pk_a) = enc(&conn, "M.A");
+    let (_, spk_s3) = sign_key(&conn, "M.S.3");
+    let (_, spk_a1) = sign_key(&conn, "M.A.1");
     let created = create(
         &conn,
         None,
         None,
-        &[party("M.S.3", pk_s3), party("M.A.1", pk_a1)],
-        &[party("M.S", pk_s), party("M.A", pk_a)],
+        &[party("M.S.3", pk_s3, spk_s3), party("M.A.1", pk_a1, spk_a1)],
+        &[supervisor("M.S", pk_s), supervisor("M.A", pk_a)],
         Some("M.S.3"),
     )
     .expect("create");
@@ -297,11 +329,13 @@ fn create_requires_department_manager_pubs() {
     let conn = db::open_in_memory().expect("schema");
     let (_, pk_s2) = enc(&conn, "M.S.2");
     let (_, pk_a2) = enc(&conn, "M.A.2");
+    let (_, spk_s2) = sign_key(&conn, "M.S.2");
+    let (_, spk_a2) = sign_key(&conn, "M.A.2");
     let err = create(
         &conn,
         None,
         None,
-        &[party("M.S.2", pk_s2), party("M.A.2", pk_a2)],
+        &[party("M.S.2", pk_s2, spk_s2), party("M.A.2", pk_a2, spk_a2)],
         &[],
         Some("M.S.2"),
     )
@@ -334,18 +368,21 @@ fn coordinator_evict_notice_lists_five_stakeholders() {
         2,
         vec![("M.S.2".into(), id_s2), ("M.S.3".into(), id_s3)],
     );
-    let secret = b"company master secret 32 bytes!";
-    let key_id = crate::key_tree::split(&mut conn, "org", secret, &spec).expect("split");
+    let (_, spk_s2) = sign_key(&conn, "M.S.2");
+    let (_, spk_s3) = sign_key(&conn, "M.S.3");
+    let (_, spk_a2) = sign_key(&conn, "M.A.2");
+    let secret = *crate::crypto::random_key();
+    let key_id = crate::key_tree::split(&mut conn, "org", &secret, &spec).expect("split");
     create(
         &conn,
         Some(key_id),
         Some("eng-acct"),
         &[
-            party("M.S.2", pk_s2),
-            party("M.S.3", pk_s3),
-            party("M.A.2", pk_a2),
+            party("M.S.2", pk_s2, spk_s2),
+            party("M.S.3", pk_s3, spk_s3),
+            party("M.A.2", pk_a2, spk_a2),
         ],
-        &[party("M.S", pk_s), party("M.A", pk_a)],
+        &[supervisor("M.S", pk_s), supervisor("M.A", pk_a)],
         None,
     )
     .expect("create coordinator view");
@@ -356,4 +393,58 @@ fn coordinator_evict_notice_lists_five_stakeholders() {
     assert_eq!(changes[0].notify.len(), 5);
     assert!(changes[0].notify.iter().any(|l| l == "M.A"));
     assert!(changes[0].notify.iter().any(|l| l == "M.S"));
+}
+
+#[test]
+fn verify_rejects_impersonation_with_unrelated_personal_key() {
+    let creator = db::open_in_memory().expect("schema");
+    let [(sk_s2, pk_s2), (_, pk_s3), (_, pk_a2), (_, pk_s), (_, pk_a)] = five_party_keys(&creator);
+    let [(_, spk_s2), (_, spk_s3), (_, spk_a2)] = [
+        sign_key(&creator, "M.S.2"),
+        sign_key(&creator, "M.S.3"),
+        sign_key(&creator, "M.A.2"),
+    ];
+    let created = create(
+        &creator,
+        None,
+        Some("eng-acct"),
+        &[
+            party("M.S.2", pk_s2, spk_s2),
+            party("M.S.3", pk_s3, spk_s3),
+            party("M.A.2", pk_a2, spk_a2),
+        ],
+        &[supervisor("M.S", pk_s), supervisor("M.A", pk_a)],
+        Some("M.S.2"),
+    )
+    .expect("create");
+
+    let bridge_sk =
+        unseal_local_secret(&creator, &created.uid, "M.S.2", &sk_s2.to_bytes()).expect("unseal");
+    let (attacker_sk, _) = keys::generate_signing_keypair();
+    let artifact = crate::signing::sign_with_bridge(
+        &created.uid,
+        created.generation,
+        &created.salt,
+        "M.A.2",
+        &bridge_sk,
+        &attacker_sk,
+        b"forged",
+    )
+    .expect("crafted artifact");
+    assert!(matches!(
+        verify_message(&creator, &created.uid, "M.S.2", b"forged", &artifact),
+        Err(Error::SignatureVerificationFailed)
+    ));
+    let (wrong_sk, _) = keys::generate_signing_keypair();
+    assert!(matches!(
+        sign_message(
+            &creator,
+            &created.uid,
+            "M.S.2",
+            &sk_s2.to_bytes(),
+            &wrong_sk,
+            b"nope",
+        ),
+        Err(Error::IntegrityCheckFailed)
+    ));
 }

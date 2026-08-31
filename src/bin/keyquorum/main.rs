@@ -18,7 +18,7 @@ use keyquorum::{
     db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, sharing, signing, vault,
 };
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -634,8 +634,8 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
             message_file,
             signature_out,
         } => {
-            let encryption_sk = read_key_array_32(Path::new(&share_file))?;
-            let signing_sk = read_key_array_32(&signing_key_file)?;
+            let encryption_sk = zeroize::Zeroizing::new(read_key_array_32(Path::new(&share_file))?);
+            let signing_sk = zeroize::Zeroizing::new(read_key_array_32(&signing_key_file)?);
             let message = fs::read(&message_file)?;
             let artifact = private_bridge::sign_message(
                 &conn,
@@ -997,8 +997,8 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
             output_dir,
             label,
         } => {
-            let member_parties = resolve_parties(conn, Some(key_id), &members)?;
-            let mut supervisor_parties = resolve_parties(conn, Some(key_id), &supervisors)?;
+            let member_parties = resolve_parties(conn, Some(key_id), &members, true)?;
+            let mut supervisor_parties = resolve_parties(conn, Some(key_id), &supervisors, false)?;
             let member_labels: Vec<String> =
                 member_parties.iter().map(|p| p.label.clone()).collect();
             for notify in private_bridge::notify_labels(member_labels.iter().map(|s| s.as_str())) {
@@ -1021,6 +1021,7 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
                 supervisor_parties.push(private_bridge::BridgePartyInput {
                     label: notify,
                     encryption_public_key: pk,
+                    signing_public_key: None,
                 });
             }
             fs::create_dir_all(&output_dir)?;
@@ -1045,7 +1046,7 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
                     pkg.label,
                     pkg.role,
                     output_dir.display(),
-                    sanitize_label(&pkg.label)
+                    sanitize_label(&pkg.label)?
                 );
             }
         }
@@ -1088,7 +1089,7 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
         }
         PrivateBridgeCommand::Import { file, share_file } => {
             let bytes = fs::read(&file)?;
-            let sk = read_key_array_32(Path::new(&share_file))?;
+            let sk = zeroize::Zeroizing::new(read_key_array_32(Path::new(&share_file))?);
             let summary = private_bridge::import_package(conn, &bytes, &sk)?;
             println!("Imported private bridge {}", summary.uid);
             print_bridge_summary(&summary);
@@ -1100,10 +1101,12 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
             share_file,
             output_dir,
         } => {
-            let sk = read_key_array_32(Path::new(&share_file))?;
+            let sk = zeroize::Zeroizing::new(read_key_array_32(Path::new(&share_file))?);
             fs::create_dir_all(&output_dir)?;
-            let outcome = private_bridge::remove_member(conn, &uid, &member, &node, &sk)?;
-            write_delivery_packages(&output_dir, &outcome.packages)?;
+            let planned = private_bridge::plan_remove_member(conn, &uid, &member, &node, &sk)?;
+            write_delivery_packages(&output_dir, &planned.outcome.packages)?;
+            private_bridge::commit_planned_removal(conn, &planned)?;
+            let outcome = &planned.outcome;
             if outcome.destroyed {
                 println!("Destroyed private bridge {uid}");
             } else {
@@ -1119,7 +1122,7 @@ fn run_private_bridge(conn: &Connection, command: PrivateBridgeCommand) -> Resul
                     pkg.label,
                     pkg.role,
                     output_dir.display(),
-                    sanitize_label(&pkg.label)
+                    sanitize_label(&pkg.label)?
                 );
             }
         }
@@ -1131,6 +1134,7 @@ fn resolve_parties(
     conn: &Connection,
     key_id: Option<i64>,
     specs: &[String],
+    require_signing: bool,
 ) -> Result<Vec<private_bridge::BridgePartyInput>> {
     let mut out = Vec::new();
     for spec in specs {
@@ -1142,9 +1146,15 @@ fn resolve_parties(
                 private_bridge::encryption_public_for_label(conn, key_id, spec)?,
             )
         };
+        let signing_public_key = if require_signing {
+            Some(private_bridge::signing_public_for_label(conn, &label)?)
+        } else {
+            None
+        };
         out.push(private_bridge::BridgePartyInput {
             label,
             encryption_public_key: pk,
+            signing_public_key,
         });
     }
     Ok(out)
@@ -1154,15 +1164,39 @@ fn write_delivery_packages(
     output_dir: &Path,
     packages: &[private_bridge::DeliveryPackage],
 ) -> Result<()> {
+    let mut planned = Vec::new();
     for pkg in packages {
-        let path = output_dir.join(format!("{}.kqpb", sanitize_label(&pkg.label)));
-        locked_files::write_owner_only(&path, &pkg.bytes)?;
+        let path = output_dir.join(format!("{}.kqpb", sanitize_label(&pkg.label)?));
+        planned.push((path, pkg.bytes.as_slice()));
+    }
+    let mut written = Vec::new();
+    for (path, bytes) in planned {
+        match locked_files::write_owner_only(&path, bytes) {
+            Ok(()) => written.push(path),
+            Err(err) => {
+                for path in &written {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(err);
+            }
+        }
     }
     Ok(())
 }
 
-fn sanitize_label(label: &str) -> String {
-    label.replace('/', "_")
+fn sanitize_label(label: &str) -> Result<String> {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() || out.chars().all(|c| c == '.') {
+        return Err(Error::InvalidPath);
+    }
+    Ok(out)
 }
 
 fn print_bridge_summary(summary: &private_bridge::BridgeSummary) {
@@ -1510,33 +1544,48 @@ fn apply_hardware_revoke(conn: &mut Connection, args: HardwareRevokeArgs<'_>) ->
         let shares = collect_shares(conn, &summary.root, share_files)?;
         let changes = key_tree::evict_and_refresh(conn, target.0, target.1, &shares)?;
         println!("Evicted node {}; survivor shares refreshed", target.1);
-        for change in changes {
-            let kind = match change.kind {
-                private_bridge::BridgeChangeKind::NeedsMemberRotate => {
-                    "remaining members must rotate"
-                }
-                private_bridge::BridgeChangeKind::Destroyed => "bridge destroyed",
-            };
-            println!(
-                "Private bridge {}: removed {}; {}.",
-                change.uid, change.removed_member, kind
-            );
-            println!(
-                "  Notify these stores (members + department managers): {}",
-                change.notify.join(", ")
-            );
-            let notice_path = format!(
-                "bridge-{}-removed-{}.kqbn",
-                change.uid,
-                sanitize_label(&change.removed_member)
-            );
-            fs::write(&notice_path, &change.notice)?;
-            println!("  Wrote notice {notice_path}");
-        }
+        write_bridge_change_notices(&changes)?;
     }
+
+    let hardware = keys::get_key(conn, hardware_id)?;
+    let mut labels = BTreeSet::new();
+    labels.insert(hardware.label.clone());
+    for leaf in &leaves {
+        labels.insert(leaf.label.clone());
+    }
+    let mut revoke_changes = Vec::new();
+    for label in labels {
+        revoke_changes.extend(private_bridge::on_member_revoked(conn, &label)?);
+    }
+    write_bridge_change_notices(&revoke_changes)?;
 
     keys::revoke_key(conn, hardware_id)?;
     println!("Revoked key {hardware_id}");
+    Ok(())
+}
+
+fn write_bridge_change_notices(changes: &[private_bridge::BridgeChange]) -> Result<()> {
+    for change in changes {
+        let kind = match change.kind {
+            private_bridge::BridgeChangeKind::NeedsMemberRotate => "remaining members must rotate",
+            private_bridge::BridgeChangeKind::Destroyed => "bridge destroyed",
+        };
+        println!(
+            "Private bridge {}: removed {}; {}.",
+            change.uid, change.removed_member, kind
+        );
+        println!(
+            "  Notify these stores (members + department managers): {}",
+            change.notify.join(", ")
+        );
+        let notice_path = format!(
+            "bridge-{}-removed-{}.kqbn",
+            change.uid,
+            sanitize_label(&change.removed_member)?
+        );
+        fs::write(&notice_path, &change.notice)?;
+        println!("  Wrote notice {notice_path}");
+    }
     Ok(())
 }
 

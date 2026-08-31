@@ -105,23 +105,23 @@ pub fn sign_with_bridge(
 pub fn verify_bridge_signature(
     artifact: &BridgeSignature,
     bridge_public_key: &[u8; 32],
+    signer_public_key: &[u8; 32],
     message: &[u8],
 ) -> Result<()> {
+    if artifact.signer_public_key != *signer_public_key {
+        return Err(Error::SignatureVerificationFailed);
+    }
     let preimage = bridge_sign_preimage(
         &artifact.uid,
         artifact.generation,
         &artifact.bridge_salt,
         &artifact.signature_salt,
         &artifact.signer_label,
-        &artifact.signer_public_key,
+        signer_public_key,
         message,
     );
     verify_signature(bridge_public_key, &preimage, &artifact.bridge_signature)?;
-    verify_signature(
-        &artifact.signer_public_key,
-        &preimage,
-        &artifact.personal_signature,
-    )
+    verify_signature(signer_public_key, &preimage, &artifact.personal_signature)
 }
 
 pub fn encode_bridge_signature(artifact: &BridgeSignature) -> Result<Vec<u8>> {

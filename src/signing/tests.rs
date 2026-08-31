@@ -82,9 +82,15 @@ fn bridge_dual_signature_binds_salts_and_rejects_wrong_message() {
         message,
     )
     .expect("sign");
-    assert!(verify_bridge_signature(&artifact, &bridge_pub, message).is_ok());
+    let personal_pub = personal.verifying_key().to_bytes();
+    assert!(verify_bridge_signature(&artifact, &bridge_pub, &personal_pub, message).is_ok());
     assert!(matches!(
-        verify_bridge_signature(&artifact, &bridge_pub, b"tampered"),
+        verify_bridge_signature(&artifact, &bridge_pub, &personal_pub, b"tampered"),
+        Err(Error::SignatureVerificationFailed)
+    ));
+    let (_, other_pub) = generate();
+    assert!(matches!(
+        verify_bridge_signature(&artifact, &bridge_pub, &other_pub, message),
         Err(Error::SignatureVerificationFailed)
     ));
     let encoded = encode_bridge_signature(&artifact).expect("encode");

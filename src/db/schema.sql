@@ -233,9 +233,14 @@ CREATE TABLE IF NOT EXISTS private_bridge_members (
     bridge_id               INTEGER NOT NULL REFERENCES private_bridges(id) ON DELETE CASCADE,
     node_label              TEXT NOT NULL,
     encryption_public_key   BLOB NOT NULL,
+    signing_public_key      BLOB,
     role                    TEXT NOT NULL CHECK (role IN ('member', 'supervisor')),
     is_local                INTEGER NOT NULL DEFAULT 0 CHECK (is_local IN (0, 1)),
-    PRIMARY KEY (bridge_id, node_label)
+    PRIMARY KEY (bridge_id, node_label),
+    CHECK (
+        (role = 'member' AND length(signing_public_key) = 32)
+        OR (role = 'supervisor' AND signing_public_key IS NULL)
+    )
 );
 
 -- Sealed `wrap_salt || bridge_ed25519_sk` for a local member only.

@@ -141,7 +141,7 @@ open it. A mailbox, USB drop, or email can carry the envelope without
 being able to read the letter. `.kqbn` eviction notices are the
 exception — they are public routing slips, not sealed envelopes.
 
-```
+```text
 outside (anyone can see)     inside (recipient only)
 -------------------------    --------------------------------
 KQPB magic, kind             wrap_salt || bridge secret (members)
