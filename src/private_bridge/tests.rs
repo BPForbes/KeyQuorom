@@ -269,6 +269,10 @@ fn remove_member_rotates_and_notifies_remaining_stores() {
         .find(|p| p.label == "M.A.2" && p.role == PartyRole::Member)
         .expect("a2 rotate");
     import_package(&db_a2, &a2_rotate.bytes, &sk_a2.to_bytes()).expect("a2 import rotate");
+    assert!(matches!(
+        import_package(&db_a2, &a2_rotate.bytes, &sk_a2.to_bytes()),
+        Err(Error::BridgeGenerationMismatch)
+    ));
 
     assert!(matches!(
         verify_message(&db_a2, &created.uid, "M.A.2", b"old", &old_sig),

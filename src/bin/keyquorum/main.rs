@@ -1523,6 +1523,7 @@ fn apply_hardware_revoke(conn: &mut Connection, args: HardwareRevokeArgs<'_>) ->
         );
     }
 
+    let mut evict_changes = Vec::new();
     if evict {
         let target = match (key_id, node_label) {
             (Some(key_id), Some(node_label)) => {
@@ -1544,7 +1545,7 @@ fn apply_hardware_revoke(conn: &mut Connection, args: HardwareRevokeArgs<'_>) ->
         let shares = collect_shares(conn, &summary.root, share_files)?;
         let changes = key_tree::evict_and_refresh(conn, target.0, target.1, &shares)?;
         println!("Evicted node {}; survivor shares refreshed", target.1);
-        write_bridge_change_notices(&changes)?;
+        evict_changes = changes;
     }
 
     let hardware = keys::get_key(conn, hardware_id)?;
@@ -1557,10 +1558,12 @@ fn apply_hardware_revoke(conn: &mut Connection, args: HardwareRevokeArgs<'_>) ->
     for label in labels {
         revoke_changes.extend(private_bridge::on_member_revoked(conn, &label)?);
     }
-    write_bridge_change_notices(&revoke_changes)?;
 
     keys::revoke_key(conn, hardware_id)?;
     println!("Revoked key {hardware_id}");
+
+    write_bridge_change_notices(&evict_changes)?;
+    write_bridge_change_notices(&revoke_changes)?;
     Ok(())
 }
 

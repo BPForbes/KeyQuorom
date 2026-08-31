@@ -1429,17 +1429,21 @@ fn apply_rotate(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
     verify_update_auth(decoded, &summary.public_key)?;
     let bridge_id = last_bridge_id(conn, &decoded.uid)?;
     with_immediate_transaction(conn, |conn| {
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3, label = COALESCE(?4, label)
-             WHERE uid = ?5",
+             WHERE uid = ?5 AND generation = ?6 AND destroyed_at IS NULL",
             params![
                 decoded.generation as i64,
                 decoded.public_key.as_slice(),
                 decoded.salt.as_slice(),
                 empty_to_none(&decoded.bridge_label),
-                decoded.uid
+                decoded.uid,
+                summary.generation as i64
             ],
         )?;
+        if updated != 1 {
+            return Err(Error::BridgeGenerationMismatch);
+        }
         conn.execute(
             "DELETE FROM private_bridge_members WHERE bridge_id = ?1",
             params![bridge_id],
@@ -1526,22 +1530,24 @@ fn apply_destroy(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
     }
     verify_update_auth(decoded, &summary.public_key)?;
     let bridge_id = last_bridge_id(conn, &decoded.uid)?;
-    conn.execute(
-        "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE uid = ?1",
-        params![decoded.uid],
-    )?;
-    conn.execute(
-        "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
-        params![bridge_id],
-    )?;
-    insert_event(
-        conn,
-        bridge_id,
-        "destroyed",
-        json!({"uid": decoded.uid, "node": decoded.recipient_label}),
-    )?;
-    Ok(())
+    with_immediate_transaction(conn, |conn| {
+        conn.execute(
+            "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE uid = ?1 AND destroyed_at IS NULL",
+            params![decoded.uid],
+        )?;
+        conn.execute(
+            "DELETE FROM private_bridge_sealed_keys WHERE bridge_id = ?1",
+            params![bridge_id],
+        )?;
+        insert_event(
+            conn,
+            bridge_id,
+            "destroyed",
+            json!({"uid": decoded.uid, "node": decoded.recipient_label}),
+        )?;
+        Ok(())
+    })
 }
 
 fn verify_update_auth(decoded: &DecodedPackage, old_public: &[u8; 32]) -> Result<()> {
