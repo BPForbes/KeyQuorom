@@ -15,7 +15,8 @@ use keyquorum::key_tree::{NodeSpec, TreeNodeSummary};
 use keyquorum::keys::KeyType;
 use keyquorum::pin::ResourceType;
 use keyquorum::{
-    db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, sharing, signing, vault,
+    db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, relay, sharing, signing,
+    vault,
 };
 use rusqlite::Connection;
 use std::collections::{BTreeSet, HashMap};
@@ -265,6 +266,11 @@ enum Command {
     Pin {
         #[command(subcommand)]
         command: PinCommand,
+    },
+    /// Push and pull opaque .kqpb envelopes through the mailbox relay
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
     },
 }
 
@@ -544,6 +550,41 @@ enum ShareCommand {
     RevokeFile { share_id: i64 },
 }
 
+#[derive(Subcommand)]
+enum RelayCommand {
+    /// Upload every `.kqpb` in a directory to the relay inbox
+    Push {
+        /// Directory containing `.kqpb` envelopes
+        #[arg(long)]
+        dir: PathBuf,
+        /// Relay base URL (or KEYQUORUM_RELAY_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// Push-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Download envelopes for this device's pull-scope API key
+    Pull {
+        /// Import each envelope into --db using --share-file
+        #[arg(long, requires = "share_file")]
+        import: bool,
+        /// Encryption private key that opens the envelopes
+        #[arg(long, requires = "import")]
+        share_file: Option<String>,
+        /// Write retrieved envelopes here (required unless --import)
+        #[arg(long, required_unless_present = "import")]
+        output_dir: Option<PathBuf>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Only envelopes with id greater than this
+        #[arg(long)]
+        after: Option<i64>,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum CliResourceType {
     Credential,
@@ -589,6 +630,10 @@ fn main() -> ExitCode {
 }
 
 fn run(db_path: &Path, command: Command) -> Result<()> {
+    if let Command::Relay { command } = command {
+        return run_relay(db_path, command);
+    }
+
     let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
     let mut conn = db::open(db_path_str)?;
 
@@ -659,6 +704,9 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         Command::Export { command } => run_export(&conn, command)?,
         Command::Share { command } => run_share(&conn, command)?,
         Command::Pin { command } => run_pin(&conn, command)?,
+        Command::Relay { .. } => {
+            unreachable!("relay commands are handled before opening the org db")
+        }
     }
 
     Ok(())
@@ -945,7 +993,8 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
         | Command::Sign { .. }
         | Command::Export { .. }
         | Command::Share { .. }
-        | Command::Pin { .. } => unreachable!("non-tree commands are dispatched in run()"),
+        | Command::Pin { .. }
+        | Command::Relay { .. } => unreachable!("non-tree commands are dispatched in run()"),
     }
     Ok(())
 }
@@ -1386,6 +1435,113 @@ fn run_export(conn: &Connection, command: ExportCommand) -> Result<()> {
             let bundle = export::export_file(conn, id, &password, &recipient_public_key)?;
             locked_files::write_owner_only(&output, &bundle)?;
             println!("Exported file {id} to {}", output.display());
+        }
+    }
+    Ok(())
+}
+
+fn relay_url(explicit: Option<String>) -> Result<String> {
+    if let Some(url) = explicit.filter(|s| !s.is_empty()) {
+        return Ok(url);
+    }
+    match std::env::var("KEYQUORUM_RELAY_URL") {
+        Ok(url) if !url.is_empty() => Ok(url),
+        _ => Err(Error::RelayRequest(
+            "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
+        )),
+    }
+}
+
+fn relay_api_key(explicit: Option<String>) -> Result<String> {
+    if let Some(key) = explicit.filter(|s| !s.is_empty()) {
+        return Ok(key);
+    }
+    match std::env::var("KEYQUORUM_RELAY_API_KEY") {
+        Ok(key) if !key.is_empty() => Ok(key),
+        _ => prompt_secret("Relay API key: "),
+    }
+}
+
+fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
+    match command {
+        RelayCommand::Push { dir, url, api_key } => {
+            let url = relay_url(url)?;
+            let api_key = relay_api_key(api_key)?;
+            let mut uploaded = 0usize;
+            let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<std::io::Result<_>>()?;
+            entries.sort_by_key(|e| e.path());
+            for entry in entries {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("kqpb") {
+                    continue;
+                }
+                let bytes = fs::read(&path)?;
+                let accepted = relay::push_inbox(&url, &api_key, &bytes)?;
+                println!(
+                    "{} -> id {} ({})",
+                    path.display(),
+                    accepted.id,
+                    accepted.recipient_fingerprint
+                );
+                uploaded += 1;
+            }
+            if uploaded == 0 {
+                return Err(Error::RelayRequest(format!(
+                    "no .kqpb files in {}",
+                    dir.display()
+                )));
+            }
+        }
+        RelayCommand::Pull {
+            import,
+            share_file,
+            output_dir,
+            url,
+            api_key,
+            after,
+        } => {
+            let url = relay_url(url)?;
+            let api_key = relay_api_key(api_key)?;
+            let listed = relay::pull_inbox(&url, &api_key, after)?;
+            if listed.envelopes.is_empty() {
+                println!("(no envelopes)");
+                return Ok(());
+            }
+
+            let mut conn = if import {
+                let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
+                Some(db::open(db_path_str)?)
+            } else {
+                None
+            };
+            let share_sk = if import {
+                let path = share_file.as_ref().ok_or(Error::InvalidPath)?;
+                Some(zeroize::Zeroizing::new(read_key_array_32(Path::new(path))?))
+            } else {
+                None
+            };
+
+            if let Some(output_dir) = &output_dir {
+                fs::create_dir_all(output_dir)?;
+            }
+
+            for item in &listed.envelopes {
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &item.bytes)
+                        .map_err(|_| Error::InvalidBridgePackage)?;
+                if let Some(output_dir) = &output_dir {
+                    let path = output_dir.join(format!("{}.kqpb", item.id));
+                    locked_files::write_owner_only(&path, &bytes)?;
+                    println!("Wrote {}", path.display());
+                }
+                if let (Some(conn), Some(sk)) = (conn.as_mut(), share_sk.as_ref()) {
+                    let summary = private_bridge::import_package(conn, &bytes, sk)?;
+                    println!(
+                        "Imported envelope {} as private bridge {} gen {}",
+                        item.id, summary.uid, summary.generation
+                    );
+                }
+            }
         }
     }
     Ok(())

@@ -336,3 +336,47 @@ fn infer_root_label_from_dotted_leaves_or_fallback() {
         "org"
     );
 }
+
+#[test]
+fn relay_push_requires_dir() {
+    assert!(Cli::try_parse_from(["keyquorum", "relay", "push"]).is_err());
+}
+
+#[test]
+fn relay_pull_requires_output_or_import() {
+    assert!(Cli::try_parse_from(["keyquorum", "relay", "pull"]).is_err());
+}
+
+#[test]
+fn relay_pull_import_requires_share_file() {
+    assert!(Cli::try_parse_from(["keyquorum", "relay", "pull", "--import"]).is_err());
+}
+
+#[test]
+fn relay_pull_import_with_share_file_parses() {
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "relay",
+        "pull",
+        "--import",
+        "--share-file",
+        "alice.key",
+        "--url",
+        "http://127.0.0.1:8787",
+    ])
+    .is_ok());
+}
+
+#[test]
+fn relay_push_with_dir_parses() {
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "relay",
+        "push",
+        "--dir",
+        "./packages",
+        "--url",
+        "http://127.0.0.1:8787",
+    ])
+    .is_ok());
+}

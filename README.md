@@ -167,8 +167,9 @@ recipient encryption pub     or roster + salts (managers)
 ```
 
 Five people in the example means five envelopes, each addressed to a
-different pub. Operators copy those files out of band. Online relay
-delivery is enhancement #10 and is not part of this change.
+different pub. Operators can copy those files out of band, or push them
+through the mailbox relay (`keyquorum relay push`) so each store can
+`relay pull --import` locally.
 
 ```sh
 # Each member needs a registered signing public key under their label:
@@ -206,7 +207,7 @@ person still holds the old bridge secret). A remaining member then:
 keyquorum bridge private remove-member <uid> --member M.S.3 \
   --node M.S.2 --share-file Software2.key --output-dir ./bridge-packages
 # Copy the new packages to M.S.2, M.A.2, M.S, M.A, and M.S.3
-# (online relay delivery is enhancement #10).
+# (or `keyquorum relay push --dir ./bridge-packages`).
 ```
 
 A two-person bridge is destroyed when one member is removed.
@@ -283,11 +284,54 @@ keyquorum share create-file 1 --ttl-seconds 3600 --pin
 keyquorum share redeem-file
 ```
 
+### Mailbox relay
+
+The `kq-relay` binary is a transport-only inbox for sealed `.kqpb` envelopes.
+It indexes packages by the recipient X25519 fingerprint in the outer header
+and never unseals them. Organization SQLite data and private keys stay on
+the device. Put TLS in front of it (Caddy, nginx); the process itself binds
+loopback by default.
+
+```sh
+# First start mints an admin API key and prints it once.
+kq-relay --db keyquorum-relay.sqlite serve --bind 127.0.0.1:8787
+# Swagger UI: http://127.0.0.1:8787/swagger-ui
+
+# Host-local key management (talks to the relay SQLite, not HTTP):
+kq-relay --db keyquorum-relay.sqlite keys create --scope inbox.push --label ops
+kq-relay --db keyquorum-relay.sqlite keys create \
+  --scope inbox.pull --fingerprint <hex-sha256-of-recipient-x25519-pub> --label alice
+kq-relay --db keyquorum-relay.sqlite keys list
+kq-relay --db keyquorum-relay.sqlite keys rotate --id 2
+kq-relay --db keyquorum-relay.sqlite keys revoke --id 2
+```
+
+Scopes are least-privilege: `inbox.push` uploads, `inbox.pull` reads only
+the fingerprint bound to that key, `admin` creates/lists/rotates/revokes
+keys over HTTP (`POST /api-keys`, …). Bearers are shown once (`kq_…`);
+the database stores `hex(SHA-256(raw))` only.
+
+```sh
+export KEYQUORUM_RELAY_URL=http://127.0.0.1:8787
+# Prefer KEYQUORUM_RELAY_API_KEY or a prompt; --api-key is for scripts.
+keyquorum relay push --dir ./bridge-packages --api-key "$PUSH_KEY"
+keyquorum relay pull --output-dir ./inbox --api-key "$PULL_KEY"
+keyquorum --db alice.sqlite relay pull --import --share-file alice.key --api-key "$PULL_KEY"
+```
+
+Lost or compromised API keys: mint a replacement (`keys rotate` or
+`keys create`) and revoke the old id. Envelopes already in the mailbox
+are unchanged. Missed pulls: `GET /inbox?after=<id>` (or `--after`)
+replays anything not yet downloaded; `bridge private import` still
+rejects stale generations.
+
 ## Roadmap
 
-Not built yet:
-
-- **[#10](https://github.com/BPForbes/KeyQuorom/issues/10) Online relay** — inbox of sealed `.kqpb` envelopes (later). Devices still `import` locally.
+[#10](https://github.com/BPForbes/KeyQuorom/issues/10) mailbox transport
+(`kq-relay`, API keys, `relay push` / `relay pull --import`) is in place.
+Still open on that issue: authenticated envelopes for hardware-key reissue
+and key-tree restructure (private-bridge create/rotate/remove-member already
+emit `.kqpb` files the relay can carry).
 
 These still need a private-key custody model (a software file, OS keychain, or real hardware) that hasn't been decided:
 
@@ -300,7 +344,9 @@ These still need a private-key custody model (a software file, OS keychain, or r
 
 ## Security
 
-This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded.
+This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, API key bearers, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded.
+
+The mailbox relay is transport only: it cannot decrypt `.kqpb` envelopes and must not be given the organization database or private keys. Store only hashed API keys in the relay SQLite file. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key.
 
 ## Contributing
 

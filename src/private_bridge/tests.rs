@@ -120,6 +120,33 @@ fn create_emits_packages_for_members_and_department_managers() {
         .parties
         .iter()
         .any(|p| p.label == "M.A.2" && p.has_sealed_key));
+
+    for pkg in &created.packages {
+        let peeked = routing_public_key(&pkg.bytes).expect("header peek");
+        assert_eq!(peeked, pkg.recipient_public_key);
+    }
+}
+
+#[test]
+fn routing_public_key_rejects_truncated_and_wrong_magic() {
+    assert!(matches!(
+        routing_public_key(b"KQXB"),
+        Err(Error::InvalidBridgePackage)
+    ));
+    assert!(matches!(
+        routing_public_key(b"KQPB\x02\x01"),
+        Err(Error::InvalidBridgePackage)
+    ));
+    let mut truncated = b"KQPB".to_vec();
+    truncated.push(2);
+    truncated.push(1);
+    truncated.extend_from_slice(&[7u8; 32]);
+    truncated.extend_from_slice(&5u32.to_be_bytes());
+    truncated.extend_from_slice(&[0, 1, 2]);
+    assert!(matches!(
+        routing_public_key(&truncated),
+        Err(Error::InvalidBridgePackage)
+    ));
 }
 
 #[test]
