@@ -11,7 +11,7 @@ fn schema_applies_cleanly() {
             |row| row.get(0),
         )
         .expect("query should succeed");
-    assert_eq!(table_count, 16);
+    assert_eq!(table_count, 17);
 }
 
 #[test]
@@ -73,6 +73,28 @@ fn key_node_leaf_backed_by_encryption_key_is_allowed() {
         [],
     );
     assert!(result.is_ok());
+}
+
+#[test]
+fn key_node_topology_only_leaf_is_allowed() {
+    let conn = open_in_memory().expect("schema should apply");
+    seed_encryption_key(&conn, 1);
+    seed_key(&conn, 1);
+
+    let result = conn.execute(
+        "INSERT INTO key_nodes (key_id, label, hardware_key_id)
+             VALUES (1, 'peer', 1)",
+        [],
+    );
+    assert!(result.is_ok());
+    let share: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT wrapped_share FROM key_nodes WHERE label = 'peer'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("row");
+    assert!(share.is_none());
 }
 
 #[test]
@@ -183,6 +205,134 @@ fn opening_a_legacy_key_nodes_table_adds_is_active() {
 }
 
 #[test]
+fn rebuilding_share_required_key_nodes_keeps_bridge_rows() {
+    let conn = Connection::open_in_memory().expect("in-memory db");
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE keys (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL
+         );
+         CREATE TABLE hardware_keys (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL,
+            key_type TEXT NOT NULL,
+            fingerprint TEXT NOT NULL UNIQUE,
+            public_key BLOB NOT NULL
+         );
+         CREATE TABLE key_nodes (
+            id INTEGER PRIMARY KEY,
+            key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+            parent_id INTEGER REFERENCES key_nodes(id) ON DELETE CASCADE,
+            label TEXT NOT NULL,
+            threshold INTEGER,
+            hardware_key_id INTEGER REFERENCES hardware_keys(id),
+            wrapped_share BLOB,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            CHECK (
+                (threshold IS NOT NULL AND hardware_key_id IS NULL AND wrapped_share IS NULL)
+                OR (threshold IS NULL AND hardware_key_id IS NOT NULL AND wrapped_share IS NOT NULL)
+            )
+         );
+         CREATE TABLE key_node_bridges (
+            node_id INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+            peer_label TEXT NOT NULL,
+            PRIMARY KEY (node_id, peer_label)
+         );
+         CREATE TABLE key_node_links (
+            node_a_id INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+            node_b_id INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+            established_at TEXT NOT NULL DEFAULT 'now',
+            PRIMARY KEY (node_a_id, node_b_id),
+            CHECK (node_a_id < node_b_id)
+         );
+         INSERT INTO keys (id, label) VALUES (1, 'legacy');
+         INSERT INTO hardware_keys (id, label, key_type, fingerprint, public_key)
+            VALUES (1, 'a', 'encryption', 'fp-a', x'01'),
+                   (2, 'b', 'encryption', 'fp-b', x'02');
+         INSERT INTO key_nodes (id, key_id, parent_id, label, threshold, is_active)
+            VALUES (1, 1, NULL, 'root', 2, 1);
+         INSERT INTO key_nodes (id, key_id, parent_id, label, hardware_key_id, wrapped_share, is_active)
+            VALUES (2, 1, 1, 'left', 1, x'aa', 1),
+                   (3, 1, 1, 'right', 2, x'bb', 1);
+         INSERT INTO key_node_bridges (node_id, peer_label) VALUES (2, 'right');
+         INSERT INTO key_node_links (node_a_id, node_b_id) VALUES (2, 3);",
+    )
+    .expect("legacy schema should apply");
+
+    init(&conn).expect("init should rebuild key_nodes");
+
+    let bridges: i64 = conn
+        .query_row("SELECT count(*) FROM key_node_bridges", [], |row| {
+            row.get(0)
+        })
+        .expect("bridges");
+    let links: i64 = conn
+        .query_row("SELECT count(*) FROM key_node_links", [], |row| row.get(0))
+        .expect("links");
+    assert_eq!(bridges, 1);
+    assert_eq!(links, 1);
+    let bridge_node: i64 = conn
+        .query_row("SELECT node_id FROM key_node_bridges", [], |row| row.get(0))
+        .expect("bridge node_id");
+    assert_eq!(bridge_node, 2);
+    let link: (i64, i64) = conn
+        .query_row(
+            "SELECT node_a_id, node_b_id FROM key_node_links",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("link endpoints");
+    assert_eq!(link, (2, 3));
+    conn.execute(
+        "INSERT INTO key_nodes (key_id, parent_id, label, hardware_key_id)
+             VALUES (1, 1, 'peer', 1)",
+        [],
+    )
+    .expect("a topology-only leaf must be insertable after the rebuild");
+    let sql = table_sql(&conn, "key_nodes")
+        .expect("sql")
+        .expect("key_nodes");
+    assert!(
+        !sql.contains("wrapped_share IS NOT NULL"),
+        "rebuild should drop the share-required check: {sql}"
+    );
+    conn.execute(
+        "INSERT INTO hardware_keys (label, key_type, fingerprint, public_key)
+         VALUES ('sign', 'signing', 'fp-s', x'03')",
+        [],
+    )
+    .expect("signing key");
+    let signing_id: i64 = conn
+        .query_row(
+            "SELECT id FROM hardware_keys WHERE fingerprint = 'fp-s'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("signing id");
+    assert!(conn
+        .execute(
+            "INSERT INTO key_nodes (key_id, parent_id, label, hardware_key_id)
+             VALUES (1, 1, 'signed-leaf', ?1)",
+            rusqlite::params![signing_id],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE key_nodes SET hardware_key_id = ?1 WHERE label = 'left'",
+            rusqlite::params![signing_id],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO key_nodes (key_id, parent_id, label, threshold)
+             VALUES (1, 999, 'orphan', 2)",
+            [],
+        )
+        .is_err());
+}
+
+#[test]
 fn private_bridge_member_requires_a_signing_public_key() {
     let conn = open_in_memory().expect("schema should apply");
     conn.execute(
@@ -218,4 +368,78 @@ fn files_key_id_referencing_an_existing_key_is_allowed() {
         [],
     );
     assert!(result.is_ok());
+}
+
+#[test]
+fn relay_credential_roundtrip_seals_the_bearer() {
+    let conn = open_in_memory().expect("schema");
+    let stored = relay_credential::StoredRelayKey {
+        relay_url: "http://127.0.0.1:8787/".into(),
+        scope: "inbox.pull".into(),
+        key_hash: "a".repeat(64),
+        token: "kq_test-bearer".into(),
+        remote_id: Some(7),
+        label: Some("alice".into()),
+    };
+    relay_credential::save(&conn, &stored).expect("save");
+    let loaded = relay_credential::get(&conn, "http://127.0.0.1:8787", "inbox.pull")
+        .expect("get")
+        .expect("row");
+    assert_eq!(loaded.token, "kq_test-bearer");
+    assert_eq!(loaded.key_hash, stored.key_hash);
+    assert_eq!(loaded.relay_url, "http://127.0.0.1:8787");
+    assert_eq!(loaded.remote_id, Some(7));
+    let plaintext: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM relay_credentials
+             WHERE instr(CAST(wrapped_token AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(relay_url AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(scope AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(key_hash AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(wrap_key AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(wrap_nonce AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(COALESCE(label, '') AS BLOB), CAST(?1 AS BLOB)) > 0",
+            rusqlite::params![b"kq_test-bearer".as_slice()],
+            |row| row.get(0),
+        )
+        .expect("scan");
+    assert_eq!(plaintext, 0, "bearer must not be stored in the clear");
+}
+
+#[cfg(unix)]
+#[test]
+fn open_restricts_permissions_on_an_existing_database() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("org.sqlite");
+    let path_str = path.to_str().expect("utf-8");
+    open(path_str).expect("create");
+    let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&path, perms).expect("chmod 0644");
+    open(path_str).expect("reopen");
+    let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_restricts_permissions_on_rollback_journal_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("org.sqlite");
+    let path_str = path.to_str().expect("utf-8");
+    open(path_str).expect("create");
+    let journal = dir.path().join("org.sqlite-journal");
+    std::fs::write(&journal, b"").expect("journal");
+    let mut perms = std::fs::metadata(&journal).expect("meta").permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&journal, perms).expect("chmod 0644");
+    open(path_str).expect("reopen");
+    let mode = std::fs::metadata(&journal)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }

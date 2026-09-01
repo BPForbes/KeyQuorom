@@ -17,9 +17,30 @@ the envelopes exist. The two must stay in step in both directions: if the commit
 fails, the CLI deletes the `.kqpb` files it just wrote, because `write_owner_only`
 refuses to overwrite and leftovers would block the retry.
 
+The mailbox relay (`src/relay/`) stores opaque `.kqpb` envelopes and
+the canonical *public* split-tree as JSON documents (full context). It must never
+unseal envelopes or hold wrapped shares or private keys. `relay push` merges
+the sender's public topology into those documents and leaves nodes the sender
+does not hold in place; `tree publish` (admin) replaces a document. `relay pull`
+returns a sliced copy that the personal SQLite file translates. A personal SQLite
+file should keep only the subgraph that person needs (own lineage, siblings,
+descendants, and established-bridge peers plus those peers' ancestors). API keys
+are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
+are minted only by the licensee (host-local `keys create|rotate` with the
+`kql_…` issuer); HTTP cannot create or rotate bearers. The mailbox host is a
+**hidden** `keyquorum host` subcommand, compiled only with `--features
+provider`. Do not document it in README or other customer-facing docs — buyers
+get a URL and an API key and use `keyquorum loadkey` / `relay push` /
+`relay pull`. Default `cargo build` produces `keyquorum` without that
+subcommand. `keyquorum loadkey` calls `POST /keycheck` (no auth) and stores
+that hash plus a sealed bearer in the personal SQLite file. Later commands
+re-check the hash and inject the bearer. Never commit bearers, `.kqpb`
+files, or the relay database.
+
 ## Setup / build / test
 
-- Build: `cargo build`
+- Build (customer CLI): `cargo build --release` (no mailbox host subcommand)
+- Build (provider mailbox): `cargo build --release --features provider`
 - Test: `cargo test --locked --all-targets --all-features`
 - Lint: `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - Format: `cargo fmt`
@@ -32,6 +53,12 @@ Run format, lint, and tests before considering any change complete.
   guide exists yet.
 - Keep changes minimal and scoped to the request. Avoid speculative abstractions or
   unrelated scaffolding.
+- Put tests in their own file next to the module they cover, not in an inline
+  `#[cfg(test)]` module inside the implementation. Use `src/<module>/tests.rs`
+  (directory module: `#[cfg(test)] mod tests;`) or `src/<module>.rs` with
+  `#[cfg(test)] #[path = "<module>/tests.rs"] mod tests;`. Nested files such as
+  `src/relay/client.rs` load `src/relay/client/tests.rs` the same way. Shared
+  test helpers belong in a `#[cfg(test)]` module, not in production code.
 
 ## Security
 

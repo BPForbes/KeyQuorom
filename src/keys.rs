@@ -124,6 +124,30 @@ pub fn get_key_by_public_key(conn: &Connection, public_key: &[u8]) -> Result<Har
     .ok_or(Error::InvalidPublicKey)
 }
 
+pub fn get_key_by_fingerprint(conn: &Connection, fingerprint: &str) -> Result<HardwareKey> {
+    conn.query_row(
+        &format!("SELECT {SELECT_COLUMNS} FROM hardware_keys WHERE fingerprint = ?1"),
+        params![fingerprint],
+        row_to_key,
+    )
+    .optional()?
+    .ok_or(Error::InvalidPublicKey)
+}
+
+pub fn get_or_register_encryption(
+    conn: &Connection,
+    label: &str,
+    public_key: &[u8],
+) -> Result<i64> {
+    if public_key.len() != 32 {
+        return Err(Error::InvalidPublicKey);
+    }
+    if let Ok(existing) = get_key_by_public_key(conn, public_key) {
+        return Ok(existing.id);
+    }
+    register_key(conn, label, KeyType::Encryption, public_key)
+}
+
 /// Raw 32-byte public or private key material from a hex dump, PEM, or
 /// OpenSSH `.pub` line — the files `generate` writes and the usual
 /// standard key-file shapes.
