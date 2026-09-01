@@ -1,14 +1,14 @@
 //! Axum router for the mailbox relay. Handlers never unseal envelopes.
 
 use super::api_key::{self, ApiKeyInfo, ApiKeyScope, CreatedApiKey, NewApiKey};
-use super::client::{ErrorBody, InboxAccepted, InboxEnvelope, InboxList};
+use super::client::{ErrorBody, InboxAccepted, InboxEnvelope, InboxList, InboxPush};
 use super::mailbox;
 use super::org_tree;
 use crate::error::Error;
 use crate::key_tree::{PublicEdge, PublicNode, PublicTree};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -253,6 +253,7 @@ impl Modify for SecurityAddon {
             InboxAccepted,
             InboxEnvelope,
             InboxList,
+            InboxPush,
             ErrorBody,
             CreateApiKeyBody,
             ApiKeyCreated,
@@ -285,11 +286,11 @@ async fn health() -> Json<HealthResponse> {
     post,
     path = "/inbox",
     tag = "inbox",
-    request_body(content = [u8], content_type = "application/octet-stream"),
+    request_body(content = InboxPush, content_type = "application/json"),
     responses(
-        (status = 201, description = "Envelope stored", body = InboxAccepted),
+        (status = 201, description = "Envelope stored; attached trees replace full public context", body = InboxAccepted),
         (status = 200, description = "Envelope already stored", body = InboxAccepted),
-        (status = 400, description = "Malformed envelope", body = ErrorBody),
+        (status = 400, description = "Malformed envelope or tree", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 403, description = "Forbidden", body = ErrorBody),
         (status = 413, description = "Envelope too large", body = ErrorBody)
@@ -299,14 +300,18 @@ async fn health() -> Json<HealthResponse> {
 async fn post_inbox(
     State(state): State<AppState>,
     ApiToken(token): ApiToken,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<InboxAccepted>), ApiError> {
-    if body.len() > MAX_ENVELOPE_BYTES {
+    let (envelope, trees) = parse_inbox_body(&headers, &body)?;
+    if envelope.len() > MAX_ENVELOPE_BYTES {
         return Err(Error::BundleFieldTooLarge.into());
     }
-    let envelope = body.to_vec();
     let (id, fingerprint, duplicate) = with_conn(&state, move |conn| {
         api_key::authenticate(conn, &token, ApiKeyScope::InboxPush)?;
+        for tree in &trees {
+            org_tree::put_public_tree(conn, tree)?;
+        }
         mailbox::store(conn, &envelope)
     })
     .await?;
@@ -324,13 +329,37 @@ async fn post_inbox(
     ))
 }
 
+fn parse_inbox_body(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(Vec<u8>, Vec<PublicTree>), ApiError> {
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"))
+        });
+    if !is_json {
+        return Ok((body.to_vec(), Vec::new()));
+    }
+    let push: InboxPush = serde_json::from_slice(body).map_err(|_| Error::InvalidBridgePackage)?;
+    let envelope = STANDARD
+        .decode(push.bytes.as_bytes())
+        .map_err(|_| Error::InvalidBridgePackage)?;
+    Ok((envelope, push.trees))
+}
+
 #[utoipa::path(
     get,
     path = "/inbox",
     tag = "inbox",
     params(InboxQuery),
     responses(
-        (status = 200, description = "Envelopes and visible public-tree slices for this pull key", body = InboxList),
+        (status = 200, description = "Envelopes and public-tree slices for this pull key", body = InboxList),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 403, description = "Forbidden", body = ErrorBody)
     ),
@@ -346,7 +375,7 @@ async fn get_inbox(
         let auth = api_key::authenticate(conn, &token, ApiKeyScope::InboxPull)?;
         let fingerprint = auth.recipient_fingerprint.ok_or(Error::ApiKeyScopeDenied)?;
         let envelopes = mailbox::list_after(conn, &fingerprint, after)?;
-        let trees = org_tree::contexts_for_fingerprint(conn, &fingerprint)?;
+        let trees = org_tree::slices_for_fingerprint(conn, &fingerprint)?;
         Ok((envelopes, trees))
     })
     .await?;
@@ -536,7 +565,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api-keys/{id}/revoke", post(revoke_key))
         .route("/trees", put(put_tree))
         .route("/trees/{label}/context", get(get_tree_context))
-        .layer(DefaultBodyLimit::max(MAX_ENVELOPE_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_ENVELOPE_BYTES.saturating_mul(2)))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

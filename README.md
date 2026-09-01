@@ -127,15 +127,18 @@ keyquorum bridge deny 1 --node alice --peer it
 tear down an established pairing (add requires a whitelist hit on either
 side; deny also drops any pairing).
 
-Publish the public topology (no sealed shares) to the relay. The relay
-computes each person's visibility slice (seed + ancestors + descendants +
-siblings, then the fixpoint of established links) and returns it on
-inbox pull. `tree fetch` refreshes topology without downloading envelopes.
+The relay stores the **full** public tree as a JSON document. Sending
+data (`relay push`, including private-bridge envelopes) uploads that
+document automatically from `--db`. Fetching data (`relay pull`) returns
+the slice this device's encryption fingerprint is allowed to see, and
+the CLI merges it into local SQLite before importing envelopes. A later
+push that adds a bridge such as `M.S.2 ↔ M.A.1` expands the next pull
+for `M.S.2` to include `M.A.1` as topology-only (no sealed share).
+
+`tree fetch` refreshes topology without downloading envelopes. `tree
+publish` remains if you need to replace the document without an envelope.
 
 ```sh
-# Operator / publisher: full public tree → relay (admin API key)
-keyquorum tree publish <key-id>
-
 # Person: envelopes plus the slice this pull key is allowed to see
 keyquorum --db alice.sqlite relay pull --import --share-file alice.key
 
@@ -143,11 +146,6 @@ keyquorum --db alice.sqlite relay pull --import --share-file alice.key
 keyquorum tree fetch <key-id>
 keyquorum tree fetch --label master
 ```
-
-If a later publish adds a bridge that reaches a previously omitted node
-(for example `M.S.2 <-> M.A.1`), the next pull expands that person's
-local tree to include it.
-
 ### Private sign bridges (per-person stores)
 
 A private sign bridge is an N-person group that can co-sign files. Each
@@ -317,10 +315,11 @@ keyquorum share redeem-file
 The `kq-relay` binary is an inbox for sealed `.kqpb` envelopes and the
 canonical *public* split-tree topology. It indexes packages by the recipient
 X25519 fingerprint in the outer header and never unseals them. Wrapped shares
-and private keys stay on the device. The `org_*` tables on the relay SQLite
-file hold labels, encryption fingerprints/public keys, whitelist, and
-established links only. Put TLS in front of it (Caddy, nginx); the process
-itself binds loopback by default.
+and private keys stay on the device. Full public-tree context is stored as a
+JSON document per tree label; on pull the server slices that document for the
+recipient fingerprint and the personal store translates the slice into SQLite.
+Put TLS in front of it (Caddy, nginx); the process itself binds loopback by
+default.
 
 ```sh
 # First start mints an admin API key and prints it once.
@@ -347,12 +346,12 @@ export KEYQUORUM_RELAY_URL=http://127.0.0.1:8787
 keyquorum relay push --dir ./bridge-packages --api-key "$PUSH_KEY"
 keyquorum relay pull --output-dir ./inbox --api-key "$PULL_KEY"
 keyquorum --db alice.sqlite relay pull --import --share-file alice.key --api-key "$PULL_KEY"
-
-# Public tree: admin publishes once; each pull key's inbox response
-# already includes that person's slice. `tree fetch` is topology-only.
-keyquorum tree publish 1 --api-key "$ADMIN_KEY"
-keyquorum --db alice.sqlite relay pull --import --share-file alice.key --api-key "$PULL_KEY"
 ```
+
+`relay push` also uploads every public tree in `--db`, replacing the
+relay's full context documents. `relay pull` merges the returned slices
+into `--db` (then `--import` opens envelopes). `tree publish` / `tree
+fetch` are optional if you need to sync topology without an envelope.
 
 Lost or compromised API keys: mint a replacement (`keys rotate` or
 `keys create`) and revoke the old id. Envelopes already in the mailbox
@@ -381,7 +380,7 @@ These still need a private-key custody model (a software file, OS keychain, or r
 
 This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, API key bearers, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded.
 
-The mailbox relay cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It may store the canonical *public* tree (labels, fingerprints, public keys, policy). Store only hashed API keys in the relay SQLite file. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key. A personal store that is missing a newly bridged node picks it up on the next `relay pull` (or `tree fetch`) after the operator republishes.
+The mailbox relay cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It stores the canonical *public* tree as JSON documents (labels, fingerprints, public keys, policy). Sending envelopes with `relay push` updates those documents from the sender's `--db`. Pulling returns a sliced copy for the pull-key fingerprint, which the CLI translates into local SQLite. Store only hashed API keys in the relay SQLite file. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key.
 
 ## Contributing
 

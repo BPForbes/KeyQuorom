@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::key_tree::PublicTree;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -23,8 +24,18 @@ pub struct InboxEnvelope {
 pub struct InboxList {
     pub envelopes: Vec<InboxEnvelope>,
     /// Visible public-tree slices for this pull key's fingerprint.
-    /// The relay computes these from the canonical topology; the client
-    /// does not project locally. Empty when nothing is published yet.
+    /// Empty when nothing is published or this fingerprint is not in a tree.
+    #[serde(default)]
+    pub trees: Vec<PublicTree>,
+}
+
+/// JSON inbox upload: opaque envelope plus optional full public trees.
+/// Sending trees replaces the relay's canonical documents for those labels.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct InboxPush {
+    /// Standard base64 of the exact `.kqpb` bytes.
+    pub bytes: String,
+    /// Full public trees (not slices). Omit or empty to leave server context unchanged.
     #[serde(default)]
     pub trees: Vec<PublicTree>,
 }
@@ -60,11 +71,29 @@ fn read_json<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// Upload one opaque `.kqpb` envelope.
+/// Upload one opaque `.kqpb` envelope (no tree update).
 pub fn push(base_url: &str, api_key: &str, envelope: &[u8]) -> Result<InboxAccepted> {
     let resp = with_key(ureq::post(&join_url(base_url, "/inbox")), api_key)
         .set("Content-Type", "application/octet-stream")
         .send_bytes(envelope);
+    read_json(resp)
+}
+
+/// Upload an envelope and replace the relay's full public-tree documents.
+pub fn push_with_trees(
+    base_url: &str,
+    api_key: &str,
+    envelope: &[u8],
+    trees: &[PublicTree],
+) -> Result<InboxAccepted> {
+    let body = InboxPush {
+        bytes: base64::engine::general_purpose::STANDARD.encode(envelope),
+        trees: trees.to_vec(),
+    };
+    let json = serde_json::to_string(&body).map_err(|e| Error::RelayRequest(e.to_string()))?;
+    let resp = with_key(ureq::post(&join_url(base_url, "/inbox")), api_key)
+        .set("Content-Type", "application/json")
+        .send_string(&json);
     read_json(resp)
 }
 

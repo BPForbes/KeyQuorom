@@ -18,12 +18,14 @@ the `.kqpb` files it just wrote, because `write_owner_only` refuses to overwrite
 leftovers would block the retry.
 
 The mailbox relay (`src/relay/`, `kq-relay`) stores opaque `.kqpb` envelopes and
-the canonical *public* split-tree topology (labels, fingerprints, public keys,
-whitelist, established links). It must never unseal envelopes or hold wrapped
-shares or private keys. A personal SQLite file should keep only the subgraph
-that person needs (own lineage, siblings, descendants, and established-bridge
-peers plus those peers' ancestors). API keys are shown once; persist only
-`hex(SHA-256(raw))`. Never commit bearers, `.kqpb` files, or the relay database.
+the canonical *public* split-tree as JSON documents (full context). It must never
+unseal envelopes or hold wrapped shares or private keys. `relay push` updates
+those documents from the sender's store; `relay pull` returns a sliced copy that
+the personal SQLite file translates. A personal SQLite file should keep only the
+subgraph that person needs (own lineage, siblings, descendants, and
+established-bridge peers plus those peers' ancestors). API keys are shown once;
+persist only `hex(SHA-256(raw))`. Never commit bearers, `.kqpb` files, or the
+relay database.
 
 ## Working conventions
 

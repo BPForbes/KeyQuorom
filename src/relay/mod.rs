@@ -2,9 +2,9 @@
 //! *public* split-tree topology.
 //!
 //! The relay never unseals envelopes and never holds wrapped shares or
-//! private keys. It stores public labels, encryption fingerprints,
-//! public keys, whitelist, and established links, and inbox pull
-//! automatically includes the visibility slice for that pull key.
+//! private keys. Full public-tree context is stored as JSON documents.
+//! Pushing envelopes updates those documents; pull returns a sliced copy
+//! for the recipient fingerprint that a personal SQLite store translates.
 
 mod api_key;
 mod client;
@@ -18,12 +18,13 @@ pub use api_key::{
     CreatedApiKey, NewApiKey,
 };
 pub use client::{
-    fetch_tree_context, publish_tree, pull as pull_inbox, push as push_inbox, InboxAccepted,
-    InboxEnvelope, InboxList,
+    fetch_tree_context, publish_tree, pull as pull_inbox, push as push_inbox,
+    push_with_trees as push_inbox_with_trees, InboxAccepted, InboxEnvelope, InboxList, InboxPush,
 };
 pub use mailbox::{list_after, store, StoredEnvelope};
 pub use org_tree::{
-    context_for_fingerprint, contexts_for_fingerprint, get_public_tree, put_public_tree,
+    context_for_fingerprint, contexts_for_fingerprint, get_public_tree, list_public_trees,
+    put_public_tree, slices_for_fingerprint,
 };
 pub use server::{router, AppState, MAX_ENVELOPE_BYTES};
 

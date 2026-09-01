@@ -381,6 +381,67 @@ async fn live_listener_round_trip_with_ureq() {
     assert_eq!(decoded, envelope);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pushing_an_envelope_updates_full_tree_and_pull_returns_a_slice() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, mailbox_fp) = sample_envelope();
+    let (tree, s2) = example_org_tree(false);
+    let s2_fp = keys::fingerprint(&s2);
+    let push = push_key(&conn);
+    let pull_s2 = pull_key(&conn, &s2_fp);
+    let pull_mailbox = pull_key(&conn, &mailbox_fp);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = relay::router(AppState::new(conn));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let url = format!("http://{addr}");
+    relay::push_inbox_with_trees(&url, &push, &envelope, std::slice::from_ref(&tree))
+        .expect("push with tree");
+
+    let for_member = relay::pull_inbox(&url, &pull_s2, None).expect("member pull");
+    assert!(for_member.envelopes.is_empty());
+    assert_eq!(for_member.trees.len(), 1);
+    let labels: Vec<&str> = for_member.trees[0]
+        .nodes
+        .iter()
+        .map(|node| node.label.as_str())
+        .collect();
+    assert!(labels.contains(&"M.A.2"));
+    assert!(labels.contains(&"M.S.2"));
+    assert!(!labels.contains(&"M.A.1"));
+
+    let mut with_ma1 = tree.clone();
+    with_ma1.links.push(PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.A.1".into(),
+    });
+    with_ma1.whitelist.push(PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.A.1".into(),
+    });
+    with_ma1.whitelist.push(PublicEdge {
+        from: "M.A.1".into(),
+        to: "M.S.2".into(),
+    });
+    relay::push_inbox_with_trees(&url, &push, &envelope, std::slice::from_ref(&with_ma1))
+        .expect("push updated tree");
+    let expanded = relay::pull_inbox(&url, &pull_s2, None).expect("expanded");
+    assert_eq!(expanded.trees[0].generation, 2);
+    assert!(expanded.trees[0]
+        .nodes
+        .iter()
+        .any(|node| node.label == "M.A.1"));
+
+    let mail = relay::pull_inbox(&url, &pull_mailbox, None).expect("mailbox pull");
+    assert_eq!(mail.envelopes.len(), 1);
+    assert!(mail.trees.is_empty());
+}
+
 #[test]
 fn max_envelope_constant_is_one_mib() {
     assert_eq!(MAX_ENVELOPE_BYTES, 1024 * 1024);

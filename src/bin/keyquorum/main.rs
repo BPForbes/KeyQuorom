@@ -588,7 +588,8 @@ enum ShareCommand {
 
 #[derive(Subcommand)]
 enum RelayCommand {
-    /// Upload every `.kqpb` in a directory to the relay inbox
+    /// Upload every `.kqpb` in a directory; also replace relay public-tree
+    /// documents from trees stored in --db
     Push {
         /// Directory containing `.kqpb` envelopes
         #[arg(long)]
@@ -600,7 +601,7 @@ enum RelayCommand {
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Download envelopes and the visible public-tree slice for this pull key
+    /// Download envelopes and the public-tree slice for this pull key
     Pull {
         /// Import each envelope into --db using --share-file
         #[arg(long, requires = "share_file")]
@@ -1556,6 +1557,7 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
         RelayCommand::Push { dir, url, api_key } => {
             let url = relay_url(url)?;
             let api_key = relay_api_key(api_key)?;
+            let trees = local_public_trees(db_path)?;
             let mut uploaded = 0usize;
             let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<std::io::Result<_>>()?;
             entries.sort_by_key(|e| e.path());
@@ -1565,7 +1567,11 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     continue;
                 }
                 let bytes = fs::read(&path)?;
-                let accepted = relay::push_inbox(&url, &api_key, &bytes)?;
+                let accepted = if trees.is_empty() {
+                    relay::push_inbox(&url, &api_key, &bytes)?
+                } else {
+                    relay::push_inbox_with_trees(&url, &api_key, &bytes, &trees)?
+                };
                 println!(
                     "{} -> id {} ({})",
                     path.display(),
@@ -1579,6 +1585,13 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     "no .kqpb files in {}",
                     dir.display()
                 )));
+            }
+            if !trees.is_empty() {
+                println!(
+                    "Updated relay public-tree context ({} tree{})",
+                    trees.len(),
+                    if trees.len() == 1 { "" } else { "s" }
+                );
             }
         }
         RelayCommand::Pull {
@@ -1641,6 +1654,23 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn local_public_trees(db_path: &Path) -> Result<Vec<key_tree::PublicTree>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
+    let conn = db::open(db_path_str)?;
+    let mut trees = Vec::new();
+    for listing in key_tree::list_trees(&conn)? {
+        match key_tree::export_public_tree(&conn, listing.key_id) {
+            Ok(tree) => trees.push(tree),
+            Err(Error::NodeNotFound | Error::TreeNotFound) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(trees)
 }
 
 fn run_share(conn: &Connection, command: ShareCommand) -> Result<()> {
