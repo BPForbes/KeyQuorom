@@ -1388,15 +1388,7 @@ fn encode_package(f: PackageFields<'_>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Reads only the outer `.kqpb` header: magic, version, kind, recipient
-/// public key, and declared payload length. Does not unseal or otherwise
-/// touch the letter. Used by the relay to index envelopes by fingerprint.
-pub fn routing_public_key(bytes: &[u8]) -> Result<[u8; 32]> {
-    let (_, recipient_public_key, _) = parse_kqpb_outer(bytes)?;
-    Ok(recipient_public_key)
-}
-
-fn parse_kqpb_outer(bytes: &[u8]) -> Result<(u8, [u8; 32], &[u8])> {
+fn decode_package(bytes: &[u8], recipient_sk: &[u8; 32]) -> Result<DecodedPackage> {
     let mut data = bytes;
     if take_n(&mut data, 4)? != PACKAGE_MAGIC {
         return Err(Error::InvalidBridgePackage);
@@ -1411,11 +1403,6 @@ fn parse_kqpb_outer(bytes: &[u8]) -> Result<(u8, [u8; 32], &[u8])> {
     if !data.is_empty() {
         return Err(Error::InvalidBridgePackage);
     }
-    Ok((kind, recipient_public_key, sealed))
-}
-
-fn decode_package(bytes: &[u8], recipient_sk: &[u8; 32]) -> Result<DecodedPackage> {
-    let (kind, recipient_public_key, sealed) = parse_kqpb_outer(bytes)?;
     let secret_key = crypto_box::SecretKey::from(*recipient_sk);
     let payload = secret_key
         .unseal(sealed)

@@ -29,10 +29,8 @@ CREATE TABLE IF NOT EXISTS keys (
 -- One row per node in a key's split tree. A node is either a SPLIT node
 -- (threshold set, hardware_key_id/wrapped_share NULL — reconstructing it
 -- means Shamir-recovering at least `threshold` of its children's values)
--- or a LEAF (hardware_key_id set, threshold NULL — a share sealed to one
--- specific hardware key). wrapped_share may be NULL on a leaf when this
--- store only holds topology for that person (a peer or sibling whose
--- sealed share lives on their device). parent_id NULL marks a key's root
+-- or a LEAF (hardware_key_id/wrapped_share set, threshold NULL — a share
+-- sealed to one specific hardware key). parent_id NULL marks a key's root
 -- node. A flat "M-of-N hardware keys" quorum is just a one-level tree: a
 -- single SPLIT root with N LEAF children.
 CREATE TABLE IF NOT EXISTS key_nodes (
@@ -47,7 +45,7 @@ CREATE TABLE IF NOT EXISTS key_nodes (
     is_active         INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
     CHECK (
         (threshold IS NOT NULL AND hardware_key_id IS NULL AND wrapped_share IS NULL)
-        OR (threshold IS NULL AND hardware_key_id IS NOT NULL)
+        OR (threshold IS NULL AND hardware_key_id IS NOT NULL AND wrapped_share IS NOT NULL)
     )
 );
 
@@ -271,22 +269,3 @@ CREATE TABLE IF NOT EXISTS bridge_events (
 
 CREATE INDEX IF NOT EXISTS idx_private_bridges_key ON private_bridges (key_id);
 CREATE INDEX IF NOT EXISTS idx_bridge_events_bridge ON bridge_events (bridge_id);
-
--- Relay API key loaded via `keyquorum loadkey` (or first `--api-key` use).
--- The service stores only `hex(SHA-256(raw))`. This personal DB stores that
--- same hash for `POST /keycheck` revalidation, plus the bearer (needed to
--- call authenticated routes) sealed with a random AES-256-GCM wrapping key
--- kept in this owner-only file. Never commit this database.
-CREATE TABLE IF NOT EXISTS relay_credentials (
-    relay_url       TEXT NOT NULL,
-    scope           TEXT NOT NULL CHECK (scope IN ('inbox.push', 'inbox.pull', 'admin')),
-    key_hash        TEXT NOT NULL,
-    wrap_key        BLOB NOT NULL,
-    wrap_nonce      BLOB NOT NULL,
-    wrapped_token   BLOB NOT NULL,
-    remote_id       INTEGER,
-    label           TEXT,
-    stored_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    last_checked_at TEXT,
-    PRIMARY KEY (relay_url, scope)
-);
