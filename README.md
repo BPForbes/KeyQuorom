@@ -350,7 +350,7 @@ still rejects stale generations.
 
 ## Roadmap
 
-[#10](https://github.com/BPForbes/KeyQuorom/issues/10) mailbox transport
+[#10](https://github.com/BPForbes/KeyQuorum/issues/10) mailbox transport
 (API keys, `relay push` / `relay pull --import`) is in place.
 Still open on that issue: authenticated envelopes for hardware-key reissue
 and key-tree restructure (private-bridge create/rotate/remove-member already

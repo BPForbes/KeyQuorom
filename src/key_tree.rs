@@ -1239,14 +1239,15 @@ pub struct PublicEdge {
 
 /// Snapshot this store's tree without sealed shares — safe to publish.
 pub fn export_public_tree(conn: &Connection, key_id: i64) -> Result<PublicTree> {
-    let label: String = conn
+    let (label, generation): (String, i64) = conn
         .query_row(
-            "SELECT label FROM keys WHERE id = ?1",
+            "SELECT label, public_generation FROM keys WHERE id = ?1",
             params![key_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or(Error::TreeNotFound)?;
+    let generation = u32::try_from(generation).unwrap_or(1);
     let tree = KeyQuorumTree::load(conn, key_id)?;
     let mut nodes = Vec::with_capacity(tree.nodes.len());
     for node in &tree.nodes {
@@ -1270,7 +1271,7 @@ pub fn export_public_tree(conn: &Connection, key_id: i64) -> Result<PublicTree> 
     let listing = list_bridges(conn, key_id)?;
     Ok(PublicTree {
         label,
-        generation: 1,
+        generation,
         nodes,
         whitelist: listing
             .allowed
@@ -1513,6 +1514,15 @@ fn apply_public_tree_inner(
         }
     };
 
+    let stored_generation: i64 = conn.query_row(
+        "SELECT public_generation FROM keys WHERE id = ?1",
+        params![key_id],
+        |row| row.get(0),
+    )?;
+    if i64::from(snapshot.generation) < stored_generation {
+        return Err(Error::StalePublicTree);
+    }
+
     let remaining: HashSet<String> = snapshot.nodes.iter().map(|n| n.label.clone()).collect();
     if remaining.len() != snapshot.nodes.len() {
         return Err(Error::DuplicateNodeLabel);
@@ -1552,12 +1562,15 @@ fn apply_public_tree_inner(
     }
 
     conn.execute(
-        "DELETE FROM key_node_bridges WHERE node_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)",
+        "DELETE FROM key_node_bridges
+         WHERE node_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)
+           AND peer_label IN (SELECT label FROM key_nodes WHERE key_id = ?1)",
         params![key_id],
     )?;
     conn.execute(
-        "DELETE FROM key_node_links WHERE node_a_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)
-            OR node_b_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)",
+        "DELETE FROM key_node_links
+         WHERE node_a_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)
+           AND node_b_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)",
         params![key_id],
     )?;
     for edge in &snapshot.whitelist {
@@ -1566,6 +1579,10 @@ fn apply_public_tree_inner(
     for edge in &snapshot.links {
         add_bridge(conn, key_id, &edge.from, &edge.to)?;
     }
+    conn.execute(
+        "UPDATE keys SET public_generation = ?1 WHERE id = ?2",
+        params![i64::from(snapshot.generation), key_id],
+    )?;
     Ok(key_id)
 }
 
@@ -1606,8 +1623,12 @@ fn apply_public_node(conn: &Connection, key_id: i64, node: &PublicNode) -> Resul
     if let Some(id) = existing {
         conn.execute(
             "UPDATE key_nodes SET parent_id = ?1, threshold = ?2,
+                    wrapped_share = CASE
+                        WHEN ?3 IS NOT NULL AND ?3 IS NOT hardware_key_id THEN NULL
+                        ELSE wrapped_share
+                    END,
                     hardware_key_id = CASE
-                        WHEN wrapped_share IS NOT NULL THEN COALESCE(?3, hardware_key_id)
+                        WHEN wrapped_share IS NOT NULL AND ?3 IS NULL THEN hardware_key_id
                         ELSE ?3
                     END,
                     is_active = ?4

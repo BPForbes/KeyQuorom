@@ -4,6 +4,8 @@ use crate::error::{Error, Result};
 use crate::key_tree::PublicTree;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+use std::time::Duration;
 use utoipa::ToSchema;
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -127,6 +129,20 @@ fn join_url(base: &str, path: &str) -> Result<String> {
     Ok(format!("{}{path}", base.trim_end_matches('/')))
 }
 
+fn http_agent_builder() -> ureq::AgentBuilder {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(20))
+        .timeout_write(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30))
+        .redirects(0)
+}
+
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| http_agent_builder().build())
+}
+
 fn with_key(req: ureq::Request, api_key: &str) -> ureq::Request {
     req.set("Authorization", &format!("Bearer {api_key}"))
 }
@@ -151,7 +167,7 @@ fn read_json<T: serde::de::DeserializeOwned>(
 
 /// Upload one opaque `.kqpb` envelope (no tree update).
 pub fn push(base_url: &str, api_key: &str, envelope: &[u8]) -> Result<InboxAccepted> {
-    let resp = with_key(ureq::post(&join_url(base_url, "/inbox")?), api_key)
+    let resp = with_key(http_agent().post(&join_url(base_url, "/inbox")?), api_key)
         .set("Content-Type", "application/octet-stream")
         .send_bytes(envelope);
     read_json(resp)
@@ -169,7 +185,7 @@ pub fn push_with_trees(
         trees: trees.to_vec(),
     };
     let json = serde_json::to_string(&body).map_err(|e| Error::RelayRequest(e.to_string()))?;
-    let resp = with_key(ureq::post(&join_url(base_url, "/inbox")?), api_key)
+    let resp = with_key(http_agent().post(&join_url(base_url, "/inbox")?), api_key)
         .set("Content-Type", "application/json")
         .send_string(&json);
     read_json(resp)
@@ -194,7 +210,7 @@ pub fn pull(
         url.push('?');
         url.push_str(&params.join("&"));
     }
-    let resp = with_key(ureq::get(&url), api_key).call();
+    let resp = with_key(http_agent().get(&url), api_key).call();
     read_json(resp)
 }
 
@@ -222,7 +238,8 @@ pub fn check_key_hash(base_url: &str, key_hash: &str) -> Result<KeyCheckResponse
 
 fn post_keycheck(base_url: &str, body: &KeyCheckRequest) -> Result<KeyCheckResponse> {
     let json = serde_json::to_string(body).map_err(|e| Error::RelayRequest(e.to_string()))?;
-    let resp = ureq::post(&join_url(base_url, "/keycheck")?)
+    let resp = http_agent()
+        .post(&join_url(base_url, "/keycheck")?)
         .set("Content-Type", "application/json")
         .send_string(&json);
     read_json(resp)
@@ -231,7 +248,7 @@ fn post_keycheck(base_url: &str, body: &KeyCheckRequest) -> Result<KeyCheckRespo
 /// Replace the relay's canonical public tree (admin scope).
 pub fn publish_tree(base_url: &str, api_key: &str, tree: &PublicTree) -> Result<PublicTree> {
     let body = serde_json::to_string(tree).map_err(|e| Error::RelayRequest(e.to_string()))?;
-    let resp = with_key(ureq::put(&join_url(base_url, "/trees")?), api_key)
+    let resp = with_key(http_agent().put(&join_url(base_url, "/trees")?), api_key)
         .set("Content-Type", "application/json")
         .send_string(&body);
     read_json(resp)
@@ -240,7 +257,7 @@ pub fn publish_tree(base_url: &str, api_key: &str, tree: &PublicTree) -> Result<
 /// Fetch the public-tree slice for this pull key's bound fingerprint.
 pub fn fetch_tree_context(base_url: &str, api_key: &str, label: &str) -> Result<PublicTree> {
     let path = format!("/trees/{}/context", urlencoding_label(label));
-    let resp = with_key(ureq::get(&join_url(base_url, &path)?), api_key).call();
+    let resp = with_key(http_agent().get(&join_url(base_url, &path)?), api_key).call();
     read_json(resp)
 }
 
@@ -263,6 +280,7 @@ fn urlencoding_label(label: &str) -> String {
 #[cfg(test)]
 mod url_tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn rejects_remote_http_and_allows_loopback_and_https() {
@@ -273,5 +291,25 @@ mod url_tests {
         validate_relay_url("http://localhost:8787").expect("localhost");
         validate_relay_url("http://[::1]:8787").expect("ipv6");
         validate_relay_url("https://relay.example.com").expect("https");
+    }
+
+    #[test]
+    fn stalled_peer_is_terminated_by_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            std::thread::sleep(Duration::from_secs(5));
+            drop(stream);
+        });
+        let agent = http_agent_builder()
+            .timeout(Duration::from_millis(400))
+            .build();
+        let started = std::time::Instant::now();
+        let result = agent.get(&format!("http://{addr}/")).call();
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

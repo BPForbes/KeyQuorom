@@ -118,6 +118,7 @@ fn project_local_drops_irrelevant_leaves_and_keeps_own_share() {
     let spec = two_branch_org_spec(a1, a2, s1, s2);
     let key_id = split(&mut conn, "org", b"company master secret 32 bytes!", &spec).expect("split");
     bind_pair(&conn, key_id, "M.S.2", "M.A.2").expect("bridge");
+    allow_bridge(&conn, key_id, "M.S.2", "M.A.1").expect("future peer");
     let own_share = wrapped_share(&conn, key_id, "M.S.2").expect("own share");
 
     project_local(&conn, key_id, "M.S.2").expect("project");
@@ -136,6 +137,16 @@ fn project_local_drops_irrelevant_leaves_and_keeps_own_share() {
         wrapped_share(&conn, key_id, "M.S.2").as_deref(),
         Some(own_share.as_slice())
     );
+    let future_peer: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM key_node_bridges
+             WHERE node_id = (SELECT id FROM key_nodes WHERE key_id = ?1 AND label = 'M.S.2')
+               AND peer_label = 'M.A.1'",
+            params![key_id],
+            |row| row.get(0),
+        )
+        .expect("preserved whitelist");
+    assert_eq!(future_peer, 1);
 }
 
 #[test]
@@ -317,6 +328,100 @@ fn apply_public_tree_replaces_topology_only_hardware_keys() {
         )
         .expect("fp");
     assert_eq!(fp, crate::keys::fingerprint(&rotated));
+}
+
+#[test]
+fn apply_public_tree_clears_wrapped_share_when_hardware_key_rotates() {
+    let mut conn = db::open_in_memory().expect("schema");
+    let (a1, _) = register_encryption_key(&conn, "a1");
+    let (a2, _) = register_encryption_key(&conn, "a2");
+    let spec = NodeSpec::Split {
+        label: "M".into(),
+        threshold: 2,
+        allowed_bridges: vec![],
+        children: vec![
+            NodeSpec::Leaf {
+                label: "M.A.1".into(),
+                hardware_key_id: a1,
+                allowed_bridges: vec![],
+            },
+            NodeSpec::Leaf {
+                label: "M.A.2".into(),
+                hardware_key_id: a2,
+                allowed_bridges: vec![],
+            },
+        ],
+    };
+    let key_id = split(&mut conn, "org", b"company master secret 32 bytes!", &spec).expect("split");
+    assert!(wrapped_share(&conn, key_id, "M.A.2").is_some());
+    let mut snapshot = export_public_tree(&conn, key_id).expect("export");
+    let (_sk, rotated) = crate::keys::generate_encryption_keypair();
+    let leaf = snapshot
+        .nodes
+        .iter_mut()
+        .find(|n| n.label == "M.A.2")
+        .expect("leaf");
+    leaf.encryption_fingerprint = Some(crate::keys::fingerprint(&rotated));
+    leaf.encryption_public_key = Some(hex::encode(rotated));
+    apply_public_tree(&conn, Some(key_id), &snapshot).expect("rotate");
+    assert!(wrapped_share(&conn, key_id, "M.A.2").is_none());
+    let fp: String = conn
+        .query_row(
+            "SELECT fingerprint FROM hardware_keys
+             WHERE id = (SELECT hardware_key_id FROM key_nodes WHERE key_id = ?1 AND label = 'M.A.2')",
+            params![key_id],
+            |row| row.get(0),
+        )
+        .expect("fp");
+    assert_eq!(fp, crate::keys::fingerprint(&rotated));
+}
+
+#[test]
+fn apply_public_tree_rejects_a_lower_generation() {
+    let personal = db::open_in_memory().expect("personal");
+    let (_sk, a2) = crate::keys::generate_encryption_keypair();
+    let mut snapshot = PublicTree {
+        label: "org".into(),
+        generation: 2,
+        nodes: vec![
+            PublicNode {
+                label: "M".into(),
+                parent_label: None,
+                threshold: Some(2),
+                is_active: true,
+                encryption_fingerprint: None,
+                encryption_public_key: None,
+            },
+            PublicNode {
+                label: "M.A.2".into(),
+                parent_label: Some("M".into()),
+                threshold: None,
+                is_active: true,
+                encryption_fingerprint: Some(crate::keys::fingerprint(&a2)),
+                encryption_public_key: Some(hex::encode(a2)),
+            },
+        ],
+        whitelist: vec![],
+        links: vec![],
+    };
+    let key_id = apply_public_tree(&personal, None, &snapshot).expect("first");
+    assert_eq!(
+        export_public_tree(&personal, key_id)
+            .expect("export")
+            .generation,
+        2
+    );
+    snapshot.generation = 1;
+    assert!(matches!(
+        apply_public_tree(&personal, Some(key_id), &snapshot),
+        Err(Error::StalePublicTree)
+    ));
+    assert_eq!(
+        export_public_tree(&personal, key_id)
+            .expect("kept")
+            .generation,
+        2
+    );
 }
 
 #[test]

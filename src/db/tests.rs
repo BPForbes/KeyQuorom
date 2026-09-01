@@ -297,6 +297,39 @@ fn rebuilding_share_required_key_nodes_keeps_bridge_rows() {
         !sql.contains("wrapped_share IS NOT NULL"),
         "rebuild should drop the share-required check: {sql}"
     );
+    conn.execute(
+        "INSERT INTO hardware_keys (label, key_type, fingerprint, public_key)
+         VALUES ('sign', 'signing', 'fp-s', x'03')",
+        [],
+    )
+    .expect("signing key");
+    let signing_id: i64 = conn
+        .query_row(
+            "SELECT id FROM hardware_keys WHERE fingerprint = 'fp-s'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("signing id");
+    assert!(conn
+        .execute(
+            "INSERT INTO key_nodes (key_id, parent_id, label, hardware_key_id)
+             VALUES (1, 1, 'signed-leaf', ?1)",
+            rusqlite::params![signing_id],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE key_nodes SET hardware_key_id = ?1 WHERE label = 'left'",
+            rusqlite::params![signing_id],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO key_nodes (key_id, parent_id, label, threshold)
+             VALUES (1, 999, 'orphan', 2)",
+            [],
+        )
+        .is_err());
 }
 
 #[test]
@@ -359,7 +392,13 @@ fn relay_credential_roundtrip_seals_the_bearer() {
     let plaintext: i64 = conn
         .query_row(
             "SELECT count(*) FROM relay_credentials
-             WHERE instr(CAST(wrapped_token AS BLOB), CAST(?1 AS BLOB)) > 0",
+             WHERE instr(CAST(wrapped_token AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(relay_url AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(scope AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(key_hash AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(wrap_key AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(wrap_nonce AS BLOB), CAST(?1 AS BLOB)) > 0
+                OR instr(CAST(COALESCE(label, '') AS BLOB), CAST(?1 AS BLOB)) > 0",
             rusqlite::params![b"kq_test-bearer".as_slice()],
             |row| row.get(0),
         )

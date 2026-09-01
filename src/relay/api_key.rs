@@ -379,7 +379,10 @@ pub fn authorize_licensee_or_bootstrap(
     conn: &Connection,
     supplied: Option<&str>,
 ) -> Result<Option<CreatedLicensee>> {
-    if let Some(key) = supplied.filter(|key| !key.is_empty()) {
+    if let Some(key) = supplied {
+        if key.is_empty() {
+            return Err(Error::InvalidLicenseeKey);
+        }
         authenticate_licensee(conn, key)?;
         return Ok(None);
     }

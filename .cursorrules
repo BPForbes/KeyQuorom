@@ -35,7 +35,8 @@ Rules:
 
 - Keep changes minimal and scoped to what's asked. Don't add speculative abstractions,
   unrelated tooling, or unfinished scaffolding.
-- After Rust work, run `cargo build`, `cargo fmt`,
+- After Rust work, run `cargo build` (and `cargo build --features provider`
+  when touching the mailbox host), `cargo fmt`,
   `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
   `cargo test --locked --all-targets --all-features` before treating a change as
   done. Follow standard `rustfmt` conventions.

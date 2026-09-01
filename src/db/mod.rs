@@ -126,6 +126,12 @@ fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+            if !table_has_column(conn, "keys", "public_generation")? {
+                conn.execute(
+                    "ALTER TABLE keys ADD COLUMN public_generation INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
             rebuild_key_nodes_if_share_required(conn)?;
             Ok(())
         })();

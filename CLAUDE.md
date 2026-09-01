@@ -41,7 +41,8 @@ files, or the relay database.
 
 - Keep changes minimal and scoped to what's requested — don't scaffold unrelated
   modules, abstractions, or tooling ahead of need.
-- After Rust work, run `cargo build`, `cargo fmt`,
+- After Rust work, run `cargo build` (and `cargo build --features provider`
+  when touching the mailbox host), `cargo fmt`,
   `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
   `cargo test --locked --all-targets --all-features` before considering a change
   complete.

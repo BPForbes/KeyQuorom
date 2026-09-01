@@ -52,6 +52,7 @@ pub enum Error {
     InvalidInboxPage,
     RelayRequest(String),
     TreeNotFound,
+    StalePublicTree,
 }
 
 impl fmt::Display for Error {
@@ -171,6 +172,12 @@ impl fmt::Display for Error {
             }
             Error::RelayRequest(msg) => write!(f, "relay request failed: {msg}"),
             Error::TreeNotFound => write!(f, "no published tree with that label exists"),
+            Error::StalePublicTree => {
+                write!(
+                    f,
+                    "public tree generation is older than the copy already stored"
+                )
+            }
         }
     }
 }

@@ -317,7 +317,7 @@ pub fn plan_create(
 /// packages should persist those files first so a later disk failure does
 /// not leave a live bridge without envelopes.
 pub fn commit_planned_creation(conn: &Connection, planned: &PlannedCreation) -> Result<()> {
-    with_immediate_transaction(conn, |conn| {
+    crate::db::with_immediate_transaction(conn, || {
         persist_new_bridge(
             conn,
             &planned.created.uid,
@@ -702,7 +702,7 @@ pub fn commit_planned_removal(conn: &Connection, planned: &PlannedRemoval) -> Re
             removed_label,
             notify,
             expected_generation,
-        } => with_immediate_transaction(conn, |conn| {
+        } => crate::db::with_immediate_transaction(conn, || {
             // Same guard as the rotate path: the plan was built outside this
             // transaction, so refuse to destroy a bridge that moved on in
             // between — the destroy notices we handed out are signed with the
@@ -744,7 +744,7 @@ pub fn commit_planned_removal(conn: &Connection, planned: &PlannedRemoval) -> Re
             members,
             supervisors,
             new_secret,
-        } => with_immediate_transaction(conn, |conn| {
+        } => crate::db::with_immediate_transaction(conn, || {
             persist_rotation(
                 conn,
                 uid,
@@ -1472,7 +1472,7 @@ fn insert_from_invite(conn: &Connection, decoded: &DecodedPackage) -> Result<()>
     if get_optional(conn, &decoded.uid)?.is_some() {
         return Err(Error::InvalidBridge);
     }
-    with_immediate_transaction(conn, |conn| {
+    crate::db::with_immediate_transaction(conn, || {
         conn.execute(
             "INSERT INTO private_bridges (uid, label, generation, public_key, salt)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1512,7 +1512,7 @@ fn apply_rotate(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
     }
     verify_update_auth(decoded, &summary.public_key)?;
     let bridge_id = last_bridge_id(conn, &decoded.uid)?;
-    with_immediate_transaction(conn, |conn| {
+    crate::db::with_immediate_transaction(conn, || {
         let updated = conn.execute(
             "UPDATE private_bridges SET generation = ?1, public_key = ?2, salt = ?3, label = COALESCE(?4, label)
              WHERE uid = ?5 AND generation = ?6 AND destroyed_at IS NULL",
@@ -1614,7 +1614,7 @@ fn apply_destroy(conn: &Connection, decoded: &DecodedPackage) -> Result<()> {
     }
     verify_update_auth(decoded, &summary.public_key)?;
     let bridge_id = last_bridge_id(conn, &decoded.uid)?;
-    with_immediate_transaction(conn, |conn| {
+    crate::db::with_immediate_transaction(conn, || {
         conn.execute(
             "UPDATE private_bridges SET destroyed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE uid = ?1 AND destroyed_at IS NULL",
@@ -1678,7 +1678,7 @@ fn drop_member_on_coordinator(
     } else {
         BridgeChangeKind::NeedsMemberRotate
     };
-    with_immediate_transaction(conn, |conn| {
+    crate::db::with_immediate_transaction(conn, || {
         conn.execute(
             "DELETE FROM private_bridge_members WHERE bridge_id = ?1 AND node_label = ?2",
             params![bridge_id, removed_label],
@@ -1901,26 +1901,6 @@ fn remaining_members(
         );
     }
     Ok(members)
-}
-
-fn with_immediate_transaction(
-    conn: &Connection,
-    f: impl FnOnce(&Connection) -> Result<()>,
-) -> Result<()> {
-    if !conn.is_autocommit() {
-        return f(conn);
-    }
-    conn.execute("BEGIN IMMEDIATE", [])?;
-    match f(conn) {
-        Ok(()) => {
-            conn.execute("COMMIT", [])?;
-            Ok(())
-        }
-        Err(err) => {
-            let _ = conn.execute("ROLLBACK", []);
-            Err(err)
-        }
-    }
 }
 
 fn empty_to_none(s: &str) -> Option<&str> {

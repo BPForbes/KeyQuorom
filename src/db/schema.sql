@@ -21,9 +21,10 @@ CREATE TABLE IF NOT EXISTS hardware_keys (
 -- split" is a capability on its own, not just a mechanism for protecting
 -- files (see key_nodes below).
 CREATE TABLE IF NOT EXISTS keys (
-    id            INTEGER PRIMARY KEY,
-    label         TEXT NOT NULL,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    id                 INTEGER PRIMARY KEY,
+    label              TEXT NOT NULL,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    public_generation  INTEGER NOT NULL DEFAULT 1 CHECK (public_generation > 0)
 );
 
 -- One row per node in a key's split tree. A node is either a SPLIT node
