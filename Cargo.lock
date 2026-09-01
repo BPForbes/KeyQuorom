@@ -998,6 +998,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
  "x25519-dalek",

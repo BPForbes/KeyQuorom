@@ -6,6 +6,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
+use url::Url;
 use utoipa::ToSchema;
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -81,17 +82,33 @@ pub struct KeyCheckResponse {
 /// HTTPS is always accepted. HTTP is only allowed for loopback hosts so a
 /// bearer is never sent in the clear to a remote relay.
 pub fn validate_relay_url(url: &str) -> Result<()> {
-    let url = url.trim();
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+    parse_relay_url(url).map(|_| ())
+}
+
+/// Parse once with the same WHATWG parser `ureq` uses, then validate that
+/// parsed host. Callers must reuse the returned `Url` for the request so a
+/// string-level host check cannot disagree with the connect target.
+fn parse_relay_url(raw: &str) -> Result<Url> {
+    let raw = raw.trim();
+    if raw.contains('\\') {
+        return Err(Error::RelayRequest(
+            "relay URL must not contain backslashes".into(),
+        ));
+    }
+    let parsed = Url::parse(raw).map_err(|_| {
         Error::RelayRequest("relay URL must use https, or http only to a loopback host".into())
     })?;
-    let host = relay_host(rest);
-    if host.is_empty() {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::RelayRequest(
+            "relay URL must not include userinfo".into(),
+        ));
+    }
+    if parsed.host().is_none() {
         return Err(Error::RelayRequest("relay URL is missing a host".into()));
     }
-    match scheme {
-        "https" => Ok(()),
-        "http" if is_loopback_host(host) => Ok(()),
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" if is_loopback_url(&parsed) => Ok(parsed),
         "http" => Err(Error::RelayRequest(
             "HTTP relay URLs are only allowed for loopback hosts".into(),
         )),
@@ -101,32 +118,20 @@ pub fn validate_relay_url(url: &str) -> Result<()> {
     }
 }
 
-fn relay_host(rest: &str) -> &str {
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let authority = match authority.rsplit_once('@') {
-        Some((_, hostport)) => hostport,
-        None => authority,
-    };
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
     }
-    authority
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(authority)
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
-}
-
-fn join_url(base: &str, path: &str) -> Result<String> {
-    validate_relay_url(base)?;
-    Ok(format!("{}{path}", base.trim_end_matches('/')))
+fn relay_request_url(base: &str, path: &str) -> Result<Url> {
+    let mut parsed = parse_relay_url(base)?;
+    let joined = format!("{}{path}", parsed.path().trim_end_matches('/'));
+    parsed.set_path(&joined);
+    Ok(parsed)
 }
 
 fn http_agent_builder() -> ureq::AgentBuilder {
@@ -167,7 +172,8 @@ fn read_json<T: serde::de::DeserializeOwned>(
 
 /// Upload one opaque `.kqpb` envelope (no tree update).
 pub fn push(base_url: &str, api_key: &str, envelope: &[u8]) -> Result<InboxAccepted> {
-    let resp = with_key(http_agent().post(&join_url(base_url, "/inbox")?), api_key)
+    let url = relay_request_url(base_url, "/inbox")?;
+    let resp = with_key(http_agent().request_url("POST", &url), api_key)
         .set("Content-Type", "application/octet-stream")
         .send_bytes(envelope);
     read_json(resp)
@@ -185,7 +191,8 @@ pub fn push_with_trees(
         trees: trees.to_vec(),
     };
     let json = serde_json::to_string(&body).map_err(|e| Error::RelayRequest(e.to_string()))?;
-    let resp = with_key(http_agent().post(&join_url(base_url, "/inbox")?), api_key)
+    let url = relay_request_url(base_url, "/inbox")?;
+    let resp = with_key(http_agent().request_url("POST", &url), api_key)
         .set("Content-Type", "application/json")
         .send_string(&json);
     read_json(resp)
@@ -205,12 +212,11 @@ pub fn pull(
     if let Some(limit) = limit {
         params.push(format!("limit={limit}"));
     }
-    let mut url = join_url(base_url, "/inbox")?;
+    let mut url = relay_request_url(base_url, "/inbox")?;
     if !params.is_empty() {
-        url.push('?');
-        url.push_str(&params.join("&"));
+        url.set_query(Some(&params.join("&")));
     }
-    let resp = with_key(http_agent().get(&url), api_key).call();
+    let resp = with_key(http_agent().request_url("GET", &url), api_key).call();
     read_json(resp)
 }
 
@@ -238,8 +244,9 @@ pub fn check_key_hash(base_url: &str, key_hash: &str) -> Result<KeyCheckResponse
 
 fn post_keycheck(base_url: &str, body: &KeyCheckRequest) -> Result<KeyCheckResponse> {
     let json = serde_json::to_string(body).map_err(|e| Error::RelayRequest(e.to_string()))?;
+    let url = relay_request_url(base_url, "/keycheck")?;
     let resp = http_agent()
-        .post(&join_url(base_url, "/keycheck")?)
+        .request_url("POST", &url)
         .set("Content-Type", "application/json")
         .send_string(&json);
     read_json(resp)
@@ -248,7 +255,8 @@ fn post_keycheck(base_url: &str, body: &KeyCheckRequest) -> Result<KeyCheckRespo
 /// Replace the relay's canonical public tree (admin scope).
 pub fn publish_tree(base_url: &str, api_key: &str, tree: &PublicTree) -> Result<PublicTree> {
     let body = serde_json::to_string(tree).map_err(|e| Error::RelayRequest(e.to_string()))?;
-    let resp = with_key(http_agent().put(&join_url(base_url, "/trees")?), api_key)
+    let url = relay_request_url(base_url, "/trees")?;
+    let resp = with_key(http_agent().request_url("PUT", &url), api_key)
         .set("Content-Type", "application/json")
         .send_string(&body);
     read_json(resp)
@@ -257,7 +265,8 @@ pub fn publish_tree(base_url: &str, api_key: &str, tree: &PublicTree) -> Result<
 /// Fetch the public-tree slice for this pull key's bound fingerprint.
 pub fn fetch_tree_context(base_url: &str, api_key: &str, label: &str) -> Result<PublicTree> {
     let path = format!("/trees/{}/context", urlencoding_label(label));
-    let resp = with_key(http_agent().get(&join_url(base_url, &path)?), api_key).call();
+    let url = relay_request_url(base_url, &path)?;
+    let resp = with_key(http_agent().request_url("GET", &url), api_key).call();
     read_json(resp)
 }
 
@@ -291,6 +300,20 @@ mod url_tests {
         validate_relay_url("http://localhost:8787").expect("localhost");
         validate_relay_url("http://[::1]:8787").expect("ipv6");
         validate_relay_url("https://relay.example.com").expect("https");
+    }
+
+    #[test]
+    fn rejects_backslash_host_confusion() {
+        // Manual authority splitting treated `localhost` as the host; the
+        // WHATWG parser (and ureq) treat `\` as `/`, so the host is the
+        // attacker and HTTP would leak the bearer if we allowed it.
+        let confused = r"http://attacker.example\@localhost";
+        assert!(validate_relay_url(confused).is_err());
+        assert!(relay_request_url(confused, "/inbox").is_err());
+        assert!(validate_relay_url("http://attacker.example@localhost").is_err());
+        let url = relay_request_url("http://127.0.0.1:8787", "/inbox").expect("loopback");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/inbox");
     }
 
     #[test]

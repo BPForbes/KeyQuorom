@@ -49,6 +49,7 @@ tower-http = { version = "0.6", optional = true, features = ["trace"] }
 utoipa = "5"
 utoipa-swagger-ui = { version = "9", optional = true, features = ["axum"] }
 ureq = "2"
+url = "2"
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
 
