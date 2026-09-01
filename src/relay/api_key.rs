@@ -319,7 +319,7 @@ pub fn check_hash(conn: &Connection, key_hash: &str) -> Result<KeyCheck> {
         return Ok(KeyCheck::invalid());
     }
     let key_hash = key_hash.to_ascii_lowercase();
-    let row: Option<(i64, String, Option<String>, Option<String>, bool, bool)> = conn
+    let row = conn
         .query_row(
             "SELECT id, scope, label, recipient_fingerprint,
                     revoked_at IS NOT NULL,
@@ -327,31 +327,23 @@ pub fn check_hash(conn: &Connection, key_hash: &str) -> Result<KeyCheck> {
              FROM api_keys WHERE key_hash = ?1",
             params![key_hash],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
+                let revoked: bool = row.get(4)?;
+                let expired: bool = row.get(5)?;
+                if revoked || expired {
+                    Ok(KeyCheck::invalid())
+                } else {
+                    Ok(KeyCheck {
+                        valid: true,
+                        id: Some(row.get(0)?),
+                        scope: Some(row.get(1)?),
+                        label: row.get(2)?,
+                        recipient_fingerprint: row.get(3)?,
+                    })
+                }
             },
         )
         .optional()?;
-
-    let Some((id, scope, label, fingerprint, revoked, expired)) = row else {
-        return Ok(KeyCheck::invalid());
-    };
-    if revoked || expired {
-        return Ok(KeyCheck::invalid());
-    }
-    Ok(KeyCheck {
-        valid: true,
-        id: Some(id),
-        scope: Some(scope),
-        label,
-        recipient_fingerprint: fingerprint,
-    })
+    Ok(row.unwrap_or_else(KeyCheck::invalid))
 }
 
 /// Mints a one-time admin bearer when the table is empty.

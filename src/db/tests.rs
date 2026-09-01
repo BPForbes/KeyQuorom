@@ -311,6 +311,11 @@ fn files_key_id_referencing_an_existing_key_is_allowed() {
     let conn = open_in_memory().expect("schema should apply");
     seed_key(&conn, 1);
 
+    let result = conn.execute(
+        "INSERT INTO files (name, encrypted_path, key_id, nonce)
+             VALUES ('secret.txt', '/data/secret.txt.enc', 1, x'00')",
+        [],
+    );
     assert!(result.is_ok());
 }
 

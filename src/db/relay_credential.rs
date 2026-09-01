@@ -58,7 +58,7 @@ pub fn save(conn: &Connection, cred: &StoredRelayKey) -> Result<()> {
     Ok(())
 }
 
-fn unwrap_row(
+struct SealedRelayRow {
     relay_url: String,
     scope: String,
     key_hash: String,
@@ -67,23 +67,40 @@ fn unwrap_row(
     wrapped_token: Vec<u8>,
     remote_id: Option<i64>,
     label: Option<String>,
-) -> Result<StoredRelayKey> {
-    let wrap_key: [u8; KEY_LEN] = wrap_key
+}
+
+fn row_to_sealed(row: &rusqlite::Row<'_>) -> rusqlite::Result<SealedRelayRow> {
+    Ok(SealedRelayRow {
+        relay_url: row.get(0)?,
+        scope: row.get(1)?,
+        key_hash: row.get(2)?,
+        wrap_key: row.get(3)?,
+        wrap_nonce: row.get(4)?,
+        wrapped_token: row.get(5)?,
+        remote_id: row.get(6)?,
+        label: row.get(7)?,
+    })
+}
+
+fn unwrap_row(row: SealedRelayRow) -> Result<StoredRelayKey> {
+    let wrap_key: [u8; KEY_LEN] = row
+        .wrap_key
         .try_into()
         .map_err(|_| Error::IntegrityCheckFailed)?;
-    let wrap_nonce: [u8; NONCE_LEN] = wrap_nonce
+    let wrap_nonce: [u8; NONCE_LEN] = row
+        .wrap_nonce
         .try_into()
         .map_err(|_| Error::IntegrityCheckFailed)?;
-    let token = crypto::decrypt(&wrap_key, &wrap_nonce, &wrapped_token)
+    let token = crypto::decrypt(&wrap_key, &wrap_nonce, &row.wrapped_token)
         .map_err(|_| Error::IntegrityCheckFailed)?;
     let token = String::from_utf8(token).map_err(|_| Error::IntegrityCheckFailed)?;
     Ok(StoredRelayKey {
-        relay_url,
-        scope,
-        key_hash,
+        relay_url: row.relay_url,
+        scope: row.scope,
+        key_hash: row.key_hash,
         token,
-        remote_id,
-        label,
+        remote_id: row.remote_id,
+        label: row.label,
     })
 }
 
@@ -95,25 +112,12 @@ pub fn get(conn: &Connection, relay_url: &str, scope: &str) -> Result<Option<Sto
                     remote_id, label
              FROM relay_credentials WHERE relay_url = ?1 AND scope = ?2",
             params![url, scope],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
-            },
+            row_to_sealed,
         )
         .optional()?;
     match row {
         None => Ok(None),
-        Some((url, scope, hash, key, nonce, wrapped, remote_id, label)) => Ok(Some(unwrap_row(
-            url, scope, hash, key, nonce, wrapped, remote_id, label,
-        )?)),
+        Some(row) => Ok(Some(unwrap_row(row)?)),
     }
 }
 
@@ -123,24 +127,10 @@ pub fn get_for_scope(conn: &Connection, scope: &str) -> Result<Vec<StoredRelayKe
                 remote_id, label
          FROM relay_credentials WHERE scope = ?1",
     )?;
-    let rows = stmt.query_map(params![scope], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-            row.get(7)?,
-        ))
-    })?;
+    let rows = stmt.query_map(params![scope], row_to_sealed)?;
     let mut out = Vec::new();
     for row in rows {
-        let (url, scope, hash, key, nonce, wrapped, remote_id, label) = row?;
-        out.push(unwrap_row(
-            url, scope, hash, key, nonce, wrapped, remote_id, label,
-        )?);
+        out.push(unwrap_row(row?)?);
     }
     Ok(out)
 }
