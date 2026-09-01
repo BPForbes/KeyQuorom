@@ -47,7 +47,9 @@ pub enum Error {
     ApiKeyRevoked,
     ApiKeyScopeDenied,
     ApiKeyNotFound,
+    InvalidLicenseeKey,
     RelayRequest(String),
+    TreeNotFound,
 }
 
 impl fmt::Display for Error {
@@ -152,7 +154,14 @@ impl fmt::Display for Error {
             Error::ApiKeyRevoked => write!(f, "API key has been revoked"),
             Error::ApiKeyScopeDenied => write!(f, "API key is not permitted for this operation"),
             Error::ApiKeyNotFound => write!(f, "no API key with that id exists"),
+            Error::InvalidLicenseeKey => {
+                write!(
+                    f,
+                    "invalid licensee key; only the licensee can mint or rotate API keys"
+                )
+            }
             Error::RelayRequest(msg) => write!(f, "relay request failed: {msg}"),
+            Error::TreeNotFound => write!(f, "no published tree with that label exists"),
         }
     }
 }

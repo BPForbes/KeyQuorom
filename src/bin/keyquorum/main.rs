@@ -18,7 +18,7 @@ use keyquorum::{
     db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, relay, sharing, signing,
     vault,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
@@ -180,19 +180,9 @@ enum Command {
         #[arg(long)]
         register: bool,
     },
-    /// Print live split trees, one tree, the LCA of --node labels, or
-    /// write the live spec JSON
-    Tree {
-        /// Split-tree id from `list` / `split`. Omit to list every tree.
-        key_id: Option<i64>,
-        /// Two or more node labels or key files: print their lowest
-        /// common ancestor instead of the full tree
-        #[arg(long = "node", num_args = 2.., requires = "key_id")]
-        nodes: Vec<String>,
-        /// Write a snapshot of the live tree (active nodes and binds)
-        #[arg(long, conflicts_with = "nodes", requires = "key_id")]
-        output: Option<PathBuf>,
-    },
+    /// Print live split trees, one tree, the LCA of --node labels, write
+    /// the live spec JSON, or publish/fetch a public slice
+    Tree(TreeArgs),
     /// Reconstruct a key's secret from raw shares
     Reconstruct {
         key_id: i64,
@@ -272,6 +262,16 @@ enum Command {
         #[command(subcommand)]
         command: RelayCommand,
     },
+    /// Check a relay API key with POST /keycheck and store it on this instance.
+    /// Later relay commands reuse it after a hash re-check; prefer omitting
+    /// the key so it is prompted (stays out of shell history).
+    Loadkey {
+        /// Raw `kq_…` bearer. Prompted if omitted.
+        api_key: Option<String>,
+        /// Relay base URL (or KEYQUORUM_RELAY_URL)
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -302,6 +302,52 @@ impl From<CliKeyType> for KeyType {
             CliKeyType::Signing => KeyType::Signing,
         }
     }
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct TreeArgs {
+    #[command(subcommand)]
+    command: Option<TreeCommand>,
+    /// Split-tree id from `list` / `split`. Omit to list every tree.
+    key_id: Option<i64>,
+    /// Two or more node labels or key files: print their lowest
+    /// common ancestor instead of the full tree
+    #[arg(long = "node", num_args = 2.., requires = "key_id")]
+    nodes: Vec<String>,
+    /// Write a snapshot of the live tree (active nodes and binds)
+    #[arg(long, conflicts_with = "nodes", requires = "key_id")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum TreeCommand {
+    /// Upload this store's public topology (no sealed shares) to the relay
+    Publish {
+        key_id: i64,
+        /// Relay base URL (or KEYQUORUM_RELAY_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// Admin-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Download the slice this pull key is allowed to see and merge it here.
+    /// Inbox pull also applies this slice automatically; use fetch to refresh
+    /// topology without downloading envelopes.
+    Fetch {
+        /// Local key id to update. Default: match the published tree label.
+        key_id: Option<i64>,
+        /// Published `keys.label` when this store has no local key id yet
+        #[arg(long, required_unless_present = "key_id")]
+        label: Option<String>,
+        /// Relay base URL (or KEYQUORUM_RELAY_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// Pull-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -552,7 +598,8 @@ enum ShareCommand {
 
 #[derive(Subcommand)]
 enum RelayCommand {
-    /// Upload every `.kqpb` in a directory to the relay inbox
+    /// Upload every `.kqpb` in a directory; also replace relay public-tree
+    /// documents from trees stored in --db
     Push {
         /// Directory containing `.kqpb` envelopes
         #[arg(long)]
@@ -560,11 +607,11 @@ enum RelayCommand {
         /// Relay base URL (or KEYQUORUM_RELAY_URL)
         #[arg(long)]
         url: Option<String>,
-        /// Push-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
+        /// Push-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Download envelopes for this device's pull-scope API key
+    /// Download envelopes and the public-tree slice for this pull key
     Pull {
         /// Import each envelope into --db using --share-file
         #[arg(long, requires = "share_file")]
@@ -630,8 +677,10 @@ fn main() -> ExitCode {
 }
 
 fn run(db_path: &Path, command: Command) -> Result<()> {
-    if let Command::Relay { command } = command {
-        return run_relay(db_path, command);
+    match command {
+        Command::Relay { command } => return run_relay(db_path, command),
+        Command::Loadkey { api_key, url } => return run_loadkey(db_path, api_key, url),
+        _ => {}
     }
 
     let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
@@ -648,7 +697,7 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         | Command::Split { .. }
         | Command::Bind { .. }
         | Command::Add { .. }
-        | Command::Tree { .. }
+        | Command::Tree(_)
         | Command::Reconstruct { .. }
         | Command::Bridge { .. } => run_tree_command(&mut conn, command)?,
         Command::Verify {
@@ -704,7 +753,7 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         Command::Export { command } => run_export(&conn, command)?,
         Command::Share { command } => run_share(&conn, command)?,
         Command::Pin { command } => run_pin(&conn, command)?,
-        Command::Relay { .. } => {
+        Command::Relay { .. } | Command::Loadkey { .. } => {
             unreachable!("relay commands are handled before opening the org db")
         }
     }
@@ -940,31 +989,7 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
             key_tree::bind_leaf_to_active_siblings(conn, key_id, &node)?;
             println!("Added {node} (node {new_id}); parent shares refreshed");
         }
-        Command::Tree {
-            key_id,
-            nodes,
-            output,
-        } => match key_id {
-            None => {
-                let trees = key_tree::list_trees(conn)?;
-                if trees.is_empty() {
-                    println!("(no split trees)");
-                } else {
-                    for tree in trees {
-                        println!("{}\t{}", tree.key_id, tree.label);
-                    }
-                }
-            }
-            Some(key_id) if nodes.is_empty() => {
-                let summary = key_tree::describe(conn, key_id)?;
-                println!("{} (key {})", summary.label, summary.key_id);
-                print_tree_node(&summary.root, 0);
-                if let Some(path) = output {
-                    write_live_spec(conn, key_id, &path)?;
-                }
-            }
-            Some(key_id) => print_lca(conn, key_id, &nodes)?,
-        },
+        Command::Tree(args) => run_tree(conn, args)?,
         Command::Reconstruct {
             key_id,
             nodes,
@@ -994,9 +1019,86 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
         | Command::Export { .. }
         | Command::Share { .. }
         | Command::Pin { .. }
-        | Command::Relay { .. } => unreachable!("non-tree commands are dispatched in run()"),
+        | Command::Relay { .. }
+        | Command::Loadkey { .. } => unreachable!("non-tree commands are dispatched in run()"),
     }
     Ok(())
+}
+
+fn run_tree(conn: &Connection, args: TreeArgs) -> Result<()> {
+    match args.command {
+        Some(TreeCommand::Publish {
+            key_id,
+            url,
+            api_key,
+        }) => {
+            let snapshot = key_tree::export_public_tree(conn, key_id)?;
+            let (url, api_key) = resolve_relay_auth(conn, url, api_key, relay::ApiKeyScope::Admin)?;
+            let stored = relay::publish_tree(&url, &api_key, &snapshot)?;
+            println!(
+                "Published {} (generation {}, {} nodes)",
+                stored.label,
+                stored.generation,
+                stored.nodes.len()
+            );
+        }
+        Some(TreeCommand::Fetch {
+            key_id,
+            label,
+            url,
+            api_key,
+        }) => {
+            let label = match (label, key_id) {
+                (Some(label), _) => label,
+                (None, Some(id)) => key_label(conn, id)?,
+                (None, None) => {
+                    fatal_usage_error("tree fetch requires a key id or --label");
+                }
+            };
+            let (url, api_key) =
+                resolve_relay_auth(conn, url, api_key, relay::ApiKeyScope::InboxPull)?;
+            let slice = relay::fetch_tree_context(&url, &api_key, &label)?;
+            let applied = key_tree::apply_public_tree(conn, key_id, &slice)?;
+            println!(
+                "Merged {} (generation {}, {} nodes) into key {applied}",
+                slice.label,
+                slice.generation,
+                slice.nodes.len()
+            );
+        }
+        None => match args.key_id {
+            None => {
+                let trees = key_tree::list_trees(conn)?;
+                if trees.is_empty() {
+                    println!("(no split trees)");
+                } else {
+                    for tree in trees {
+                        println!("{}\t{}", tree.key_id, tree.label);
+                    }
+                }
+            }
+            Some(key_id) if args.nodes.is_empty() => {
+                let summary = key_tree::describe(conn, key_id)?;
+                println!("{} (key {})", summary.label, summary.key_id);
+                print_tree_node(&summary.root, 0);
+                if let Some(path) = args.output {
+                    write_live_spec(conn, key_id, &path)?;
+                }
+            }
+            Some(key_id) => print_lca(conn, key_id, &args.nodes)?,
+        },
+    }
+    Ok(())
+}
+
+fn key_label(conn: &Connection, key_id: i64) -> Result<String> {
+    conn.query_row(
+        "SELECT label FROM keys WHERE id = ?1",
+        rusqlite::params![key_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or(Error::TreeNotFound)
 }
 
 fn run_bridge(conn: &Connection, command: BridgeCommand) -> Result<()> {
@@ -1440,33 +1542,141 @@ fn run_export(conn: &Connection, command: ExportCommand) -> Result<()> {
     Ok(())
 }
 
-fn relay_url(explicit: Option<String>) -> Result<String> {
+fn persist_checked_key(
+    conn: &Connection,
+    url: &str,
+    token: &str,
+    check: &relay::KeyCheckResponse,
+) -> Result<()> {
+    if !check.valid {
+        return Err(Error::InvalidApiKey);
+    }
+    let scope = check.scope.as_deref().ok_or(Error::InvalidApiKey)?;
+    let key_hash = relay::hash_bearer(token)?;
+    db::relay_credential::save(
+        conn,
+        &db::relay_credential::StoredRelayKey {
+            relay_url: url.to_string(),
+            scope: scope.to_string(),
+            key_hash,
+            token: token.to_string(),
+            remote_id: check.id,
+            label: check.label.clone(),
+        },
+    )
+}
+
+fn resolve_relay_url(
+    conn: &Connection,
+    explicit: Option<String>,
+    scope: relay::ApiKeyScope,
+) -> Result<String> {
     if let Some(url) = explicit.filter(|s| !s.is_empty()) {
-        return Ok(url);
+        return Ok(db::relay_credential::normalize_url(&url));
     }
     match std::env::var("KEYQUORUM_RELAY_URL") {
-        Ok(url) if !url.is_empty() => Ok(url),
-        _ => Err(Error::RelayRequest(
-            "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
-        )),
+        Ok(url) if !url.is_empty() => Ok(db::relay_credential::normalize_url(&url)),
+        _ => {
+            let stored = db::relay_credential::get_for_scope(conn, scope.as_str())?;
+            match stored.as_slice() {
+                [one] => Ok(one.relay_url.clone()),
+                [] => Err(Error::RelayRequest(
+                    "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
+                )),
+                _ => Err(Error::RelayRequest(
+                    "multiple stored relay URLs; pass --url".into(),
+                )),
+            }
+        }
     }
 }
 
-fn relay_api_key(explicit: Option<String>) -> Result<String> {
-    if let Some(key) = explicit.filter(|s| !s.is_empty()) {
-        return Ok(key);
+/// `--api-key` / env win, then a stored key whose hash still passes `/keycheck`.
+/// A newly presented bearer is stored (by scope) after a successful check.
+fn resolve_relay_auth(
+    conn: &Connection,
+    explicit_url: Option<String>,
+    explicit_key: Option<String>,
+    required: relay::ApiKeyScope,
+) -> Result<(String, String)> {
+    let url = resolve_relay_url(conn, explicit_url, required)?;
+    let provided = explicit_key.filter(|s| !s.is_empty()).or_else(|| {
+        match std::env::var("KEYQUORUM_RELAY_API_KEY") {
+            Ok(key) if !key.is_empty() => Some(key),
+            _ => None,
+        }
+    });
+
+    if let Some(token) = provided {
+        let check = relay::check_key(&url, &token)?;
+        if !check.valid {
+            return Err(Error::InvalidApiKey);
+        }
+        if check.scope.as_deref() != Some(required.as_str()) {
+            return Err(Error::ApiKeyScopeDenied);
+        }
+        persist_checked_key(conn, &url, &token, &check)?;
+        return Ok((url, token));
     }
-    match std::env::var("KEYQUORUM_RELAY_API_KEY") {
-        Ok(key) if !key.is_empty() => Ok(key),
-        _ => prompt_secret("Relay API key: "),
+
+    match db::relay_credential::get(conn, &url, required.as_str())? {
+        Some(stored) => {
+            let check = relay::check_key_hash(&url, &stored.key_hash)?;
+            if !check.valid {
+                db::relay_credential::delete(conn, &url, required.as_str())?;
+                return Err(Error::RelayRequest(format!(
+                    "stored API key for {} is no longer valid; run `keyquorum loadkey`",
+                    required.as_str()
+                )));
+            }
+            db::relay_credential::touch_checked(conn, &url, required.as_str())?;
+            Ok((url, stored.token))
+        }
+        None => Err(Error::RelayRequest(format!(
+            "no stored API key for {}; run `keyquorum loadkey` or pass --api-key",
+            required.as_str()
+        ))),
     }
+}
+
+fn run_loadkey(db_path: &Path, api_key: Option<String>, url: Option<String>) -> Result<()> {
+    let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
+    let conn = db::open(db_path_str)?;
+    let url = if let Some(url) = url.filter(|s| !s.is_empty()) {
+        db::relay_credential::normalize_url(&url)
+    } else {
+        match std::env::var("KEYQUORUM_RELAY_URL") {
+            Ok(url) if !url.is_empty() => db::relay_credential::normalize_url(&url),
+            _ => {
+                return Err(Error::RelayRequest(
+                    "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
+                ))
+            }
+        }
+    };
+    let token = match api_key.filter(|s| !s.is_empty()) {
+        Some(token) => token,
+        None => prompt_secret("Relay API key: ")?,
+    };
+    let check = relay::check_key(&url, &token)?;
+    persist_checked_key(&conn, &url, &token, &check)?;
+    let scope = check.scope.as_deref().unwrap_or("unknown");
+    print!("Stored {scope} API key for {url}");
+    if let Some(label) = check.label.as_deref().filter(|s| !s.is_empty()) {
+        print!(" ({label})");
+    }
+    println!();
+    Ok(())
 }
 
 fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
+    let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
+    let conn = db::open(db_path_str)?;
     match command {
         RelayCommand::Push { dir, url, api_key } => {
-            let url = relay_url(url)?;
-            let api_key = relay_api_key(api_key)?;
+            let (url, api_key) =
+                resolve_relay_auth(&conn, url, api_key, relay::ApiKeyScope::InboxPush)?;
+            let trees = export_local_public_trees(&conn)?;
             let mut uploaded = 0usize;
             let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<std::io::Result<_>>()?;
             entries.sort_by_key(|e| e.path());
@@ -1476,7 +1686,11 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     continue;
                 }
                 let bytes = fs::read(&path)?;
-                let accepted = relay::push_inbox(&url, &api_key, &bytes)?;
+                let accepted = if trees.is_empty() {
+                    relay::push_inbox(&url, &api_key, &bytes)?
+                } else {
+                    relay::push_inbox_with_trees(&url, &api_key, &bytes, &trees)?
+                };
                 println!(
                     "{} -> id {} ({})",
                     path.display(),
@@ -1491,6 +1705,13 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     dir.display()
                 )));
             }
+            if !trees.is_empty() {
+                println!(
+                    "Updated relay public-tree context ({} tree{})",
+                    trees.len(),
+                    if trees.len() == 1 { "" } else { "s" }
+                );
+            }
         }
         RelayCommand::Pull {
             import,
@@ -1500,20 +1721,25 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
             api_key,
             after,
         } => {
-            let url = relay_url(url)?;
-            let api_key = relay_api_key(api_key)?;
+            let (url, api_key) =
+                resolve_relay_auth(&conn, url, api_key, relay::ApiKeyScope::InboxPull)?;
             let listed = relay::pull_inbox(&url, &api_key, after)?;
+            for slice in &listed.trees {
+                let applied = key_tree::apply_public_tree(&conn, None, slice)?;
+                println!(
+                    "Merged {} (generation {}, {} nodes) into key {applied}",
+                    slice.label,
+                    slice.generation,
+                    slice.nodes.len()
+                );
+            }
             if listed.envelopes.is_empty() {
-                println!("(no envelopes)");
+                if listed.trees.is_empty() {
+                    println!("(no envelopes)");
+                }
                 return Ok(());
             }
 
-            let mut conn = if import {
-                let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
-                Some(db::open(db_path_str)?)
-            } else {
-                None
-            };
             let share_sk = if import {
                 let path = share_file.as_ref().ok_or(Error::InvalidPath)?;
                 Some(zeroize::Zeroizing::new(read_key_array_32(Path::new(path))?))
@@ -1534,8 +1760,8 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     locked_files::write_owner_only(&path, &bytes)?;
                     println!("Wrote {}", path.display());
                 }
-                if let (Some(conn), Some(sk)) = (conn.as_mut(), share_sk.as_ref()) {
-                    let summary = private_bridge::import_package(conn, &bytes, sk)?;
+                if let Some(sk) = share_sk.as_ref() {
+                    let summary = private_bridge::import_package(&conn, &bytes, sk)?;
                     println!(
                         "Imported envelope {} as private bridge {} gen {}",
                         item.id, summary.uid, summary.generation
@@ -1545,6 +1771,18 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn export_local_public_trees(conn: &Connection) -> Result<Vec<key_tree::PublicTree>> {
+    let mut trees = Vec::new();
+    for listing in key_tree::list_trees(conn)? {
+        match key_tree::export_public_tree(conn, listing.key_id) {
+            Ok(tree) => trees.push(tree),
+            Err(Error::NodeNotFound | Error::TreeNotFound) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(trees)
 }
 
 fn run_share(conn: &Connection, command: ShareCommand) -> Result<()> {

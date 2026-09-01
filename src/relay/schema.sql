@@ -1,6 +1,18 @@
--- Server-only mailbox database. Never store organization SQLite data or
--- private key material here. Envelopes are opaque blobs indexed by the
+-- Server-only mailbox + public-tree database. Never store wrapped shares
+-- or private key material here. Envelopes are opaque blobs indexed by the
 -- recipient encryption-key fingerprint from the outer .kqpb header.
+-- `org_tree_docs` is a document store: one JSON public tree per label
+-- (the full org context). Pushing envelopes updates those documents.
+-- Personal devices translate a sliced copy into local SQLite.
+
+-- One issuer credential for the KeyQuorum licensee. Customer API keys are
+-- minted only with this secret via `kq-relay keys` on the host; HTTP cannot
+-- create or rotate bearers. The table stores `hex(SHA-256(raw))` only.
+CREATE TABLE IF NOT EXISTS licensee_issuer (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    key_hash    TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 
 CREATE TABLE IF NOT EXISTS api_keys (
     id                      INTEGER PRIMARY KEY,
@@ -29,3 +41,11 @@ CREATE TABLE IF NOT EXISTS mailbox (
 
 CREATE INDEX IF NOT EXISTS idx_mailbox_recipient
     ON mailbox (recipient_fingerprint, id);
+
+-- Full public split-tree as a JSON document (no wrapped shares, no private keys).
+CREATE TABLE IF NOT EXISTS org_tree_docs (
+    label         TEXT PRIMARY KEY,
+    generation    INTEGER NOT NULL CHECK (generation > 0),
+    document      TEXT NOT NULL,
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

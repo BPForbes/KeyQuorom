@@ -257,6 +257,13 @@ fn top_level_tree_and_bridge_parse() {
     .is_ok());
     assert!(Cli::try_parse_from(["keyquorum", "revoke", "3", "--evict"]).is_ok());
     assert!(Cli::try_parse_from(["keyquorum", "tree"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "publish", "1"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch", "1"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch", "--label", "master"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch"]).is_err());
+    assert!(
+        Cli::try_parse_from(["keyquorum", "tree", "project", "1", "--as-node", "M.S.2"]).is_err()
+    );
     assert!(Cli::try_parse_from([
         "keyquorum",
         "generate",
@@ -375,6 +382,19 @@ fn relay_push_with_dir_parses() {
         "push",
         "--dir",
         "./packages",
+        "--url",
+        "http://127.0.0.1:8787",
+    ])
+    .is_ok());
+}
+
+#[test]
+fn loadkey_parses_with_and_without_positional_key() {
+    assert!(Cli::try_parse_from(["keyquorum", "loadkey"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "loadkey",
+        "kq_example",
         "--url",
         "http://127.0.0.1:8787",
     ])

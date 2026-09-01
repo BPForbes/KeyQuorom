@@ -26,12 +26,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Listen for envelope push/pull and API-key administration
+    /// Listen for envelope push/pull. Does not mint API keys.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
     },
-    /// Manage API keys in the relay database (no HTTP)
+    /// Mint, list, rotate, or revoke API keys on this host (not over HTTP)
     Keys {
         #[command(subcommand)]
         command: KeysCommand,
@@ -50,6 +50,9 @@ enum KeysCommand {
         label: Option<String>,
         #[arg(long)]
         ttl_seconds: Option<i64>,
+        /// Licensee issuer (`kql_…`). Prompted or KEYQUORUM_LICENSEE_KEY if omitted.
+        #[arg(long)]
+        licensee_key: Option<String>,
     },
     List,
     Revoke {
@@ -57,6 +60,8 @@ enum KeysCommand {
     },
     Rotate {
         id: i64,
+        #[arg(long)]
+        licensee_key: Option<String>,
     },
 }
 
@@ -83,6 +88,36 @@ async fn run() -> Result<()> {
     }
 }
 
+fn print_new_licensee(issuer: &relay::CreatedLicensee) {
+    eprintln!("Created licensee issuer key (shown once):");
+    eprintln!("  {}", issuer.token);
+    eprintln!("Only this key can mint or rotate customer API keys.");
+    eprintln!("Store this; it cannot be recovered from the database.");
+}
+
+fn licensee_secret(explicit: Option<String>) -> Result<String> {
+    if let Some(key) = explicit.filter(|s| !s.is_empty()) {
+        return Ok(key);
+    }
+    match std::env::var("KEYQUORUM_LICENSEE_KEY") {
+        Ok(key) if !key.is_empty() => Ok(key),
+        _ => rpassword::prompt_password("Licensee key: ").map_err(Error::from),
+    }
+}
+
+fn require_licensee(conn: &rusqlite::Connection, explicit: Option<String>) -> Result<()> {
+    relay::authenticate_licensee(conn, &licensee_secret(explicit)?)
+}
+
+fn authorize_mint(conn: &rusqlite::Connection, licensee_key: Option<String>) -> Result<()> {
+    if let Some(issuer) = relay::bootstrap_licensee_if_empty(conn)? {
+        print_new_licensee(&issuer);
+        Ok(())
+    } else {
+        require_licensee(conn, licensee_key)
+    }
+}
+
 fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
     match command {
         KeysCommand::Create {
@@ -90,7 +125,9 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
             fingerprint,
             label,
             ttl_seconds,
+            licensee_key,
         } => {
+            authorize_mint(conn, licensee_key)?;
             let created = relay::create_api_key(
                 conn,
                 &NewApiKey {
@@ -131,7 +168,8 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
             relay::revoke_api_key(conn, id)?;
             println!("Revoked API key {id}");
         }
-        KeysCommand::Rotate { id } => {
+        KeysCommand::Rotate { id, licensee_key } => {
+            authorize_mint(conn, licensee_key)?;
             let created = relay::rotate_api_key(conn, id)?;
             println!("Rotated API key {id} -> {}", created.info.id);
             println!("token (shown once): {}", created.token);
@@ -146,10 +184,8 @@ async fn serve(db_path: &str, bind: &str) -> Result<()> {
         .init();
 
     let conn = relay::open(db_path)?;
-    if let Some(admin) = relay::bootstrap_admin_if_empty(&conn)? {
-        eprintln!("Created bootstrap admin API key (shown once):");
-        eprintln!("  {}", admin.token);
-        eprintln!("Store this; it cannot be recovered from the database.");
+    if let Some(issuer) = relay::bootstrap_licensee_if_empty(&conn)? {
+        print_new_licensee(&issuer);
     }
 
     let addr: SocketAddr = bind
