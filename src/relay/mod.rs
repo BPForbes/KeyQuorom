@@ -23,26 +23,63 @@ pub use client::{
     push as push_inbox, push_with_trees as push_inbox_with_trees, InboxAccepted, InboxEnvelope,
     InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
 };
-pub use mailbox::{list_after, store, StoredEnvelope};
+pub use mailbox::{
+    list_after, store, MailboxPage, StoredEnvelope, DEFAULT_INBOX_PAGE, MAX_INBOX_PAGE,
+};
 pub use org_tree::{
     context_for_fingerprint, contexts_for_fingerprint, get_public_tree, list_public_trees,
     put_public_tree, slices_for_fingerprint,
 };
 pub use server::{router, AppState, MAX_ENVELOPE_BYTES};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use rusqlite::Connection;
+use std::path::Path;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
+const ORGANIZATION_TABLES: [&str; 4] = [
+    "hardware_keys",
+    "private_bridges",
+    "credentials",
+    "key_nodes",
+];
+
 /// Opens (creating if needed) the relay's own SQLite database and applies
 /// the mailbox + public-tree schema. This is not a personal organization
 /// database and must not receive wrapped shares or private keys.
+///
+/// An existing organization store is refused before any relay tables are
+/// created, so a `--db` mix-up cannot merge the two schemas.
 pub fn open(path: &str) -> Result<Connection> {
+    let path_ref = Path::new(path);
+    if path_ref.is_file() {
+        let meta = std::fs::metadata(path_ref)?;
+        if meta.len() > 0 {
+            let probe = Connection::open(path)?;
+            if looks_like_organization_database(&probe)? {
+                return Err(Error::OrganizationDatabase);
+            }
+        }
+    }
     let conn = Connection::open(path)?;
     init(&conn)?;
     Ok(conn)
+}
+
+fn looks_like_organization_database(conn: &Connection) -> Result<bool> {
+    for table in ORGANIZATION_TABLES {
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if found > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Opens an in-memory relay database. Intended for tests.

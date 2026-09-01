@@ -27,6 +27,9 @@ pub struct InboxList {
     /// Empty when nothing is published or this fingerprint is not in a tree.
     #[serde(default)]
     pub trees: Vec<PublicTree>,
+    /// Id to pass as `after` for the next page. Absent when this page is complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<i64>,
 }
 
 /// JSON inbox upload: opaque envelope plus optional full public trees.
@@ -123,11 +126,24 @@ pub fn push_with_trees(
     read_json(resp)
 }
 
-/// Fetch envelopes for the pull key's bound fingerprint.
-pub fn pull(base_url: &str, api_key: &str, after: Option<i64>) -> Result<InboxList> {
-    let mut url = join_url(base_url, "/inbox");
+/// Fetch one page of envelopes for the pull key's bound fingerprint.
+pub fn pull(
+    base_url: &str,
+    api_key: &str,
+    after: Option<i64>,
+    limit: Option<i64>,
+) -> Result<InboxList> {
+    let mut params = Vec::new();
     if let Some(after) = after {
-        url.push_str(&format!("?after={after}"));
+        params.push(format!("after={after}"));
+    }
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    let mut url = join_url(base_url, "/inbox");
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
     }
     let resp = with_key(ureq::get(&url), api_key).call();
     read_json(resp)

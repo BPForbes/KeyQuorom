@@ -129,6 +129,32 @@ fn api_key_rejects_expired_and_unknown() {
 }
 
 #[test]
+fn api_key_rejects_ttl_that_sqlite_cannot_represent() {
+    let conn = relay::open_in_memory().expect("schema");
+    for ttl in [0, i64::MIN, i64::MAX] {
+        assert!(
+            matches!(
+                relay::create_api_key(
+                    &conn,
+                    &NewApiKey {
+                        scope: ApiKeyScope::Admin,
+                        recipient_fingerprint: None,
+                        label: None,
+                        ttl_seconds: Some(ttl),
+                    },
+                ),
+                Err(Error::InvalidApiKeyRequest)
+            ),
+            "ttl {ttl} must not mint a key"
+        );
+    }
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM api_keys", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(count, 0);
+}
+
+#[test]
 fn pull_key_requires_fingerprint_and_cannot_bind_push() {
     let conn = relay::open_in_memory().expect("schema");
     assert!(matches!(
@@ -169,9 +195,35 @@ fn mailbox_stores_bytes_verbatim_and_dedupes() {
     let (id2, _, dup2) = relay::store(&conn, &envelope).expect("dedupe");
     assert!(dup2);
     assert_eq!(id, id2);
-    let listed = relay::list_after(&conn, &fingerprint, None).expect("list");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].bytes, envelope);
+    let listed = relay::list_after(&conn, &fingerprint, None, None).expect("list");
+    assert_eq!(listed.envelopes.len(), 1);
+    assert_eq!(listed.envelopes[0].bytes, envelope);
+    assert!(listed.next_after.is_none());
+}
+
+#[test]
+fn mailbox_list_after_pages_and_rejects_invalid_limits() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (_sk, pk) = keys::generate_encryption_keypair();
+    let fingerprint = keys::fingerprint(&pk);
+    for payload in [b"one".as_slice(), b"two", b"three"] {
+        relay::store(&conn, &fake_kqpb(pk, payload)).expect("store");
+    }
+    let first = relay::list_after(&conn, &fingerprint, None, Some(2)).expect("page");
+    assert_eq!(first.envelopes.len(), 2);
+    let cursor = first.next_after.expect("continuation");
+    assert_eq!(cursor, first.envelopes[1].id);
+    let second = relay::list_after(&conn, &fingerprint, Some(cursor), Some(2)).expect("rest");
+    assert_eq!(second.envelopes.len(), 1);
+    assert!(second.next_after.is_none());
+    assert!(matches!(
+        relay::list_after(&conn, &fingerprint, None, Some(0)),
+        Err(Error::InvalidInboxPage)
+    ));
+    assert!(matches!(
+        relay::list_after(&conn, &fingerprint, None, Some(501)),
+        Err(Error::InvalidInboxPage)
+    ));
 }
 
 #[test]
@@ -409,7 +461,7 @@ async fn live_listener_round_trip_with_ureq() {
     let url = format!("http://{addr}");
     let accepted = relay::push_inbox(&url, &push, &envelope).expect("push");
     assert_eq!(accepted.recipient_fingerprint, fingerprint);
-    let listed = relay::pull_inbox(&url, &pull, None).expect("pull");
+    let listed = relay::pull_inbox(&url, &pull, None, None).expect("pull");
     assert_eq!(listed.envelopes.len(), 1);
     assert!(listed.trees.is_empty());
     let decoded = STANDARD.decode(&listed.envelopes[0].bytes).expect("base64");
@@ -438,7 +490,7 @@ async fn pushing_an_envelope_updates_full_tree_and_pull_returns_a_slice() {
     relay::push_inbox_with_trees(&url, &push, &envelope, std::slice::from_ref(&tree))
         .expect("push with tree");
 
-    let for_member = relay::pull_inbox(&url, &pull_s2, None).expect("member pull");
+    let for_member = relay::pull_inbox(&url, &pull_s2, None, None).expect("member pull");
     assert!(for_member.envelopes.is_empty());
     assert_eq!(for_member.trees.len(), 1);
     let labels: Vec<&str> = for_member.trees[0]
@@ -465,14 +517,14 @@ async fn pushing_an_envelope_updates_full_tree_and_pull_returns_a_slice() {
     });
     relay::push_inbox_with_trees(&url, &push, &envelope, std::slice::from_ref(&with_ma1))
         .expect("push updated tree");
-    let expanded = relay::pull_inbox(&url, &pull_s2, None).expect("expanded");
+    let expanded = relay::pull_inbox(&url, &pull_s2, None, None).expect("expanded");
     assert_eq!(expanded.trees[0].generation, 2);
     assert!(expanded.trees[0]
         .nodes
         .iter()
         .any(|node| node.label == "M.A.1"));
 
-    let mail = relay::pull_inbox(&url, &pull_mailbox, None).expect("mailbox pull");
+    let mail = relay::pull_inbox(&url, &pull_mailbox, None, None).expect("mailbox pull");
     assert_eq!(mail.envelopes.len(), 1);
     assert!(mail.trees.is_empty());
 }
@@ -629,6 +681,22 @@ fn put_public_tree_rejects_a_parent_cycle() {
 }
 
 #[test]
+fn relay_open_rejects_an_organization_database() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("org.sqlite");
+    let path_str = path.to_str().expect("utf-8");
+    crate::db::open(path_str).expect("organization store");
+    assert!(matches!(
+        relay::open(path_str),
+        Err(Error::OrganizationDatabase)
+    ));
+    let relay_path = dir.path().join("relay.sqlite");
+    let relay_str = relay_path.to_str().expect("utf-8");
+    relay::open(relay_str).expect("create relay db");
+    relay::open(relay_str).expect("reopen relay db");
+}
+
+#[test]
 fn put_public_tree_keeps_the_previous_tree_when_a_duplicate_edge_is_rejected() {
     let conn = relay::open_in_memory().expect("schema");
     let (mut tree, _) = example_org_tree(false);
@@ -642,6 +710,100 @@ fn put_public_tree_keeps_the_previous_tree_when_a_duplicate_edge_is_rejected() {
     let kept = relay::get_public_tree(&conn, "org").expect("kept");
     assert_eq!(kept.generation, 1);
     assert_eq!(kept.nodes.len(), 7);
+}
+
+#[tokio::test]
+async fn inbox_get_rejects_invalid_page_sizes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let pull = pull_key(&conn, &keys::fingerprint(&[1u8; 32]));
+    let app = relay::router(AppState::new(conn));
+    for uri in ["/inbox?limit=0", "/inbox?limit=501"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {pull}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn push_rolls_back_trees_and_envelope_when_a_later_tree_is_invalid() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, mailbox_fp) = sample_envelope();
+    let (good, s2) = example_org_tree(false);
+    let s2_fp = keys::fingerprint(&s2);
+    let push = push_key(&conn);
+    let pull_s2 = pull_key(&conn, &s2_fp);
+    let pull_mailbox = pull_key(&conn, &mailbox_fp);
+    let cyclic = PublicTree {
+        label: "other".into(),
+        generation: 1,
+        nodes: vec![
+            split_node("M", None),
+            split_node("A", Some("B")),
+            split_node("B", Some("A")),
+        ],
+        whitelist: vec![],
+        links: vec![],
+    };
+    let body = serde_json::to_vec(&relay::InboxPush {
+        bytes: STANDARD.encode(&envelope),
+        trees: vec![good, cyclic],
+    })
+    .unwrap();
+    let app = relay::router(AppState::new(conn));
+
+    let stored = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {push}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), StatusCode::BAD_REQUEST);
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/trees/org/context")
+                .header("Authorization", format!("Bearer {pull_s2}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let listed = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {pull_mailbox}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let json = body_json(listed).await;
+    assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

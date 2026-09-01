@@ -14,24 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 pub fn put_public_tree(conn: &Connection, snapshot: &PublicTree) -> Result<PublicTree> {
     validate_public_tree(snapshot)?;
-    with_immediate_transaction(conn, || persist_public_tree(conn, snapshot))
-}
-
-fn with_immediate_transaction<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    if !conn.is_autocommit() {
-        return f();
-    }
-    conn.execute("BEGIN IMMEDIATE", [])?;
-    match f() {
-        Ok(value) => {
-            conn.execute("COMMIT", [])?;
-            Ok(value)
-        }
-        Err(err) => {
-            let _ = conn.execute("ROLLBACK", []);
-            Err(err)
-        }
-    }
+    crate::db::with_immediate_transaction(conn, || persist_public_tree(conn, snapshot))
 }
 
 fn persist_public_tree(conn: &Connection, snapshot: &PublicTree) -> Result<PublicTree> {
@@ -261,5 +244,29 @@ mod persist_tests {
         assert_eq!(stored.generation, 1);
         assert_eq!(stored.nodes.len(), 3);
         assert_eq!(stored.whitelist.len(), 1);
+    }
+
+    #[test]
+    fn persist_rejects_a_disconnected_parent_cycle() {
+        let conn = crate::relay::open_in_memory().expect("schema");
+        let tree = PublicTree {
+            label: "org".into(),
+            generation: 1,
+            nodes: vec![
+                split("M", None),
+                split("A", Some("B")),
+                split("B", Some("A")),
+            ],
+            whitelist: vec![],
+            links: vec![],
+        };
+        assert!(matches!(
+            put_public_tree(&conn, &tree),
+            Err(Error::InvalidTreeSpec)
+        ));
+        assert!(matches!(
+            get_public_tree(&conn, "org"),
+            Err(Error::TreeNotFound)
+        ));
     }
 }

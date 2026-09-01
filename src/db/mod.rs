@@ -1,5 +1,4 @@
 use rusqlite::{Connection, OptionalExtension, Result};
-use std::path::Path;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -8,15 +7,12 @@ pub mod relay_credential;
 
 /// Opens (creating if needed) a KeyQuorum SQLite database at `path` and
 /// applies the schema. Safe to call repeatedly; every statement is
-/// idempotent. Newly created files are owner-only (0600) on Unix because
-/// this store can hold sealed shares and loaded relay API keys.
+/// idempotent. The file is owner-only (0600) on Unix because this store
+/// can hold sealed shares and loaded relay API keys.
 pub fn open(path: &str) -> Result<Connection> {
-    let existed = Path::new(path).exists();
     let conn = Connection::open(path)?;
     init(&conn)?;
-    if !existed {
-        restrict_owner_only(path);
-    }
+    restrict_owner_only(path);
     Ok(conn)
 }
 
@@ -34,6 +30,28 @@ fn restrict_owner_only(path: &str) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// Run `f` inside `BEGIN IMMEDIATE` so a later failure rolls back earlier
+/// writes. Nested calls (already in a transaction) just invoke `f`.
+pub(crate) fn with_immediate_transaction<T>(
+    conn: &Connection,
+    f: impl FnOnce() -> crate::error::Result<T>,
+) -> crate::error::Result<T> {
+    if !conn.is_autocommit() {
+        return f();
+    }
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    match f() {
+        Ok(value) => {
+            conn.execute("COMMIT", [])?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(err)
+        }
+    }
 }
 
 /// Opens an in-memory database with the schema applied. Intended for tests.
@@ -120,8 +138,16 @@ fn rebuild_key_nodes_if_share_required(conn: &Connection) -> Result<()> {
     if !sql.contains("wrapped_share IS NOT NULL") {
         return Ok(());
     }
+    // Copy dependent rows first. `DROP TABLE key_nodes` still cascades when
+    // foreign keys are on; the copies survive that wipe and are restored
+    // after the rebuilt table exists. TEMP tables live on this connection
+    // only, so a crashed migrate cannot leave leftover rebuild tables.
     conn.execute_batch(
-        "CREATE TABLE key_nodes_new (
+        "DROP TABLE IF EXISTS key_node_bridges_rebuild;
+         DROP TABLE IF EXISTS key_node_links_rebuild;
+         CREATE TEMP TABLE key_node_bridges_rebuild AS SELECT * FROM key_node_bridges;
+         CREATE TEMP TABLE key_node_links_rebuild AS SELECT * FROM key_node_links;
+         CREATE TABLE key_nodes_new (
             id                INTEGER PRIMARY KEY,
             key_id            INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
             parent_id         INTEGER REFERENCES key_nodes_new(id) ON DELETE CASCADE,
@@ -143,7 +169,13 @@ fn rebuild_key_nodes_if_share_required(conn: &Connection) -> Result<()> {
         ALTER TABLE key_nodes_new RENAME TO key_nodes;
         CREATE INDEX IF NOT EXISTS idx_key_nodes_parent ON key_nodes (parent_id);
         CREATE INDEX IF NOT EXISTS idx_key_nodes_key ON key_nodes (key_id);
-        CREATE INDEX IF NOT EXISTS idx_key_nodes_hardware_key ON key_nodes (hardware_key_id);",
+        CREATE INDEX IF NOT EXISTS idx_key_nodes_hardware_key ON key_nodes (hardware_key_id);
+        DELETE FROM key_node_bridges;
+        DELETE FROM key_node_links;
+        INSERT INTO key_node_bridges SELECT * FROM key_node_bridges_rebuild;
+        INSERT INTO key_node_links SELECT * FROM key_node_links_rebuild;
+        DROP TABLE key_node_bridges_rebuild;
+        DROP TABLE key_node_links_rebuild;",
     )?;
     conn.execute_batch(SCHEMA)?;
     Ok(())

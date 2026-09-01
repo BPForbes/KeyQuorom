@@ -347,3 +347,19 @@ fn relay_credential_roundtrip_seals_the_bearer() {
         .expect("scan");
     assert_eq!(plaintext, 0, "bearer must not be stored in the clear");
 }
+
+#[cfg(unix)]
+#[test]
+fn open_restricts_permissions_on_an_existing_database() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("org.sqlite");
+    let path_str = path.to_str().expect("utf-8");
+    open(path_str).expect("create");
+    let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&path, perms).expect("chmod 0644");
+    open(path_str).expect("reopen");
+    let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}

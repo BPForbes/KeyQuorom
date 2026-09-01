@@ -98,6 +98,7 @@ impl From<Error> for ApiError {
                 message: "forbidden".to_string(),
             },
             Error::InvalidApiKeyRequest
+            | Error::InvalidInboxPage
             | Error::InvalidBridgePackage
             | Error::InvalidPublicKey
             | Error::InvalidTreeSpec
@@ -157,6 +158,8 @@ struct HealthResponse {
 #[derive(Deserialize, IntoParams)]
 struct InboxQuery {
     after: Option<i64>,
+    /// Page size, 1–500. Defaults to 100 when omitted.
+    limit: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -316,10 +319,12 @@ async fn post_inbox(
     }
     let (id, fingerprint, duplicate) = with_conn(&state, move |conn| {
         api_key::authenticate(conn, &token, ApiKeyScope::InboxPush)?;
-        for tree in &trees {
-            org_tree::put_public_tree(conn, tree)?;
-        }
-        mailbox::store(conn, &envelope)
+        crate::db::with_immediate_transaction(conn, || {
+            for tree in &trees {
+                org_tree::put_public_tree(conn, tree)?;
+            }
+            mailbox::store(conn, &envelope)
+        })
     })
     .await?;
     let status = if duplicate {
@@ -367,6 +372,7 @@ fn parse_inbox_body(
     params(InboxQuery),
     responses(
         (status = 200, description = "Envelopes and public-tree slices for this pull key", body = InboxList),
+        (status = 400, description = "Invalid page size", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 403, description = "Forbidden", body = ErrorBody)
     ),
@@ -378,16 +384,18 @@ async fn get_inbox(
     Query(query): Query<InboxQuery>,
 ) -> Result<Json<InboxList>, ApiError> {
     let after = query.after;
-    let (envelopes, trees) = with_conn(&state, move |conn| {
+    let limit = query.limit;
+    let (page, trees) = with_conn(&state, move |conn| {
         let auth = api_key::authenticate(conn, &token, ApiKeyScope::InboxPull)?;
         let fingerprint = auth.recipient_fingerprint.ok_or(Error::ApiKeyScopeDenied)?;
-        let envelopes = mailbox::list_after(conn, &fingerprint, after)?;
+        let page = mailbox::list_after(conn, &fingerprint, after, limit)?;
         let trees = org_tree::slices_for_fingerprint(conn, &fingerprint)?;
-        Ok((envelopes, trees))
+        Ok((page, trees))
     })
     .await?;
     Ok(Json(InboxList {
-        envelopes: envelopes
+        envelopes: page
+            .envelopes
             .into_iter()
             .map(|item| InboxEnvelope {
                 id: item.id,
@@ -396,6 +404,7 @@ async fn get_inbox(
             })
             .collect(),
         trees,
+        next_after: page.next_after,
     }))
 }
 

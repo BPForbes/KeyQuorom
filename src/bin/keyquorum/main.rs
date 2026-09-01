@@ -629,6 +629,9 @@ enum RelayCommand {
         /// Only envelopes with id greater than this
         #[arg(long)]
         after: Option<i64>,
+        /// Page size (1–500). Default 100. Pass --after with the printed cursor for more.
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
     },
 }
 
@@ -1720,10 +1723,14 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
             url,
             api_key,
             after,
+            limit,
         } => {
             let (url, api_key) =
                 resolve_relay_auth(&conn, url, api_key, relay::ApiKeyScope::InboxPull)?;
-            let listed = relay::pull_inbox(&url, &api_key, after)?;
+            if !(1..=relay::MAX_INBOX_PAGE).contains(&limit) {
+                return Err(Error::InvalidInboxPage);
+            }
+            let listed = relay::pull_inbox(&url, &api_key, after, Some(limit))?;
             for slice in &listed.trees {
                 let applied = key_tree::apply_public_tree(&conn, None, slice)?;
                 println!(
@@ -1767,6 +1774,9 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                         item.id, summary.uid, summary.generation
                     );
                 }
+            }
+            if let Some(cursor) = listed.next_after {
+                println!("More envelopes remain; pass --after {cursor} to continue");
             }
         }
     }

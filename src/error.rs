@@ -48,6 +48,8 @@ pub enum Error {
     ApiKeyScopeDenied,
     ApiKeyNotFound,
     InvalidLicenseeKey,
+    OrganizationDatabase,
+    InvalidInboxPage,
     RelayRequest(String),
     TreeNotFound,
 }
@@ -159,6 +161,13 @@ impl fmt::Display for Error {
                     f,
                     "invalid licensee key; only the licensee can mint or rotate API keys"
                 )
+            }
+            Error::OrganizationDatabase => write!(
+                f,
+                "this SQLite file is an organization database; kq-relay needs a separate relay database"
+            ),
+            Error::InvalidInboxPage => {
+                write!(f, "inbox page size must be between 1 and 500")
             }
             Error::RelayRequest(msg) => write!(f, "relay request failed: {msg}"),
             Error::TreeNotFound => write!(f, "no published tree with that label exists"),

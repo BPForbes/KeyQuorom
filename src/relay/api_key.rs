@@ -117,6 +117,21 @@ fn normalize_fingerprint(fingerprint: &str) -> Result<String> {
     Ok(fingerprint.to_ascii_lowercase())
 }
 
+/// SQLite `datetime('now', '+N seconds')` yields NULL outside its supported
+/// range (and for some extreme `i64` modifiers). A NULL `expires_at` is
+/// treated as non-expiring, so refuse those TTLs before insert.
+fn expiry_from_ttl(conn: &Connection, ttl_seconds: i64) -> Result<String> {
+    if ttl_seconds == 0 {
+        return Err(Error::InvalidApiKeyRequest);
+    }
+    let modifier = format!("{ttl_seconds:+} seconds");
+    let expiry: Option<String> =
+        conn.query_row("SELECT datetime('now', ?1)", params![modifier], |row| {
+            row.get(0)
+        })?;
+    expiry.ok_or(Error::InvalidApiKeyRequest)
+}
+
 fn load_info(conn: &Connection, id: i64) -> Result<ApiKeyInfo> {
     conn.query_row(
         "SELECT id, scope, recipient_fingerprint, label, created_at, expires_at,
@@ -151,25 +166,21 @@ pub fn create(conn: &Connection, new: &NewApiKey) -> Result<CreatedApiKey> {
     };
 
     let (token, token_hash) = generate_bearer();
-    if let Some(ttl) = new.ttl_seconds {
-        conn.execute(
-            "INSERT INTO api_keys (key_hash, scope, recipient_fingerprint, label, expires_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now', ?5))",
-            params![
-                token_hash,
-                new.scope.as_str(),
-                fingerprint,
-                new.label,
-                format!("{ttl:+} seconds")
-            ],
-        )?;
-    } else {
-        conn.execute(
-            "INSERT INTO api_keys (key_hash, scope, recipient_fingerprint, label)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![token_hash, new.scope.as_str(), fingerprint, new.label],
-        )?;
-    }
+    let expires_at = match new.ttl_seconds {
+        Some(ttl) => Some(expiry_from_ttl(conn, ttl)?),
+        None => None,
+    };
+    conn.execute(
+        "INSERT INTO api_keys (key_hash, scope, recipient_fingerprint, label, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            token_hash,
+            new.scope.as_str(),
+            fingerprint,
+            new.label,
+            expires_at
+        ],
+    )?;
 
     let id = conn.last_insert_rowid();
     Ok(CreatedApiKey {
