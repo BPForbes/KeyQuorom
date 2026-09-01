@@ -36,7 +36,6 @@ fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>> {
         |row| row.get(0),
     )
     .optional()
-    .map_err(Into::into)
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
