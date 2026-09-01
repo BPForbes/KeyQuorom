@@ -1,7 +1,10 @@
 //! Axum router for the mailbox relay. Handlers never unseal envelopes.
 
 use super::api_key::{self, ApiKeyInfo, ApiKeyScope, CreatedApiKey, NewApiKey};
-use super::client::{ErrorBody, InboxAccepted, InboxEnvelope, InboxList, InboxPush};
+use super::client::{
+    ErrorBody, InboxAccepted, InboxEnvelope, InboxList, InboxPush, KeyCheckRequest,
+    KeyCheckResponse,
+};
 use super::mailbox;
 use super::org_tree;
 use crate::error::Error;
@@ -238,6 +241,7 @@ impl Modify for SecurityAddon {
 #[openapi(
     paths(
         health,
+        post_keycheck,
         post_inbox,
         get_inbox,
         create_key,
@@ -250,6 +254,8 @@ impl Modify for SecurityAddon {
     components(
         schemas(
             HealthResponse,
+            KeyCheckRequest,
+            KeyCheckResponse,
             InboxAccepted,
             InboxEnvelope,
             InboxList,
@@ -280,6 +286,44 @@ struct ApiDoc;
 )]
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+fn keycheck_response(check: api_key::KeyCheck) -> KeyCheckResponse {
+    KeyCheckResponse {
+        valid: check.valid,
+        id: check.id,
+        scope: check.scope,
+        label: check.label,
+        recipient_fingerprint: check.recipient_fingerprint,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/keycheck",
+    tag = "api-keys",
+    request_body = KeyCheckRequest,
+    responses(
+        (status = 200, description = "Whether the token or stored hash is live", body = KeyCheckResponse),
+        (status = 400, description = "Provide exactly one of token or key_hash", body = ErrorBody)
+    )
+)]
+async fn post_keycheck(
+    State(state): State<AppState>,
+    Json(body): Json<KeyCheckRequest>,
+) -> Result<Json<KeyCheckResponse>, ApiError> {
+    let token = body.token.filter(|s| !s.is_empty());
+    let key_hash = body.key_hash.filter(|s| !s.is_empty());
+    let check = match (token, key_hash) {
+        (Some(token), None) => {
+            with_conn(&state, move |conn| api_key::check_token(conn, &token)).await?
+        }
+        (None, Some(key_hash)) => {
+            with_conn(&state, move |conn| api_key::check_hash(conn, &key_hash)).await?
+        }
+        _ => return Err(Error::InvalidApiKeyRequest.into()),
+    };
+    Ok(Json(keycheck_response(check)))
 }
 
 #[utoipa::path(
@@ -559,6 +603,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
+        .route("/keycheck", post(post_keycheck))
         .route("/inbox", post(post_inbox).get(get_inbox))
         .route("/api-keys", post(create_key).get(list_keys))
         .route("/api-keys/{id}/rotate", post(rotate_key))

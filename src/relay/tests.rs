@@ -236,6 +236,8 @@ async fn router_health_and_openapi_are_public() {
     let json = body_json(spec).await;
     assert!(json["paths"]["/inbox"].is_object());
     assert!(json["paths"]["/api-keys"].is_object());
+    assert!(json["paths"]["/keycheck"].is_object());
+    assert!(json["paths"]["/keycheck"]["post"].get("security").is_none());
 }
 
 #[tokio::test]
@@ -775,4 +777,208 @@ async fn router_publish_and_fetch_tree_context() {
     assert!(spec_json["paths"]["/trees"].is_object());
     assert!(spec_json["paths"]["/trees/{label}/context"].is_object());
     assert!(spec_json["components"]["schemas"]["InboxList"]["properties"]["trees"].is_object());
+}
+
+#[test]
+fn keycheck_accepts_live_token_and_hash_without_stamping_use() {
+    let conn = relay::open_in_memory().expect("schema");
+    let created = relay::create_api_key(
+        &conn,
+        &NewApiKey {
+            scope: ApiKeyScope::InboxPush,
+            recipient_fingerprint: None,
+            label: Some("ops".into()),
+            ttl_seconds: None,
+        },
+    )
+    .expect("create");
+    let check = relay::check_token(&conn, &created.token).expect("token");
+    assert!(check.valid);
+    assert_eq!(check.scope.as_deref(), Some("inbox.push"));
+    assert_eq!(check.label.as_deref(), Some("ops"));
+    let hash = relay::hash_bearer(&created.token).expect("hash");
+    let by_hash = relay::check_hash(&conn, &hash).expect("hash");
+    assert_eq!(by_hash, check);
+    let last_used: Option<String> = conn
+        .query_row(
+            "SELECT last_used_at FROM api_keys WHERE id = ?1",
+            rusqlite::params![created.info.id],
+            |row| row.get(0),
+        )
+        .expect("last_used");
+    assert!(last_used.is_none());
+    assert!(
+        !relay::check_token(&conn, "kq_notarealtokenvalue0123456789ABCD")
+            .expect("junk")
+            .valid
+    );
+}
+
+#[test]
+fn keycheck_treats_expired_and_revoked_as_invalid() {
+    let conn = relay::open_in_memory().expect("schema");
+    let expired = relay::create_api_key(
+        &conn,
+        &NewApiKey {
+            scope: ApiKeyScope::Admin,
+            recipient_fingerprint: None,
+            label: None,
+            ttl_seconds: Some(-1),
+        },
+    )
+    .expect("expired");
+    assert!(
+        !relay::check_token(&conn, &expired.token)
+            .expect("check expired")
+            .valid
+    );
+
+    let live = relay::create_api_key(
+        &conn,
+        &NewApiKey {
+            scope: ApiKeyScope::Admin,
+            recipient_fingerprint: None,
+            label: Some("keep".into()),
+            ttl_seconds: None,
+        },
+    )
+    .expect("live");
+    relay::revoke_api_key(&conn, live.info.id).expect("revoke");
+    assert!(
+        !relay::check_token(&conn, &live.token)
+            .expect("check revoked")
+            .valid
+    );
+}
+
+#[tokio::test]
+async fn keycheck_route_is_public() {
+    let conn = relay::open_in_memory().expect("schema");
+    let created = relay::create_api_key(
+        &conn,
+        &NewApiKey {
+            scope: ApiKeyScope::InboxPush,
+            recipient_fingerprint: None,
+            label: Some("ops".into()),
+            ttl_seconds: None,
+        },
+    )
+    .expect("create");
+    let hash = relay::hash_bearer(&created.token).expect("hash");
+    let app = relay::router(AppState::new(conn));
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/keycheck")
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/keycheck")
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"token":"{}"}}"#, created.token)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let json = body_json(ok).await;
+    assert_eq!(json["valid"], true);
+    assert_eq!(json["scope"], "inbox.push");
+
+    let by_hash = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/keycheck")
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"key_hash":"{hash}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_hash.status(), StatusCode::OK);
+    assert_eq!(body_json(by_hash).await["valid"], true);
+
+    let unknown = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/keycheck")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"token":"kq_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::OK);
+    assert_eq!(body_json(unknown).await["valid"], false);
+}
+
+#[tokio::test]
+async fn check_key_client_and_stored_hash_can_push() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, _fp) = sample_envelope();
+    let token = push_key(&conn);
+    let app = relay::router(AppState::new(conn));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let token_c = token.clone();
+    let base_c = base.clone();
+    let check = tokio::task::spawn_blocking(move || relay::check_key(&base_c, &token_c))
+        .await
+        .unwrap()
+        .expect("check_key");
+    assert!(check.valid);
+    let hash = relay::hash_bearer(&token).expect("hash");
+    let org = crate::db::open_in_memory().expect("org");
+    crate::db::relay_credential::save(
+        &org,
+        &crate::db::relay_credential::StoredRelayKey {
+            relay_url: base.clone(),
+            scope: check.scope.clone().expect("scope"),
+            key_hash: hash.clone(),
+            token: token.clone(),
+            remote_id: check.id,
+            label: check.label.clone(),
+        },
+    )
+    .expect("save");
+    let base_h = base.clone();
+    let hash_c = hash.clone();
+    let recheck = tokio::task::spawn_blocking(move || relay::check_key_hash(&base_h, &hash_c))
+        .await
+        .unwrap()
+        .expect("check_key_hash");
+    assert!(recheck.valid);
+    let stored = crate::db::relay_credential::get(&org, &base, "inbox.push")
+        .expect("get")
+        .expect("row");
+    let env = envelope.clone();
+    let base_p = base.clone();
+    let tok = stored.token.clone();
+    let accepted = tokio::task::spawn_blocking(move || relay::push_inbox(&base_p, &tok, &env))
+        .await
+        .unwrap()
+        .expect("push");
+    assert!(accepted.id > 0);
 }

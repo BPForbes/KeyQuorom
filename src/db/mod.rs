@@ -1,15 +1,39 @@
 use rusqlite::{Connection, OptionalExtension, Result};
+use std::path::Path;
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("schema.sql");
 
+pub mod relay_credential;
+
 /// Opens (creating if needed) a KeyQuorum SQLite database at `path` and
 /// applies the schema. Safe to call repeatedly; every statement is
-/// idempotent.
+/// idempotent. Newly created files are owner-only (0600) on Unix because
+/// this store can hold sealed shares and loaded relay API keys.
 pub fn open(path: &str) -> Result<Connection> {
+    let existed = Path::new(path).exists();
     let conn = Connection::open(path)?;
     init(&conn)?;
+    if !existed {
+        restrict_owner_only(path);
+    }
     Ok(conn)
+}
+
+fn restrict_owner_only(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.is_file() {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Opens an in-memory database with the schema applied. Intended for tests.

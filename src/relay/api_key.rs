@@ -10,6 +10,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 const TOKEN_LEN: usize = 32;
 const TOKEN_PREFIX: &str = "kq_";
@@ -74,14 +75,17 @@ pub struct AuthedKey {
 }
 
 fn generate_bearer() -> (String, String) {
-    let mut raw = [0u8; TOKEN_LEN];
-    OsRng.fill_bytes(&mut raw);
-    let token = format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(raw));
-    let token_hash = hex::encode(Sha256::digest(raw));
+    let mut raw = Zeroizing::new([0u8; TOKEN_LEN]);
+    OsRng.fill_bytes(&mut *raw);
+    let token = format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(*raw));
+    let token_hash = hex::encode(Sha256::digest(*raw));
     (token, token_hash)
 }
 
-fn hash_bearer(token: &str) -> Result<String> {
+/// SHA-256 of the 32 raw bearer bytes, as lowercase hex. The relay and
+/// personal stores both persist this hash rather than treating it as a
+/// login secret on its own.
+pub fn hash_bearer(token: &str) -> Result<String> {
     let rest = token
         .strip_prefix(TOKEN_PREFIX)
         .ok_or(Error::InvalidApiKey)?;
@@ -274,6 +278,80 @@ pub fn authenticate(conn: &Connection, token: &str, required: ApiKeyScope) -> Re
     } else {
         Err(Error::InvalidApiKey)
     }
+}
+
+/// Result of `POST /keycheck`: whether a token or stored hash is live.
+/// Does not distinguish unknown / expired / revoked, and does not stamp
+/// `last_used_at` — this is not an authenticated session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyCheck {
+    pub valid: bool,
+    pub id: Option<i64>,
+    pub scope: Option<String>,
+    pub label: Option<String>,
+    pub recipient_fingerprint: Option<String>,
+}
+
+impl KeyCheck {
+    fn invalid() -> Self {
+        Self {
+            valid: false,
+            id: None,
+            scope: None,
+            label: None,
+            recipient_fingerprint: None,
+        }
+    }
+}
+
+/// Looks up a bearer without requiring a scope and without recording use.
+pub fn check_token(conn: &Connection, token: &str) -> Result<KeyCheck> {
+    match hash_bearer(token) {
+        Ok(hash) => check_hash(conn, &hash),
+        Err(_) => Ok(KeyCheck::invalid()),
+    }
+}
+
+/// Looks up `hex(SHA-256(raw))` the same way the personal store revalidates
+/// a previously loaded key.
+pub fn check_hash(conn: &Connection, key_hash: &str) -> Result<KeyCheck> {
+    if key_hash.len() != 64 || !key_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(KeyCheck::invalid());
+    }
+    let key_hash = key_hash.to_ascii_lowercase();
+    let row: Option<(i64, String, Option<String>, Option<String>, bool, bool)> = conn
+        .query_row(
+            "SELECT id, scope, label, recipient_fingerprint,
+                    revoked_at IS NOT NULL,
+                    expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')
+             FROM api_keys WHERE key_hash = ?1",
+            params![key_hash],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((id, scope, label, fingerprint, revoked, expired)) = row else {
+        return Ok(KeyCheck::invalid());
+    };
+    if revoked || expired {
+        return Ok(KeyCheck::invalid());
+    }
+    Ok(KeyCheck {
+        valid: true,
+        id: Some(id),
+        scope: Some(scope),
+        label,
+        recipient_fingerprint: fingerprint,
+    })
 }
 
 /// Mints a one-time admin bearer when the table is empty.

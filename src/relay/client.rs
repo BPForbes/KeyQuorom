@@ -45,6 +45,32 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+/// Body for the unauthenticated `POST /keycheck` route.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct KeyCheckRequest {
+    /// Raw `kq_…` bearer. Used by `loadkey` and `--api-key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// `hex(SHA-256(raw))` stored on the personal instance after a valid load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_hash: Option<String>,
+}
+
+/// Whether the key is live on the service. Invalid keys are not distinguished
+/// (unknown, expired, and revoked all return `valid: false`).
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct KeyCheckResponse {
+    pub valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_fingerprint: Option<String>,
+}
+
 fn join_url(base: &str, path: &str) -> String {
     format!("{}{path}", base.trim_end_matches('/'))
 }
@@ -104,6 +130,36 @@ pub fn pull(base_url: &str, api_key: &str, after: Option<i64>) -> Result<InboxLi
         url.push_str(&format!("?after={after}"));
     }
     let resp = with_key(ureq::get(&url), api_key).call();
+    read_json(resp)
+}
+
+/// Ask the relay whether a bearer is live. No `Authorization` header.
+pub fn check_key(base_url: &str, token: &str) -> Result<KeyCheckResponse> {
+    post_keycheck(
+        base_url,
+        &KeyCheckRequest {
+            token: Some(token.to_string()),
+            key_hash: None,
+        },
+    )
+}
+
+/// Revalidate a hash stored on the personal instance. No `Authorization` header.
+pub fn check_key_hash(base_url: &str, key_hash: &str) -> Result<KeyCheckResponse> {
+    post_keycheck(
+        base_url,
+        &KeyCheckRequest {
+            token: None,
+            key_hash: Some(key_hash.to_string()),
+        },
+    )
+}
+
+fn post_keycheck(base_url: &str, body: &KeyCheckRequest) -> Result<KeyCheckResponse> {
+    let json = serde_json::to_string(body).map_err(|e| Error::RelayRequest(e.to_string()))?;
+    let resp = ureq::post(&join_url(base_url, "/keycheck"))
+        .set("Content-Type", "application/json")
+        .send_string(&json);
     read_json(resp)
 }
 

@@ -271,3 +271,22 @@ CREATE TABLE IF NOT EXISTS bridge_events (
 
 CREATE INDEX IF NOT EXISTS idx_private_bridges_key ON private_bridges (key_id);
 CREATE INDEX IF NOT EXISTS idx_bridge_events_bridge ON bridge_events (bridge_id);
+
+-- Relay API key loaded via `keyquorum loadkey` (or first `--api-key` use).
+-- The service stores only `hex(SHA-256(raw))`. This personal DB stores that
+-- same hash for `POST /keycheck` revalidation, plus the bearer (needed to
+-- call authenticated routes) sealed with a random AES-256-GCM wrapping key
+-- kept in this owner-only file. Never commit this database.
+CREATE TABLE IF NOT EXISTS relay_credentials (
+    relay_url       TEXT NOT NULL,
+    scope           TEXT NOT NULL CHECK (scope IN ('inbox.push', 'inbox.pull', 'admin')),
+    key_hash        TEXT NOT NULL,
+    wrap_key        BLOB NOT NULL,
+    wrap_nonce      BLOB NOT NULL,
+    wrapped_token   BLOB NOT NULL,
+    remote_id       INTEGER,
+    label           TEXT,
+    stored_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_checked_at TEXT,
+    PRIMARY KEY (relay_url, scope)
+);

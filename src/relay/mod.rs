@@ -13,13 +13,14 @@ mod org_tree;
 mod server;
 
 pub use api_key::{
-    authenticate, bootstrap_admin_if_empty, create as create_api_key, list as list_api_keys,
-    revoke as revoke_api_key, rotate as rotate_api_key, ApiKeyInfo, ApiKeyScope, AuthedKey,
-    CreatedApiKey, NewApiKey,
+    authenticate, bootstrap_admin_if_empty, check_hash, check_token, create as create_api_key,
+    hash_bearer, list as list_api_keys, revoke as revoke_api_key, rotate as rotate_api_key,
+    ApiKeyInfo, ApiKeyScope, AuthedKey, CreatedApiKey, KeyCheck, NewApiKey,
 };
 pub use client::{
-    fetch_tree_context, publish_tree, pull as pull_inbox, push as push_inbox,
-    push_with_trees as push_inbox_with_trees, InboxAccepted, InboxEnvelope, InboxList, InboxPush,
+    check_key, check_key_hash, fetch_tree_context, publish_tree, pull as pull_inbox,
+    push as push_inbox, push_with_trees as push_inbox_with_trees, InboxAccepted, InboxEnvelope,
+    InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
 };
 pub use mailbox::{list_after, store, StoredEnvelope};
 pub use org_tree::{
