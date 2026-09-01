@@ -1,8 +1,8 @@
 -- Server-only mailbox + public-tree database. Never store wrapped shares
 -- or private key material here. Envelopes are opaque blobs indexed by the
 -- recipient encryption-key fingerprint from the outer .kqpb header. The
--- org_* tables hold the canonical *public* split-tree topology so each
--- personal store can fetch only the slice that person needs.
+-- org_* tables hold the canonical *public* split-tree topology. Inbox pull
+-- returns the visibility slice for that pull key's fingerprint.
 
 CREATE TABLE IF NOT EXISTS api_keys (
     id                      INTEGER PRIMARY KEY,

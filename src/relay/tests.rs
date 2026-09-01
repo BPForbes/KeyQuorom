@@ -326,6 +326,7 @@ async fn router_enforces_scopes_and_returns_opaque_bytes() {
     assert_eq!(empty.status(), StatusCode::OK);
     let empty_json = body_json(empty).await;
     assert_eq!(empty_json["envelopes"].as_array().unwrap().len(), 0);
+    assert_eq!(empty_json["trees"].as_array().unwrap().len(), 0);
 
     let unauth = app
         .clone()
@@ -375,6 +376,7 @@ async fn live_listener_round_trip_with_ureq() {
     assert_eq!(accepted.recipient_fingerprint, fingerprint);
     let listed = relay::pull_inbox(&url, &pull, None).expect("pull");
     assert_eq!(listed.envelopes.len(), 1);
+    assert!(listed.trees.is_empty());
     let decoded = STANDARD.decode(&listed.envelopes[0].bytes).expect("base64");
     assert_eq!(decoded, envelope);
 }
@@ -497,6 +499,9 @@ fn org_tree_put_and_context_omits_unrelated_peer_sibling() {
         relay::context_for_fingerprint(&conn, "org", "deadbeef"),
         Err(Error::NodeNotFound)
     ));
+    assert!(relay::contexts_for_fingerprint(&conn, "deadbeef")
+        .expect("unknown fp")
+        .is_empty());
     assert!(matches!(
         relay::get_public_tree(&conn, "missing"),
         Err(Error::TreeNotFound)
@@ -582,6 +587,80 @@ async fn router_publish_and_fetch_tree_context() {
     assert!(labels.contains(&"M.A.2"));
     assert!(!labels.contains(&"M.A.1"));
 
+    let inbox = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {pull}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let inbox_json = body_json(inbox).await;
+    assert_eq!(inbox_json["envelopes"].as_array().unwrap().len(), 0);
+    let inbox_labels: Vec<&str> = inbox_json["trees"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["label"].as_str().unwrap())
+        .collect();
+    assert!(inbox_labels.contains(&"M.A.2"));
+    assert!(!inbox_labels.contains(&"M.A.1"));
+
+    let mut with_ma1 = tree.clone();
+    with_ma1.links.push(PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.A.1".into(),
+    });
+    with_ma1.whitelist.push(PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.A.1".into(),
+    });
+    with_ma1.whitelist.push(PublicEdge {
+        from: "M.A.1".into(),
+        to: "M.S.2".into(),
+    });
+    let republished = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/trees")
+                .header("Authorization", format!("Bearer {admin}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&with_ma1).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(republished.status(), StatusCode::OK);
+
+    let expanded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {pull}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expanded.status(), StatusCode::OK);
+    let expanded_json = body_json(expanded).await;
+    let expanded_labels: Vec<&str> = expanded_json["trees"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["label"].as_str().unwrap())
+        .collect();
+    assert!(expanded_labels.contains(&"M.A.1"));
+
     let spec = app
         .oneshot(
             Request::builder()
@@ -594,4 +673,5 @@ async fn router_publish_and_fetch_tree_context() {
     let spec_json = body_json(spec).await;
     assert!(spec_json["paths"]["/trees"].is_object());
     assert!(spec_json["paths"]["/trees/{label}/context"].is_object());
+    assert!(spec_json["components"]["schemas"]["InboxList"]["properties"]["trees"].is_object());
 }

@@ -181,7 +181,7 @@ enum Command {
         register: bool,
     },
     /// Print live split trees, one tree, the LCA of --node labels, write
-    /// the live spec JSON, or publish/fetch/project a public slice
+    /// the live spec JSON, or publish/fetch a public slice
     Tree(TreeArgs),
     /// Reconstruct a key's secret from raw shares
     Reconstruct {
@@ -322,7 +322,9 @@ enum TreeCommand {
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Download the slice this pull key is allowed to see and merge it here
+    /// Download the slice this pull key is allowed to see and merge it here.
+    /// Inbox pull also applies this slice automatically; use fetch to refresh
+    /// topology without downloading envelopes.
     Fetch {
         /// Local key id to update. Default: match the published tree label.
         key_id: Option<i64>,
@@ -335,12 +337,6 @@ enum TreeCommand {
         /// Pull-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
         #[arg(long)]
         api_key: Option<String>,
-    },
-    /// Drop local nodes this viewpoint does not need (no network)
-    Project {
-        key_id: i64,
-        #[arg(long)]
-        as_node: String,
     },
 }
 
@@ -604,7 +600,7 @@ enum RelayCommand {
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Download envelopes for this device's pull-scope API key
+    /// Download envelopes and the visible public-tree slice for this pull key
     Pull {
         /// Import each envelope into --db using --share-file
         #[arg(long, requires = "share_file")]
@@ -1056,12 +1052,6 @@ fn run_tree(conn: &Connection, args: TreeArgs) -> Result<()> {
                 slice.generation,
                 slice.nodes.len()
             );
-        }
-        Some(TreeCommand::Project { key_id, as_node }) => {
-            let visible = key_tree::project_local(conn, key_id, &as_node)?;
-            let mut labels: Vec<_> = visible.into_iter().collect();
-            labels.sort();
-            println!("Projected key {key_id} as {as_node}: {}", labels.join(", "));
         }
         None => match args.key_id {
             None => {
@@ -1602,17 +1592,24 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
             let url = relay_url(url)?;
             let api_key = relay_api_key(api_key)?;
             let listed = relay::pull_inbox(&url, &api_key, after)?;
+            let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
+            let mut conn = db::open(db_path_str)?;
+            for slice in &listed.trees {
+                let applied = key_tree::apply_public_tree(&conn, None, slice)?;
+                println!(
+                    "Merged {} (generation {}, {} nodes) into key {applied}",
+                    slice.label,
+                    slice.generation,
+                    slice.nodes.len()
+                );
+            }
             if listed.envelopes.is_empty() {
-                println!("(no envelopes)");
+                if listed.trees.is_empty() {
+                    println!("(no envelopes)");
+                }
                 return Ok(());
             }
 
-            let mut conn = if import {
-                let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
-                Some(db::open(db_path_str)?)
-            } else {
-                None
-            };
             let share_sk = if import {
                 let path = share_file.as_ref().ok_or(Error::InvalidPath)?;
                 Some(zeroize::Zeroizing::new(read_key_array_32(Path::new(path))?))
@@ -1633,8 +1630,8 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     locked_files::write_owner_only(&path, &bytes)?;
                     println!("Wrote {}", path.display());
                 }
-                if let (Some(conn), Some(sk)) = (conn.as_mut(), share_sk.as_ref()) {
-                    let summary = private_bridge::import_package(conn, &bytes, sk)?;
+                if let Some(sk) = share_sk.as_ref() {
+                    let summary = private_bridge::import_package(&mut conn, &bytes, sk)?;
                     println!(
                         "Imported envelope {} as private bridge {} gen {}",
                         item.id, summary.uid, summary.generation

@@ -2,8 +2,8 @@
 //!
 //! This is labels, thresholds, encryption fingerprints/public keys,
 //! whitelist, and established links only. Sealed shares and private keys
-//! never belong here. Each personal store later fetches a slice of this
-//! tree: own lineage, siblings, descendants, and the fixpoint of
+//! never belong here. Inbox pull automatically returns the slice this
+//! person needs: own lineage, siblings, descendants, and the fixpoint of
 //! established bridge peers.
 
 use crate::error::{Error, Result};
@@ -109,6 +109,27 @@ pub fn context_for_fingerprint(
     }
     let visible = visible_labels_in_public_tree(&full, &seeds);
     Ok(filter_public_tree(&full, &visible))
+}
+
+/// Every published tree this fingerprint appears in, already sliced.
+/// Unknown fingerprints yield an empty list so inbox pull still succeeds.
+pub fn contexts_for_fingerprint(conn: &Connection, fingerprint: &str) -> Result<Vec<PublicTree>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT t.label
+         FROM org_trees t
+         JOIN org_nodes n ON n.tree_id = t.id
+         WHERE n.encryption_fingerprint = ?1
+         ORDER BY t.id",
+    )?;
+    let labels: Vec<String> = stmt
+        .query_map(params![fingerprint], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let mut out = Vec::with_capacity(labels.len());
+    for label in labels {
+        out.push(context_for_fingerprint(conn, &label, fingerprint)?);
+    }
+    Ok(out)
 }
 
 fn load_public_tree(

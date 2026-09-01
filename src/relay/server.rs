@@ -330,7 +330,7 @@ async fn post_inbox(
     tag = "inbox",
     params(InboxQuery),
     responses(
-        (status = 200, description = "Envelopes for this pull key", body = InboxList),
+        (status = 200, description = "Envelopes and visible public-tree slices for this pull key", body = InboxList),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 403, description = "Forbidden", body = ErrorBody)
     ),
@@ -342,10 +342,12 @@ async fn get_inbox(
     Query(query): Query<InboxQuery>,
 ) -> Result<Json<InboxList>, ApiError> {
     let after = query.after;
-    let envelopes = with_conn(&state, move |conn| {
+    let (envelopes, trees) = with_conn(&state, move |conn| {
         let auth = api_key::authenticate(conn, &token, ApiKeyScope::InboxPull)?;
         let fingerprint = auth.recipient_fingerprint.ok_or(Error::ApiKeyScopeDenied)?;
-        mailbox::list_after(conn, &fingerprint, after)
+        let envelopes = mailbox::list_after(conn, &fingerprint, after)?;
+        let trees = org_tree::contexts_for_fingerprint(conn, &fingerprint)?;
+        Ok((envelopes, trees))
     })
     .await?;
     Ok(Json(InboxList {
@@ -357,6 +359,7 @@ async fn get_inbox(
                 bytes: STANDARD.encode(&item.bytes),
             })
             .collect(),
+        trees,
     }))
 }
 

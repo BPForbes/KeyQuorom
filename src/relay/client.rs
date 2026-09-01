@@ -22,6 +22,11 @@ pub struct InboxEnvelope {
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct InboxList {
     pub envelopes: Vec<InboxEnvelope>,
+    /// Visible public-tree slices for this pull key's fingerprint.
+    /// The relay computes these from the canonical topology; the client
+    /// does not project locally. Empty when nothing is published yet.
+    #[serde(default)]
+    pub trees: Vec<PublicTree>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]

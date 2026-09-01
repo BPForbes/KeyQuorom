@@ -2,9 +2,9 @@
 //! *public* split-tree topology.
 //!
 //! The relay never unseals envelopes and never holds wrapped shares or
-//! private keys. It may store public labels, encryption fingerprints,
-//! public keys, whitelist, and established links so a personal store can
-//! fetch only the slice that person needs.
+//! private keys. It stores public labels, encryption fingerprints,
+//! public keys, whitelist, and established links, and inbox pull
+//! automatically includes the visibility slice for that pull key.
 
 mod api_key;
 mod client;
@@ -22,7 +22,9 @@ pub use client::{
     InboxEnvelope, InboxList,
 };
 pub use mailbox::{list_after, store, StoredEnvelope};
-pub use org_tree::{context_for_fingerprint, get_public_tree, put_public_tree};
+pub use org_tree::{
+    context_for_fingerprint, contexts_for_fingerprint, get_public_tree, put_public_tree,
+};
 pub use server::{router, AppState, MAX_ENVELOPE_BYTES};
 
 use crate::error::Result;

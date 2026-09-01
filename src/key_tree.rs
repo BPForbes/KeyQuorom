@@ -1291,7 +1291,7 @@ pub fn export_public_tree(conn: &Connection, key_id: i64) -> Result<PublicTree> 
 /// Labels this person needs locally: own lineage, own descendants,
 /// siblings of the seed, and the fixpoint of established bridge peers
 /// (peer + peer ancestors). A peer's unrelated siblings stay out until
-/// a later fetch after a bridge reaches them. Whitelist-only pairs do
+/// a later pull after a bridge reaches them. Whitelist-only pairs do
 /// not expand visibility.
 pub fn visible_labels(conn: &Connection, key_id: i64, as_label: &str) -> Result<HashSet<String>> {
     let tree = KeyQuorumTree::load(conn, key_id)?;

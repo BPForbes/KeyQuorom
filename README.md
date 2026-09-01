@@ -127,25 +127,25 @@ keyquorum bridge deny 1 --node alice --peer it
 tear down an established pairing (add requires a whitelist hit on either
 side; deny also drops any pairing).
 
-Publish the public topology (no sealed shares) to the relay, then each
-person fetches the slice their pull-key fingerprint is allowed to see.
-`tree project` prunes a local store without talking to the network:
+Publish the public topology (no sealed shares) to the relay. The relay
+computes each person's visibility slice (seed + ancestors + descendants +
+siblings, then the fixpoint of established links) and returns it on
+inbox pull. `tree fetch` refreshes topology without downloading envelopes.
 
 ```sh
 # Operator / publisher: full public tree → relay (admin API key)
 keyquorum tree publish <key-id>
 
-# Person: merge the slice for this device's pull-key fingerprint
-keyquorum tree fetch <key-id>
-# first fetch onto an empty store:
-keyquorum tree fetch --label master
+# Person: envelopes plus the slice this pull key is allowed to see
+keyquorum --db alice.sqlite relay pull --import --share-file alice.key
 
-# Offline: drop nodes this viewpoint does not need
-keyquorum tree project <key-id> --as-node M.S.2
+# Topology only (no envelopes), including first fetch onto an empty store:
+keyquorum tree fetch <key-id>
+keyquorum tree fetch --label master
 ```
 
 If a later publish adds a bridge that reaches a previously omitted node
-(for example `M.S.2 <-> M.A.1`), the next fetch expands that person's
+(for example `M.S.2 <-> M.A.1`), the next pull expands that person's
 local tree to include it.
 
 ### Private sign bridges (per-person stores)
@@ -348,9 +348,10 @@ keyquorum relay push --dir ./bridge-packages --api-key "$PUSH_KEY"
 keyquorum relay pull --output-dir ./inbox --api-key "$PULL_KEY"
 keyquorum --db alice.sqlite relay pull --import --share-file alice.key --api-key "$PULL_KEY"
 
-# Public tree: admin publishes, each pull key fetches its slice.
+# Public tree: admin publishes once; each pull key's inbox response
+# already includes that person's slice. `tree fetch` is topology-only.
 keyquorum tree publish 1 --api-key "$ADMIN_KEY"
-keyquorum --db alice.sqlite tree fetch 1 --api-key "$PULL_KEY"
+keyquorum --db alice.sqlite relay pull --import --share-file alice.key --api-key "$PULL_KEY"
 ```
 
 Lost or compromised API keys: mint a replacement (`keys rotate` or
@@ -380,7 +381,7 @@ These still need a private-key custody model (a software file, OS keychain, or r
 
 This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, API key bearers, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded.
 
-The mailbox relay cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It may store the canonical *public* tree (labels, fingerprints, public keys, policy). Store only hashed API keys in the relay SQLite file. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key. A personal store that is missing a newly bridged node should `tree fetch` after the operator republishes.
+The mailbox relay cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It may store the canonical *public* tree (labels, fingerprints, public keys, policy). Store only hashed API keys in the relay SQLite file. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key. A personal store that is missing a newly bridged node picks it up on the next `relay pull` (or `tree fetch`) after the operator republishes.
 
 ## Contributing
 

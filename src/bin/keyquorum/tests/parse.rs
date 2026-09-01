@@ -262,9 +262,8 @@ fn top_level_tree_and_bridge_parse() {
     assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch", "--label", "master"]).is_ok());
     assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch"]).is_err());
     assert!(
-        Cli::try_parse_from(["keyquorum", "tree", "project", "1", "--as-node", "M.S.2",]).is_ok()
+        Cli::try_parse_from(["keyquorum", "tree", "project", "1", "--as-node", "M.S.2"]).is_err()
     );
-    assert!(Cli::try_parse_from(["keyquorum", "tree", "project", "1"]).is_err());
     assert!(Cli::try_parse_from([
         "keyquorum",
         "generate",
