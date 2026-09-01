@@ -11,7 +11,7 @@ fn schema_applies_cleanly() {
             |row| row.get(0),
         )
         .expect("query should succeed");
-    assert_eq!(table_count, 16);
+    assert_eq!(table_count, 17);
 }
 
 #[test]
@@ -317,4 +317,33 @@ fn files_key_id_referencing_an_existing_key_is_allowed() {
         [],
     );
     assert!(result.is_ok());
+}
+
+#[test]
+fn relay_credential_roundtrip_seals_the_bearer() {
+    let conn = open_in_memory().expect("schema");
+    let stored = relay_credential::StoredRelayKey {
+        relay_url: "http://127.0.0.1:8787/".into(),
+        scope: "inbox.pull".into(),
+        key_hash: "a".repeat(64),
+        token: "kq_test-bearer".into(),
+        remote_id: Some(7),
+        label: Some("alice".into()),
+    };
+    relay_credential::save(&conn, &stored).expect("save");
+    let loaded = relay_credential::get(&conn, "http://127.0.0.1:8787", "inbox.pull")
+        .expect("get")
+        .expect("row");
+    assert_eq!(loaded.token, "kq_test-bearer");
+    assert_eq!(loaded.key_hash, stored.key_hash);
+    assert_eq!(loaded.relay_url, "http://127.0.0.1:8787");
+    assert_eq!(loaded.remote_id, Some(7));
+    let plaintext: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM relay_credentials WHERE wrapped_token = ?1",
+            rusqlite::params![b"kq_test-bearer".as_slice()],
+            |row| row.get(0),
+        )
+        .expect("scan");
+    assert_eq!(plaintext, 0, "bearer must not be stored in the clear");
 }

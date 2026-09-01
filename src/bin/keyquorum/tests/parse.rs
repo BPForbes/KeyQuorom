@@ -387,3 +387,16 @@ fn relay_push_with_dir_parses() {
     ])
     .is_ok());
 }
+
+#[test]
+fn loadkey_parses_with_and_without_positional_key() {
+    assert!(Cli::try_parse_from(["keyquorum", "loadkey"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "loadkey",
+        "kq_example",
+        "--url",
+        "http://127.0.0.1:8787",
+    ])
+    .is_ok());
+}

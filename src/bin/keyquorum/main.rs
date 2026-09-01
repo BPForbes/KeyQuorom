@@ -262,6 +262,16 @@ enum Command {
         #[command(subcommand)]
         command: RelayCommand,
     },
+    /// Check a relay API key with POST /keycheck and store it on this instance.
+    /// Later relay commands reuse it after a hash re-check; prefer omitting
+    /// the key so it is prompted (stays out of shell history).
+    Loadkey {
+        /// Raw `kq_…` bearer. Prompted if omitted.
+        api_key: Option<String>,
+        /// Relay base URL (or KEYQUORUM_RELAY_URL)
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -318,7 +328,7 @@ enum TreeCommand {
         /// Relay base URL (or KEYQUORUM_RELAY_URL)
         #[arg(long)]
         url: Option<String>,
-        /// Admin-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
+        /// Admin-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
         #[arg(long)]
         api_key: Option<String>,
     },
@@ -334,7 +344,7 @@ enum TreeCommand {
         /// Relay base URL (or KEYQUORUM_RELAY_URL)
         #[arg(long)]
         url: Option<String>,
-        /// Pull-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
+        /// Pull-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
         #[arg(long)]
         api_key: Option<String>,
     },
@@ -597,7 +607,7 @@ enum RelayCommand {
         /// Relay base URL (or KEYQUORUM_RELAY_URL)
         #[arg(long)]
         url: Option<String>,
-        /// Push-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
+        /// Push-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
         #[arg(long)]
         api_key: Option<String>,
     },
@@ -667,8 +677,10 @@ fn main() -> ExitCode {
 }
 
 fn run(db_path: &Path, command: Command) -> Result<()> {
-    if let Command::Relay { command } = command {
-        return run_relay(db_path, command);
+    match command {
+        Command::Relay { command } => return run_relay(db_path, command),
+        Command::Loadkey { api_key, url } => return run_loadkey(db_path, api_key, url),
+        _ => {}
     }
 
     let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
@@ -741,7 +753,7 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         Command::Export { command } => run_export(&conn, command)?,
         Command::Share { command } => run_share(&conn, command)?,
         Command::Pin { command } => run_pin(&conn, command)?,
-        Command::Relay { .. } => {
+        Command::Relay { .. } | Command::Loadkey { .. } => {
             unreachable!("relay commands are handled before opening the org db")
         }
     }
@@ -1007,7 +1019,8 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
         | Command::Export { .. }
         | Command::Share { .. }
         | Command::Pin { .. }
-        | Command::Relay { .. } => unreachable!("non-tree commands are dispatched in run()"),
+        | Command::Relay { .. }
+        | Command::Loadkey { .. } => unreachable!("non-tree commands are dispatched in run()"),
     }
     Ok(())
 }
@@ -1020,8 +1033,7 @@ fn run_tree(conn: &Connection, args: TreeArgs) -> Result<()> {
             api_key,
         }) => {
             let snapshot = key_tree::export_public_tree(conn, key_id)?;
-            let url = relay_url(url)?;
-            let api_key = relay_api_key(api_key)?;
+            let (url, api_key) = resolve_relay_auth(conn, url, api_key, relay::ApiKeyScope::Admin)?;
             let stored = relay::publish_tree(&url, &api_key, &snapshot)?;
             println!(
                 "Published {} (generation {}, {} nodes)",
@@ -1043,8 +1055,8 @@ fn run_tree(conn: &Connection, args: TreeArgs) -> Result<()> {
                     fatal_usage_error("tree fetch requires a key id or --label");
                 }
             };
-            let url = relay_url(url)?;
-            let api_key = relay_api_key(api_key)?;
+            let (url, api_key) =
+                resolve_relay_auth(conn, url, api_key, relay::ApiKeyScope::InboxPull)?;
             let slice = relay::fetch_tree_context(&url, &api_key, &label)?;
             let applied = key_tree::apply_public_tree(conn, key_id, &slice)?;
             println!(
@@ -1530,34 +1542,141 @@ fn run_export(conn: &Connection, command: ExportCommand) -> Result<()> {
     Ok(())
 }
 
-fn relay_url(explicit: Option<String>) -> Result<String> {
+fn persist_checked_key(
+    conn: &Connection,
+    url: &str,
+    token: &str,
+    check: &relay::KeyCheckResponse,
+) -> Result<()> {
+    if !check.valid {
+        return Err(Error::InvalidApiKey);
+    }
+    let scope = check.scope.as_deref().ok_or(Error::InvalidApiKey)?;
+    let key_hash = relay::hash_bearer(token)?;
+    db::relay_credential::save(
+        conn,
+        &db::relay_credential::StoredRelayKey {
+            relay_url: url.to_string(),
+            scope: scope.to_string(),
+            key_hash,
+            token: token.to_string(),
+            remote_id: check.id,
+            label: check.label.clone(),
+        },
+    )
+}
+
+fn resolve_relay_url(
+    conn: &Connection,
+    explicit: Option<String>,
+    scope: relay::ApiKeyScope,
+) -> Result<String> {
     if let Some(url) = explicit.filter(|s| !s.is_empty()) {
-        return Ok(url);
+        return Ok(db::relay_credential::normalize_url(&url));
     }
     match std::env::var("KEYQUORUM_RELAY_URL") {
-        Ok(url) if !url.is_empty() => Ok(url),
-        _ => Err(Error::RelayRequest(
-            "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
-        )),
+        Ok(url) if !url.is_empty() => Ok(db::relay_credential::normalize_url(&url)),
+        _ => {
+            let stored = db::relay_credential::get_for_scope(conn, scope.as_str())?;
+            match stored.as_slice() {
+                [one] => Ok(one.relay_url.clone()),
+                [] => Err(Error::RelayRequest(
+                    "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
+                )),
+                _ => Err(Error::RelayRequest(
+                    "multiple stored relay URLs; pass --url".into(),
+                )),
+            }
+        }
     }
 }
 
-fn relay_api_key(explicit: Option<String>) -> Result<String> {
-    if let Some(key) = explicit.filter(|s| !s.is_empty()) {
-        return Ok(key);
+/// `--api-key` / env win, then a stored key whose hash still passes `/keycheck`.
+/// A newly presented bearer is stored (by scope) after a successful check.
+fn resolve_relay_auth(
+    conn: &Connection,
+    explicit_url: Option<String>,
+    explicit_key: Option<String>,
+    required: relay::ApiKeyScope,
+) -> Result<(String, String)> {
+    let url = resolve_relay_url(conn, explicit_url, required)?;
+    let provided = explicit_key.filter(|s| !s.is_empty()).or_else(|| {
+        match std::env::var("KEYQUORUM_RELAY_API_KEY") {
+            Ok(key) if !key.is_empty() => Some(key),
+            _ => None,
+        }
+    });
+
+    if let Some(token) = provided {
+        let check = relay::check_key(&url, &token)?;
+        if !check.valid {
+            return Err(Error::InvalidApiKey);
+        }
+        if check.scope.as_deref() != Some(required.as_str()) {
+            return Err(Error::ApiKeyScopeDenied);
+        }
+        persist_checked_key(conn, &url, &token, &check)?;
+        return Ok((url, token));
     }
-    match std::env::var("KEYQUORUM_RELAY_API_KEY") {
-        Ok(key) if !key.is_empty() => Ok(key),
-        _ => prompt_secret("Relay API key: "),
+
+    match db::relay_credential::get(conn, &url, required.as_str())? {
+        Some(stored) => {
+            let check = relay::check_key_hash(&url, &stored.key_hash)?;
+            if !check.valid {
+                db::relay_credential::delete(conn, &url, required.as_str())?;
+                return Err(Error::RelayRequest(format!(
+                    "stored API key for {} is no longer valid; run `keyquorum loadkey`",
+                    required.as_str()
+                )));
+            }
+            db::relay_credential::touch_checked(conn, &url, required.as_str())?;
+            Ok((url, stored.token))
+        }
+        None => Err(Error::RelayRequest(format!(
+            "no stored API key for {}; run `keyquorum loadkey` or pass --api-key",
+            required.as_str()
+        ))),
     }
+}
+
+fn run_loadkey(db_path: &Path, api_key: Option<String>, url: Option<String>) -> Result<()> {
+    let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
+    let conn = db::open(db_path_str)?;
+    let url = if let Some(url) = url.filter(|s| !s.is_empty()) {
+        db::relay_credential::normalize_url(&url)
+    } else {
+        match std::env::var("KEYQUORUM_RELAY_URL") {
+            Ok(url) if !url.is_empty() => db::relay_credential::normalize_url(&url),
+            _ => {
+                return Err(Error::RelayRequest(
+                    "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
+                ))
+            }
+        }
+    };
+    let token = match api_key.filter(|s| !s.is_empty()) {
+        Some(token) => token,
+        None => prompt_secret("Relay API key: ")?,
+    };
+    let check = relay::check_key(&url, &token)?;
+    persist_checked_key(&conn, &url, &token, &check)?;
+    let scope = check.scope.as_deref().unwrap_or("unknown");
+    print!("Stored {scope} API key for {url}");
+    if let Some(label) = check.label.as_deref().filter(|s| !s.is_empty()) {
+        print!(" ({label})");
+    }
+    println!();
+    Ok(())
 }
 
 fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
+    let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
+    let conn = db::open(db_path_str)?;
     match command {
         RelayCommand::Push { dir, url, api_key } => {
-            let url = relay_url(url)?;
-            let api_key = relay_api_key(api_key)?;
-            let trees = local_public_trees(db_path)?;
+            let (url, api_key) =
+                resolve_relay_auth(&conn, url, api_key, relay::ApiKeyScope::InboxPush)?;
+            let trees = export_local_public_trees(&conn)?;
             let mut uploaded = 0usize;
             let mut entries: Vec<_> = fs::read_dir(&dir)?.collect::<std::io::Result<_>>()?;
             entries.sort_by_key(|e| e.path());
@@ -1602,11 +1721,9 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
             api_key,
             after,
         } => {
-            let url = relay_url(url)?;
-            let api_key = relay_api_key(api_key)?;
+            let (url, api_key) =
+                resolve_relay_auth(&conn, url, api_key, relay::ApiKeyScope::InboxPull)?;
             let listed = relay::pull_inbox(&url, &api_key, after)?;
-            let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
-            let conn = db::open(db_path_str)?;
             for slice in &listed.trees {
                 let applied = key_tree::apply_public_tree(&conn, None, slice)?;
                 println!(
@@ -1656,15 +1773,10 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
     Ok(())
 }
 
-fn local_public_trees(db_path: &Path) -> Result<Vec<key_tree::PublicTree>> {
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
-    let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
-    let conn = db::open(db_path_str)?;
+fn export_local_public_trees(conn: &Connection) -> Result<Vec<key_tree::PublicTree>> {
     let mut trees = Vec::new();
-    for listing in key_tree::list_trees(&conn)? {
-        match key_tree::export_public_tree(&conn, listing.key_id) {
+    for listing in key_tree::list_trees(conn)? {
+        match key_tree::export_public_tree(conn, listing.key_id) {
             Ok(tree) => trees.push(tree),
             Err(Error::NodeNotFound | Error::TreeNotFound) => {}
             Err(err) => return Err(err),

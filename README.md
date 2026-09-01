@@ -322,11 +322,12 @@ Put TLS in front of it (Caddy, nginx); the process itself binds loopback by
 default.
 
 ```sh
-# First start mints an admin API key and prints it once.
+# First start mints a licensee issuer key (`kql_…`) and prints it once.
 kq-relay --db keyquorum-relay.sqlite serve --bind 127.0.0.1:8787
 # Swagger UI: http://127.0.0.1:8787/swagger-ui
 
-# Host-local key management (talks to the relay SQLite, not HTTP):
+# Only the licensee mints customer API keys (host-local; not available over HTTP):
+export KEYQUORUM_LICENSEE_KEY=kql_…
 kq-relay --db keyquorum-relay.sqlite keys create --scope inbox.push --label ops
 kq-relay --db keyquorum-relay.sqlite keys create \
   --scope inbox.pull --fingerprint <hex-sha256-of-recipient-x25519-pub> --label alice
@@ -336,17 +337,27 @@ kq-relay --db keyquorum-relay.sqlite keys revoke --id 2
 ```
 
 Scopes are least-privilege: `inbox.push` uploads, `inbox.pull` reads only
-the fingerprint bound to that key, `admin` creates/lists/rotates/revokes
-keys over HTTP (`POST /api-keys`, …). Bearers are shown once (`kq_…`);
-the database stores `hex(SHA-256(raw))` only.
+the fingerprint bound to that key, `admin` can list/revoke keys and publish
+trees over HTTP. Creating and rotating bearers is licensee-only
+(`kq-relay keys create|rotate` with the `kql_…` issuer). Bearers are shown
+once (`kq_…`); the database stores `hex(SHA-256(raw))` only.
 
 ```sh
 export KEYQUORUM_RELAY_URL=http://127.0.0.1:8787
-# Prefer KEYQUORUM_RELAY_API_KEY or a prompt; --api-key is for scripts.
+# Load once; the personal DB stores the key hash and a sealed copy of the bearer.
+# Prefer omitting the key so it is prompted (stays out of shell history).
+keyquorum loadkey --url http://127.0.0.1:8787
+keyquorum relay push --dir ./bridge-packages
+keyquorum relay pull --output-dir ./inbox
+keyquorum --db alice.sqlite relay pull --import --share-file alice.key
+# --api-key still works for scripts and is stored after a successful /keycheck.
 keyquorum relay push --dir ./bridge-packages --api-key "$PUSH_KEY"
-keyquorum relay pull --output-dir ./inbox --api-key "$PULL_KEY"
-keyquorum --db alice.sqlite relay pull --import --share-file alice.key --api-key "$PULL_KEY"
 ```
+
+`POST /keycheck` is unauthenticated: send `{ "token": "kq_…" }` on first load or
+`{ "key_hash": "<hex>" }` to revalidate a stored key. Invalid, expired, and
+revoked keys all return `{ "valid": false }`. Each `relay` / `tree publish|fetch`
+command re-checks the stored hash before injecting the unsealed bearer.
 
 `relay push` also uploads every public tree in `--db`, replacing the
 relay's full context documents. `relay pull` merges the returned slices
@@ -380,7 +391,7 @@ These still need a private-key custody model (a software file, OS keychain, or r
 
 This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, API key bearers, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded.
 
-The mailbox relay cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It stores the canonical *public* tree as JSON documents (labels, fingerprints, public keys, policy). Sending envelopes with `relay push` updates those documents from the sender's `--db`. Pulling returns a sliced copy for the pull-key fingerprint, which the CLI translates into local SQLite. Store only hashed API keys in the relay SQLite file. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key.
+The mailbox relay cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It stores the canonical *public* tree as JSON documents (labels, fingerprints, public keys, policy). Sending envelopes with `relay push` updates those documents from the sender's `--db`. Pulling returns a sliced copy for the pull-key fingerprint, which the CLI translates into local SQLite. Store only hashed API keys in the relay SQLite file. Only the licensee mints or rotates bearers (`kq-relay keys create|rotate` with the `kql_…` issuer); HTTP cannot. Personal devices load a bearer with `keyquorum loadkey` (or `--api-key` once); they keep the hash for `/keycheck` and a sealed copy of the bearer in the owner-only org database. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key.
 
 ## Contributing
 

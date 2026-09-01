@@ -5,6 +5,15 @@
 -- (the full org context). Pushing envelopes updates those documents.
 -- Personal devices translate a sliced copy into local SQLite.
 
+-- One issuer credential for the KeyQuorum licensee. Customer API keys are
+-- minted only with this secret via `kq-relay keys` on the host; HTTP cannot
+-- create or rotate bearers. The table stores `hex(SHA-256(raw))` only.
+CREATE TABLE IF NOT EXISTS licensee_issuer (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    key_hash    TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id                      INTEGER PRIMARY KEY,
     key_hash                TEXT NOT NULL UNIQUE,

@@ -1,7 +1,10 @@
 //! Axum router for the mailbox relay. Handlers never unseal envelopes.
 
-use super::api_key::{self, ApiKeyInfo, ApiKeyScope, CreatedApiKey, NewApiKey};
-use super::client::{ErrorBody, InboxAccepted, InboxEnvelope, InboxList, InboxPush};
+use super::api_key::{self, ApiKeyInfo, ApiKeyScope};
+use super::client::{
+    ErrorBody, InboxAccepted, InboxEnvelope, InboxList, InboxPush, KeyCheckRequest,
+    KeyCheckResponse,
+};
 use super::mailbox;
 use super::org_tree;
 use crate::error::Error;
@@ -156,25 +159,6 @@ struct InboxQuery {
     after: Option<i64>,
 }
 
-#[derive(Deserialize, ToSchema)]
-struct CreateApiKeyBody {
-    scope: String,
-    recipient_fingerprint: Option<String>,
-    label: Option<String>,
-    ttl_seconds: Option<i64>,
-}
-
-#[derive(Serialize, ToSchema)]
-struct ApiKeyCreated {
-    id: i64,
-    token: String,
-    scope: String,
-    recipient_fingerprint: Option<String>,
-    label: Option<String>,
-    created_at: String,
-    expires_at: Option<String>,
-}
-
 #[derive(Serialize, ToSchema)]
 struct ApiKeyView {
     id: i64,
@@ -185,20 +169,6 @@ struct ApiKeyView {
     expires_at: Option<String>,
     revoked_at: Option<String>,
     last_used_at: Option<String>,
-}
-
-impl From<CreatedApiKey> for ApiKeyCreated {
-    fn from(created: CreatedApiKey) -> Self {
-        Self {
-            id: created.info.id,
-            token: created.token,
-            scope: created.info.scope,
-            recipient_fingerprint: created.info.recipient_fingerprint,
-            label: created.info.label,
-            created_at: created.info.created_at,
-            expires_at: created.info.expires_at,
-        }
-    }
 }
 
 impl From<ApiKeyInfo> for ApiKeyView {
@@ -238,11 +208,10 @@ impl Modify for SecurityAddon {
 #[openapi(
     paths(
         health,
+        post_keycheck,
         post_inbox,
         get_inbox,
-        create_key,
         list_keys,
-        rotate_key,
         revoke_key,
         put_tree,
         get_tree_context
@@ -250,13 +219,13 @@ impl Modify for SecurityAddon {
     components(
         schemas(
             HealthResponse,
+            KeyCheckRequest,
+            KeyCheckResponse,
             InboxAccepted,
             InboxEnvelope,
             InboxList,
             InboxPush,
             ErrorBody,
-            CreateApiKeyBody,
-            ApiKeyCreated,
             ApiKeyView,
             PublicTree,
             PublicNode,
@@ -266,7 +235,7 @@ impl Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
-        (name = "api-keys", description = "API key administration"),
+        (name = "api-keys", description = "List and revoke API keys; minting is licensee-only on the host"),
         (name = "trees", description = "Canonical public split-tree topology")
     )
 )]
@@ -280,6 +249,44 @@ struct ApiDoc;
 )]
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+fn keycheck_response(check: api_key::KeyCheck) -> KeyCheckResponse {
+    KeyCheckResponse {
+        valid: check.valid,
+        id: check.id,
+        scope: check.scope,
+        label: check.label,
+        recipient_fingerprint: check.recipient_fingerprint,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/keycheck",
+    tag = "api-keys",
+    request_body = KeyCheckRequest,
+    responses(
+        (status = 200, description = "Whether the token or stored hash is live", body = KeyCheckResponse),
+        (status = 400, description = "Provide exactly one of token or key_hash", body = ErrorBody)
+    )
+)]
+async fn post_keycheck(
+    State(state): State<AppState>,
+    Json(body): Json<KeyCheckRequest>,
+) -> Result<Json<KeyCheckResponse>, ApiError> {
+    let token = body.token.filter(|s| !s.is_empty());
+    let key_hash = body.key_hash.filter(|s| !s.is_empty());
+    let check = match (token, key_hash) {
+        (Some(token), None) => {
+            with_conn(&state, move |conn| api_key::check_token(conn, &token)).await?
+        }
+        (None, Some(key_hash)) => {
+            with_conn(&state, move |conn| api_key::check_hash(conn, &key_hash)).await?
+        }
+        _ => return Err(Error::InvalidApiKeyRequest.into()),
+    };
+    Ok(Json(keycheck_response(check)))
 }
 
 #[utoipa::path(
@@ -393,41 +400,6 @@ async fn get_inbox(
 }
 
 #[utoipa::path(
-    post,
-    path = "/api-keys",
-    tag = "api-keys",
-    request_body = CreateApiKeyBody,
-    responses(
-        (status = 201, description = "API key created; bearer shown once", body = ApiKeyCreated),
-        (status = 400, description = "Malformed request", body = ErrorBody),
-        (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 403, description = "Forbidden", body = ErrorBody)
-    ),
-    security(("api_key" = []))
-)]
-async fn create_key(
-    State(state): State<AppState>,
-    ApiToken(token): ApiToken,
-    Json(body): Json<CreateApiKeyBody>,
-) -> Result<(StatusCode, Json<ApiKeyCreated>), ApiError> {
-    let created = with_conn(&state, move |conn| {
-        api_key::authenticate(conn, &token, ApiKeyScope::Admin)?;
-        let scope = ApiKeyScope::parse(&body.scope)?;
-        api_key::create(
-            conn,
-            &NewApiKey {
-                scope,
-                recipient_fingerprint: body.recipient_fingerprint,
-                label: body.label,
-                ttl_seconds: body.ttl_seconds,
-            },
-        )
-    })
-    .await?;
-    Ok((StatusCode::CREATED, Json(created.into())))
-}
-
-#[utoipa::path(
     get,
     path = "/api-keys",
     tag = "api-keys",
@@ -448,32 +420,6 @@ async fn list_keys(
     })
     .await?;
     Ok(Json(keys.into_iter().map(ApiKeyView::from).collect()))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api-keys/{id}/rotate",
-    tag = "api-keys",
-    params(("id" = i64, Path, description = "API key id")),
-    responses(
-        (status = 200, description = "Replacement bearer shown once", body = ApiKeyCreated),
-        (status = 401, description = "Unauthorized", body = ErrorBody),
-        (status = 403, description = "Forbidden", body = ErrorBody),
-        (status = 404, description = "Unknown key", body = ErrorBody)
-    ),
-    security(("api_key" = []))
-)]
-async fn rotate_key(
-    State(state): State<AppState>,
-    ApiToken(token): ApiToken,
-    Path(id): Path<i64>,
-) -> Result<Json<ApiKeyCreated>, ApiError> {
-    let created = with_conn(&state, move |conn| {
-        api_key::authenticate(conn, &token, ApiKeyScope::Admin)?;
-        api_key::rotate(conn, id)
-    })
-    .await?;
-    Ok(Json(created.into()))
 }
 
 #[utoipa::path(
@@ -559,9 +505,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
+        .route("/keycheck", post(post_keycheck))
         .route("/inbox", post(post_inbox).get(get_inbox))
-        .route("/api-keys", post(create_key).get(list_keys))
-        .route("/api-keys/{id}/rotate", post(rotate_key))
+        .route("/api-keys", get(list_keys))
         .route("/api-keys/{id}/revoke", post(revoke_key))
         .route("/trees", put(put_tree))
         .route("/trees/{label}/context", get(get_tree_context))
