@@ -45,6 +45,7 @@ pub struct InboxPush {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[cfg_attr(not(feature = "provider"), allow(dead_code))]
 pub struct ErrorBody {
     pub error: String,
 }

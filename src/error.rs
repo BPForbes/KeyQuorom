@@ -164,7 +164,7 @@ impl fmt::Display for Error {
             }
             Error::OrganizationDatabase => write!(
                 f,
-                "this SQLite file is an organization database; kq-relay needs a separate relay database"
+                "this SQLite file is an organization database; the mailbox needs a separate database"
             ),
             Error::InvalidInboxPage => {
                 write!(f, "inbox page size must be between 1 and 500")

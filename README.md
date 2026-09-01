@@ -314,72 +314,44 @@ keyquorum share create-file 1 --ttl-seconds 3600 --pin
 keyquorum share redeem-file
 ```
 
-### Mailbox relay
+### Mailbox
 
-The `kq-relay` binary is an inbox for sealed `.kqpb` envelopes and the
-canonical *public* split-tree topology. It indexes packages by the recipient
-X25519 fingerprint in the outer header and never unseals them. Wrapped shares
-and private keys stay on the device. Full public-tree context is stored as a
-JSON document per tree label; on pull the server slices that document for the
-recipient fingerprint and the personal store translates the slice into SQLite.
-Put TLS in front of it (Caddy, nginx); the process itself binds loopback by
-default.
+The hosted mailbox carries sealed `.kqpb` envelopes and public-tree slices.
+It indexes packages by the recipient fingerprint in the outer header and
+never unseals them. Wrapped shares and private keys stay on the device.
+Your provider gives you a URL and an API key; you do not run or administer
+the mailbox.
 
 ```sh
-# First start mints a licensee issuer key (`kql_…`) and prints it once.
-kq-relay --db keyquorum-relay.sqlite serve --bind 127.0.0.1:8787
-# Swagger UI: http://127.0.0.1:8787/swagger-ui
-
-# Only the licensee mints customer API keys (host-local; not available over HTTP):
-export KEYQUORUM_LICENSEE_KEY=kql_…
-kq-relay --db keyquorum-relay.sqlite keys create --scope inbox.push --label ops
-kq-relay --db keyquorum-relay.sqlite keys create \
-  --scope inbox.pull --fingerprint <hex-sha256-of-recipient-x25519-pub> --label alice
-kq-relay --db keyquorum-relay.sqlite keys list
-kq-relay --db keyquorum-relay.sqlite keys rotate --id 2
-kq-relay --db keyquorum-relay.sqlite keys revoke --id 2
-```
-
-Scopes are least-privilege: `inbox.push` uploads, `inbox.pull` reads only
-the fingerprint bound to that key, `admin` can list/revoke keys and publish
-trees over HTTP. Creating and rotating bearers is licensee-only
-(`kq-relay keys create|rotate` with the `kql_…` issuer). Bearers are shown
-once (`kq_…`); the database stores `hex(SHA-256(raw))` only.
-
-```sh
-export KEYQUORUM_RELAY_URL=http://127.0.0.1:8787
-# Load once; the personal DB stores the key hash and a sealed copy of the bearer.
-# Prefer omitting the key so it is prompted (stays out of shell history).
-keyquorum loadkey --url http://127.0.0.1:8787
+export KEYQUORUM_RELAY_URL=https://relay.example.com
+# Load once; omit the key so it is prompted (stays out of shell history).
+keyquorum loadkey --url https://relay.example.com
 keyquorum relay push --dir ./bridge-packages
 keyquorum relay pull --output-dir ./inbox
 keyquorum --db alice.sqlite relay pull --import --share-file alice.key
-# --api-key still works for scripts and is stored after a successful /keycheck.
+# --api-key still works for scripts and is stored after a successful check.
 keyquorum relay push --dir ./bridge-packages --api-key "$PUSH_KEY"
 ```
 
-`POST /keycheck` is unauthenticated: send `{ "token": "kq_…" }` on first load or
-`{ "key_hash": "<hex>" }` to revalidate a stored key. Invalid, expired, and
-revoked keys all return `{ "valid": false }`. Each `relay` / `tree publish|fetch`
-command re-checks the stored hash before injecting the unsealed bearer.
+`loadkey` checks the key with the mailbox, then stores the key hash and a
+sealed copy of the bearer in the personal database. Later `relay` /
+`tree fetch` commands re-check that hash before using the key.
 
 `relay push` also uploads every public tree in `--db` and **merges** it
-into the relay's full context documents (unrelated nodes stay put).
-`relay pull` merges the returned slices into `--db` (then `--import`
-opens envelopes). `tree publish` replaces a document; `tree fetch` syncs
-topology without an envelope. Remote relays must be `https://`; `http://`
-is accepted only for loopback.
+into the mailbox (unrelated nodes stay put). `relay pull` merges the
+returned slices into `--db` (then `--import` opens envelopes).
+`tree fetch` syncs topology without an envelope. Remote mailboxes must
+be `https://`; `http://` is accepted only for loopback.
 
-Lost or compromised API keys: mint a replacement (`keys rotate` or
-`keys create`) and revoke the old id. Envelopes already in the mailbox
-are unchanged. Missed pulls: `GET /inbox?after=<id>` (or `--after`)
-replays anything not yet downloaded; `bridge private import` still
-rejects stale generations.
+If a key is lost or rotated, load the replacement your provider issues.
+Envelopes already delivered are unchanged. Missed pulls: `relay pull
+--after <id>` replays anything not yet downloaded; `bridge private import`
+still rejects stale generations.
 
 ## Roadmap
 
 [#10](https://github.com/BPForbes/KeyQuorom/issues/10) mailbox transport
-(`kq-relay`, API keys, `relay push` / `relay pull --import`) is in place.
+(API keys, `relay push` / `relay pull --import`) is in place.
 Still open on that issue: authenticated envelopes for hardware-key reissue
 and key-tree restructure (private-bridge create/rotate/remove-member already
 emit `.kqpb` files the relay can carry).
@@ -397,7 +369,7 @@ These still need a private-key custody model (a software file, OS keychain, or r
 
 This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, API key bearers, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded.
 
-The mailbox relay cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It stores the canonical *public* tree as JSON documents (labels, fingerprints, public keys, policy). Sending envelopes with `relay push` updates those documents from the sender's `--db`. Pulling returns a sliced copy for the pull-key fingerprint, which the CLI translates into local SQLite. Store only hashed API keys in the relay SQLite file. Only the licensee mints or rotates bearers (`kq-relay keys create|rotate` with the `kql_…` issuer); HTTP cannot. Personal devices load a bearer with `keyquorum loadkey` (or `--api-key` once); they keep the hash for `/keycheck` and a sealed copy of the bearer in the owner-only org database. Recover a lost bearer by rotating or minting a new key and revoking the old one; recover a missed update by pulling again and importing on the device that holds the matching decryption key.
+The hosted mailbox cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It stores the canonical *public* tree as JSON documents (labels, fingerprints, public keys, policy). Sending envelopes with `relay push` updates those documents from the sender's `--db`. Pulling returns a sliced copy for the pull-key fingerprint, which the CLI translates into local SQLite. Personal devices load a bearer with `keyquorum loadkey` (or `--api-key` once); they keep the hash and a sealed copy of the bearer in the owner-only org database. Recover a lost bearer by loading the replacement your provider issues; recover a missed update by pulling again and importing on the device that holds the matching decryption key.
 
 ## Contributing
 

@@ -1,4 +1,6 @@
-//! KeyQuorum envelope mailbox: store and forward opaque `.kqpb` files.
+//! Provider-only mailbox host. Not part of the customer product: mint
+//! licensee/API keys and serve opaque `.kqpb` envelopes. Customers use
+//! `keyquorum loadkey` with a URL and bearer they were given.
 
 use clap::{Parser, Subcommand};
 use keyquorum::error::{Error, Result};
@@ -13,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     name = "kq-relay",
-    about = "KeyQuorum mailbox relay (opaque .kqpb transport)",
+    about = "Provider mailbox host (setup only; not a customer command)",
     version
 )]
 struct Cli {

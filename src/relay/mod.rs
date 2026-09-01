@@ -11,6 +11,7 @@ mod api_key;
 mod client;
 mod mailbox;
 mod org_tree;
+#[cfg(feature = "provider")]
 mod server;
 
 pub use api_key::{
@@ -31,6 +32,7 @@ pub use org_tree::{
     context_for_fingerprint, contexts_for_fingerprint, get_public_tree, list_public_trees,
     merge_public_tree, put_public_tree, slices_for_fingerprint,
 };
+#[cfg(feature = "provider")]
 pub use server::{router, AppState, MAX_ENVELOPE_BYTES};
 
 use crate::error::{Error, Result};
@@ -97,6 +99,6 @@ fn init(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "provider"))]
 #[path = "tests.rs"]
 mod tests;
