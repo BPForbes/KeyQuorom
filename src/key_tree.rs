@@ -1471,6 +1471,14 @@ pub fn apply_public_tree(
     if snapshot.nodes.is_empty() {
         return Err(Error::InvalidTreeSpec);
     }
+    crate::db::with_immediate_transaction(conn, || apply_public_tree_inner(conn, key_id, snapshot))
+}
+
+fn apply_public_tree_inner(
+    conn: &Connection,
+    key_id: Option<i64>,
+    snapshot: &PublicTree,
+) -> Result<i64> {
     let key_id = match key_id {
         Some(id) => {
             let label: Option<String> = conn
@@ -1598,7 +1606,11 @@ fn apply_public_node(conn: &Connection, key_id: i64, node: &PublicNode) -> Resul
     if let Some(id) = existing {
         conn.execute(
             "UPDATE key_nodes SET parent_id = ?1, threshold = ?2,
-                    hardware_key_id = COALESCE(?3, hardware_key_id), is_active = ?4
+                    hardware_key_id = CASE
+                        WHEN wrapped_share IS NOT NULL THEN COALESCE(?3, hardware_key_id)
+                        ELSE ?3
+                    END,
+                    is_active = ?4
              WHERE id = ?5",
             params![parent_id, node.threshold, hardware_key_id, is_active, id],
         )?;

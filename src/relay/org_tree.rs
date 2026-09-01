@@ -17,6 +17,70 @@ pub fn put_public_tree(conn: &Connection, snapshot: &PublicTree) -> Result<Publi
     crate::db::with_immediate_transaction(conn, || persist_public_tree(conn, snapshot))
 }
 
+/// Upsert the incoming nodes and edges into an existing document.
+///
+/// Labels present in `snapshot` are authoritative. Nodes and edges the
+/// sender does not mention stay in place, so a personal subgraph cannot
+/// erase unrelated topology. Use [`put_public_tree`] to replace a document.
+pub fn merge_public_tree(conn: &Connection, snapshot: &PublicTree) -> Result<PublicTree> {
+    validate_public_tree(snapshot)?;
+    crate::db::with_immediate_transaction(conn, || {
+        let merged = match get_public_tree(conn, &snapshot.label) {
+            Ok(existing) => merge_into_existing(&existing, snapshot)?,
+            Err(Error::TreeNotFound) => snapshot.clone(),
+            Err(err) => return Err(err),
+        };
+        persist_public_tree(conn, &merged)
+    })
+}
+
+fn merge_into_existing(existing: &PublicTree, incoming: &PublicTree) -> Result<PublicTree> {
+    let incoming_labels: HashSet<&str> = incoming.nodes.iter().map(|n| n.label.as_str()).collect();
+    let mut nodes = incoming.nodes.clone();
+    for node in &existing.nodes {
+        if !incoming_labels.contains(node.label.as_str()) {
+            nodes.push(node.clone());
+        }
+    }
+    let mut whitelist = incoming.whitelist.clone();
+    for edge in &existing.whitelist {
+        if incoming_labels.contains(edge.from.as_str())
+            && incoming_labels.contains(edge.to.as_str())
+        {
+            continue;
+        }
+        if !whitelist
+            .iter()
+            .any(|kept| kept.from == edge.from && kept.to == edge.to)
+        {
+            whitelist.push(edge.clone());
+        }
+    }
+    let mut links = incoming.links.clone();
+    for edge in &existing.links {
+        if incoming_labels.contains(edge.from.as_str())
+            && incoming_labels.contains(edge.to.as_str())
+        {
+            continue;
+        }
+        if !links
+            .iter()
+            .any(|kept| kept.from == edge.from && kept.to == edge.to)
+        {
+            links.push(edge.clone());
+        }
+    }
+    let merged = PublicTree {
+        label: incoming.label.clone(),
+        generation: existing.generation,
+        nodes,
+        whitelist,
+        links,
+    };
+    validate_public_tree(&merged)?;
+    Ok(merged)
+}
+
 fn persist_public_tree(conn: &Connection, snapshot: &PublicTree) -> Result<PublicTree> {
     let existing: Option<i64> = conn
         .query_row(
@@ -164,6 +228,13 @@ pub(crate) fn validate_public_tree(tree: &PublicTree) -> Result<()> {
     let mut seen_links = HashSet::new();
     for edge in &tree.links {
         if !seen_links.insert((edge.from.as_str(), edge.to.as_str())) {
+            return Err(Error::InvalidBridge);
+        }
+        let listed = tree.whitelist.iter().any(|allowed| {
+            (allowed.from == edge.from && allowed.to == edge.to)
+                || (allowed.from == edge.to && allowed.to == edge.from)
+        });
+        if !listed {
             return Err(Error::InvalidBridge);
         }
     }

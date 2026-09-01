@@ -272,6 +272,24 @@ fn rebuilding_share_required_key_nodes_keeps_bridge_rows() {
         .expect("links");
     assert_eq!(bridges, 1);
     assert_eq!(links, 1);
+    let bridge_node: i64 = conn
+        .query_row("SELECT node_id FROM key_node_bridges", [], |row| row.get(0))
+        .expect("bridge node_id");
+    assert_eq!(bridge_node, 2);
+    let link: (i64, i64) = conn
+        .query_row(
+            "SELECT node_a_id, node_b_id FROM key_node_links",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("link endpoints");
+    assert_eq!(link, (2, 3));
+    conn.execute(
+        "INSERT INTO key_nodes (key_id, parent_id, label, hardware_key_id)
+             VALUES (1, 1, 'peer', 1)",
+        [],
+    )
+    .expect("a topology-only leaf must be insertable after the rebuild");
     let sql = table_sql(&conn, "key_nodes")
         .expect("sql")
         .expect("key_nodes");
@@ -340,7 +358,8 @@ fn relay_credential_roundtrip_seals_the_bearer() {
     assert_eq!(loaded.remote_id, Some(7));
     let plaintext: i64 = conn
         .query_row(
-            "SELECT count(*) FROM relay_credentials WHERE wrapped_token = ?1",
+            "SELECT count(*) FROM relay_credentials
+             WHERE instr(CAST(wrapped_token AS BLOB), CAST(?1 AS BLOB)) > 0",
             rusqlite::params![b"kq_test-bearer".as_slice()],
             |row| row.get(0),
         )
@@ -361,5 +380,27 @@ fn open_restricts_permissions_on_an_existing_database() {
     std::fs::set_permissions(&path, perms).expect("chmod 0644");
     open(path_str).expect("reopen");
     let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_restricts_permissions_on_rollback_journal_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("org.sqlite");
+    let path_str = path.to_str().expect("utf-8");
+    open(path_str).expect("create");
+    let journal = dir.path().join("org.sqlite-journal");
+    std::fs::write(&journal, b"").expect("journal");
+    let mut perms = std::fs::metadata(&journal).expect("meta").permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&journal, perms).expect("chmod 0644");
+    open(path_str).expect("reopen");
+    let mode = std::fs::metadata(&journal)
+        .expect("meta")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode, 0o600);
 }

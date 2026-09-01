@@ -110,12 +110,20 @@ fn require_licensee(conn: &rusqlite::Connection, explicit: Option<String>) -> Re
 }
 
 fn authorize_mint(conn: &rusqlite::Connection, licensee_key: Option<String>) -> Result<()> {
-    if let Some(issuer) = relay::bootstrap_licensee_if_empty(conn)? {
+    let supplied = licensee_key.filter(|s| !s.is_empty()).or_else(|| {
+        match std::env::var("KEYQUORUM_LICENSEE_KEY") {
+            Ok(key) if !key.is_empty() => Some(key),
+            _ => None,
+        }
+    });
+    if let Some(issuer) = relay::authorize_licensee_or_bootstrap(conn, supplied.as_deref())? {
         print_new_licensee(&issuer);
-        Ok(())
-    } else {
-        require_licensee(conn, licensee_key)
+        return Ok(());
     }
+    if supplied.is_none() {
+        require_licensee(conn, None)?;
+    }
+    Ok(())
 }
 
 fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {

@@ -225,30 +225,32 @@ pub fn revoke(conn: &Connection, id: i64) -> Result<()> {
 
 /// Inserts a replacement key with the same scope and binding, then revokes the old one.
 pub fn rotate(conn: &Connection, id: i64) -> Result<CreatedApiKey> {
-    let info = load_info(conn, id)?;
-    if info.revoked_at.is_some() {
-        return Err(Error::ApiKeyRevoked);
-    }
-    let scope = ApiKeyScope::parse(&info.scope)?;
-    let created = create(
-        conn,
-        &NewApiKey {
-            scope,
-            recipient_fingerprint: info.recipient_fingerprint.clone(),
-            label: info.label.clone(),
-            ttl_seconds: None,
-        },
-    )?;
-    if let Some(expires_at) = &info.expires_at {
-        conn.execute(
-            "UPDATE api_keys SET expires_at = ?1 WHERE id = ?2",
-            params![expires_at, created.info.id],
+    crate::db::with_immediate_transaction(conn, || {
+        let info = load_info(conn, id)?;
+        if info.revoked_at.is_some() {
+            return Err(Error::ApiKeyRevoked);
+        }
+        let scope = ApiKeyScope::parse(&info.scope)?;
+        let created = create(
+            conn,
+            &NewApiKey {
+                scope,
+                recipient_fingerprint: info.recipient_fingerprint.clone(),
+                label: info.label.clone(),
+                ttl_seconds: None,
+            },
         )?;
-    }
-    revoke(conn, id)?;
-    Ok(CreatedApiKey {
-        info: load_info(conn, created.info.id)?,
-        token: created.token,
+        if let Some(expires_at) = &info.expires_at {
+            conn.execute(
+                "UPDATE api_keys SET expires_at = ?1 WHERE id = ?2",
+                params![expires_at, created.info.id],
+            )?;
+        }
+        revoke(conn, id)?;
+        Ok(CreatedApiKey {
+            info: load_info(conn, created.info.id)?,
+            token: created.token,
+        })
     })
 }
 
@@ -367,6 +369,21 @@ pub fn check_hash(conn: &Connection, key_hash: &str) -> Result<KeyCheck> {
         )
         .optional()?;
     Ok(row.unwrap_or_else(KeyCheck::invalid))
+}
+
+/// Authenticate a supplied licensee key, or mint the issuer when none exists.
+///
+/// A supplied key is never ignored in favor of a fresh bootstrap, so a
+/// mistyped `--db` path cannot mint against a new empty issuer store.
+pub fn authorize_licensee_or_bootstrap(
+    conn: &Connection,
+    supplied: Option<&str>,
+) -> Result<Option<CreatedLicensee>> {
+    if let Some(key) = supplied.filter(|key| !key.is_empty()) {
+        authenticate_licensee(conn, key)?;
+        return Ok(None);
+    }
+    bootstrap_licensee_if_empty(conn)
 }
 
 /// Mints the one-time licensee issuer when none exists. HTTP never sees this

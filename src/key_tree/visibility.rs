@@ -1,6 +1,7 @@
 use super::super::*;
 use super::common::*;
 use crate::db;
+use crate::error::Error;
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 
@@ -171,6 +172,151 @@ fn fetch_slice_can_add_a_topology_only_peer_after_a_new_bridge() {
     apply_public_tree(&personal, Some(personal_id), &slice).expect("second fetch");
     assert!(labels(&personal, personal_id).contains("M.A.1"));
     assert!(wrapped_share(&personal, personal_id, "M.A.1").is_none());
+}
+
+#[test]
+fn apply_public_tree_rolls_back_when_a_whitelist_edge_is_invalid() {
+    let personal = db::open_in_memory().expect("personal");
+    let (_sk, a2) = crate::keys::generate_encryption_keypair();
+    let (_sk2, s2) = crate::keys::generate_encryption_keypair();
+    let snapshot = PublicTree {
+        label: "org".into(),
+        generation: 1,
+        nodes: vec![
+            PublicNode {
+                label: "M".into(),
+                parent_label: None,
+                threshold: Some(2),
+                is_active: true,
+                encryption_fingerprint: None,
+                encryption_public_key: None,
+            },
+            PublicNode {
+                label: "M.A".into(),
+                parent_label: Some("M".into()),
+                threshold: Some(2),
+                is_active: true,
+                encryption_fingerprint: None,
+                encryption_public_key: None,
+            },
+            PublicNode {
+                label: "M.S".into(),
+                parent_label: Some("M".into()),
+                threshold: Some(2),
+                is_active: true,
+                encryption_fingerprint: None,
+                encryption_public_key: None,
+            },
+            PublicNode {
+                label: "M.A.2".into(),
+                parent_label: Some("M.A".into()),
+                threshold: None,
+                is_active: true,
+                encryption_fingerprint: Some(crate::keys::fingerprint(&a2)),
+                encryption_public_key: Some(hex::encode(a2)),
+            },
+            PublicNode {
+                label: "M.S.2".into(),
+                parent_label: Some("M.S".into()),
+                threshold: None,
+                is_active: true,
+                encryption_fingerprint: Some(crate::keys::fingerprint(&s2)),
+                encryption_public_key: Some(hex::encode(s2)),
+            },
+        ],
+        whitelist: vec![PublicEdge {
+            from: "M.S.2".into(),
+            to: "M.A.2".into(),
+        }],
+        links: vec![],
+    };
+    let key_id = apply_public_tree(&personal, None, &snapshot).expect("first apply");
+    let before: i64 = personal
+        .query_row(
+            "SELECT count(*) FROM key_node_bridges
+             WHERE node_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)",
+            params![key_id],
+            |row| row.get(0),
+        )
+        .expect("whitelist count");
+    assert_eq!(before, 1);
+    let mut bad = snapshot.clone();
+    bad.whitelist.push(PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.S.2".into(),
+    });
+    assert!(matches!(
+        apply_public_tree(&personal, Some(key_id), &bad),
+        Err(Error::InvalidBridge)
+    ));
+    let after: i64 = personal
+        .query_row(
+            "SELECT count(*) FROM key_node_bridges
+             WHERE node_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)",
+            params![key_id],
+            |row| row.get(0),
+        )
+        .expect("whitelist after");
+    assert_eq!(after, 1);
+}
+
+#[test]
+fn apply_public_tree_replaces_topology_only_hardware_keys() {
+    let personal = db::open_in_memory().expect("personal");
+    let (_sk, first) = crate::keys::generate_encryption_keypair();
+    let snapshot = PublicTree {
+        label: "org".into(),
+        generation: 1,
+        nodes: vec![
+            PublicNode {
+                label: "M".into(),
+                parent_label: None,
+                threshold: Some(2),
+                is_active: true,
+                encryption_fingerprint: None,
+                encryption_public_key: None,
+            },
+            PublicNode {
+                label: "M.A.2".into(),
+                parent_label: Some("M".into()),
+                threshold: None,
+                is_active: true,
+                encryption_fingerprint: Some(crate::keys::fingerprint(&first)),
+                encryption_public_key: Some(hex::encode(first)),
+            },
+        ],
+        whitelist: vec![],
+        links: vec![],
+    };
+    let key_id = apply_public_tree(&personal, None, &snapshot).expect("first");
+    let original: i64 = personal
+        .query_row(
+            "SELECT hardware_key_id FROM key_nodes WHERE key_id = ?1 AND label = 'M.A.2'",
+            params![key_id],
+            |row| row.get(0),
+        )
+        .expect("original key");
+    let (_sk2, rotated) = crate::keys::generate_encryption_keypair();
+    let mut refreshed = snapshot;
+    refreshed.nodes[1].encryption_fingerprint = Some(crate::keys::fingerprint(&rotated));
+    refreshed.nodes[1].encryption_public_key = Some(hex::encode(rotated));
+    apply_public_tree(&personal, Some(key_id), &refreshed).expect("refresh");
+    let updated: i64 = personal
+        .query_row(
+            "SELECT hardware_key_id FROM key_nodes WHERE key_id = ?1 AND label = 'M.A.2'",
+            params![key_id],
+            |row| row.get(0),
+        )
+        .expect("updated key");
+    assert_ne!(updated, original);
+    let fp: String = personal
+        .query_row(
+            "SELECT fingerprint FROM hardware_keys WHERE id = ?1",
+            params![updated],
+            |row| row.get(0),
+        )
+        .expect("fp");
+    assert_eq!(fp, crate::keys::fingerprint(&rotated));
 }
 
 #[test]

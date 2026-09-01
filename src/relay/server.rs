@@ -85,6 +85,13 @@ impl ApiError {
             message: "unauthorized".to_string(),
         }
     }
+
+    fn internal() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "internal error".to_string(),
+        }
+    }
 }
 
 impl From<Error> for ApiError {
@@ -115,10 +122,10 @@ impl From<Error> for ApiError {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 message: err.to_string(),
             },
-            other => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: other.to_string(),
-            },
+            other => {
+                tracing::error!("relay internal error: {other}");
+                Self::internal()
+            }
         }
     }
 }
@@ -142,12 +149,12 @@ where
 {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || {
-        let conn = db.lock().expect("relay sqlite mutex poisoned");
+        let conn = db.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&conn)
     })
     .await
-    .expect("relay db worker")
-    .map_err(ApiError::from)
+    .map_err(|_| ApiError::internal())
+    .and_then(|result| result.map_err(ApiError::from))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -298,7 +305,7 @@ async fn post_keycheck(
     tag = "inbox",
     request_body(content = InboxPush, content_type = "application/json"),
     responses(
-        (status = 201, description = "Envelope stored; attached trees replace full public context", body = InboxAccepted),
+        (status = 201, description = "Envelope stored; attached trees merge into canonical public context", body = InboxAccepted),
         (status = 200, description = "Envelope already stored", body = InboxAccepted),
         (status = 400, description = "Malformed envelope or tree", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
@@ -321,7 +328,7 @@ async fn post_inbox(
         api_key::authenticate(conn, &token, ApiKeyScope::InboxPush)?;
         crate::db::with_immediate_transaction(conn, || {
             for tree in &trees {
-                org_tree::put_public_tree(conn, tree)?;
+                org_tree::merge_public_tree(conn, tree)?;
             }
             mailbox::store(conn, &envelope)
         })

@@ -49,7 +49,9 @@ The live SQLite tree **is** the spec for whoever holds that store. An operator
 or publisher may keep the full org tree. A personal store should hold only the
 nodes that person needs for signing and RBAC: their lineage, their descendants,
 siblings of their node, and the fixpoint of *established* bridge peers (the
-peer and the peer's ancestors — not the peer's unrelated siblings). `split`,
+peer and the peer's ancestors — not the peer's unrelated siblings). Pushing
+from a personal store merges that subgraph into the relay; it does not replace
+the canonical document. `split`,
 `bind`, `add`, `revoke`, `bridge`, and `access quorum --state 0 --leaf` write
 that tree in place. There is no JSON file to author first. `tree --output`
 writes a snapshot of whatever is stored now. `--tree-spec FILE` remains only
@@ -128,12 +130,14 @@ tear down an established pairing (add requires a whitelist hit on either
 side; deny also drops any pairing).
 
 The relay stores the **full** public tree as a JSON document. Sending
-data (`relay push`, including private-bridge envelopes) uploads that
-document automatically from `--db`. Fetching data (`relay pull`) returns
-the slice this device's encryption fingerprint is allowed to see, and
-the CLI merges it into local SQLite before importing envelopes. A later
-push that adds a bridge such as `M.S.2 ↔ M.A.1` expands the next pull
-for `M.S.2` to include `M.A.1` as topology-only (no sealed share).
+data (`relay push`, including private-bridge envelopes) merges the
+sender's public topology into that document; nodes the sender does not
+hold stay in place, so a personal subgraph cannot replace canonical
+context. Fetching data (`relay pull`) returns the slice this device's
+encryption fingerprint is allowed to see, and the CLI merges it into
+local SQLite before importing envelopes. A later push that adds a bridge
+such as `M.S.2 ↔ M.A.1` expands the next pull for `M.S.2` to include
+`M.A.1` as topology-only (no sealed share).
 
 `tree fetch` refreshes topology without downloading envelopes. `tree
 publish` remains if you need to replace the document without an envelope.
@@ -359,10 +363,12 @@ keyquorum relay push --dir ./bridge-packages --api-key "$PUSH_KEY"
 revoked keys all return `{ "valid": false }`. Each `relay` / `tree publish|fetch`
 command re-checks the stored hash before injecting the unsealed bearer.
 
-`relay push` also uploads every public tree in `--db`, replacing the
-relay's full context documents. `relay pull` merges the returned slices
-into `--db` (then `--import` opens envelopes). `tree publish` / `tree
-fetch` are optional if you need to sync topology without an envelope.
+`relay push` also uploads every public tree in `--db` and **merges** it
+into the relay's full context documents (unrelated nodes stay put).
+`relay pull` merges the returned slices into `--db` (then `--import`
+opens envelopes). `tree publish` replaces a document; `tree fetch` syncs
+topology without an envelope. Remote relays must be `https://`; `http://`
+is accepted only for loopback.
 
 Lost or compromised API keys: mint a replacement (`keys rotate` or
 `keys create`) and revoke the old id. Envelopes already in the mailbox

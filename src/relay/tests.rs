@@ -126,6 +126,14 @@ fn api_key_rejects_expired_and_unknown() {
         ),
         Err(Error::InvalidApiKey)
     ));
+    assert!(matches!(
+        relay::authenticate(
+            &conn,
+            "kq_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ApiKeyScope::Admin
+        ),
+        Err(Error::InvalidApiKey)
+    ));
 }
 
 #[test]
@@ -254,6 +262,28 @@ fn bootstrap_licensee_only_when_empty() {
         relay::authenticate_licensee(&conn, "kq_notarealtokenvalue0123456789ABCD"),
         Err(Error::InvalidLicenseeKey)
     ));
+}
+
+#[test]
+fn supplied_licensee_key_does_not_bootstrap_an_empty_issuer_store() {
+    let conn = relay::open_in_memory().expect("schema");
+    assert!(matches!(
+        relay::authorize_licensee_or_bootstrap(
+            &conn,
+            Some("kql_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        ),
+        Err(Error::InvalidLicenseeKey)
+    ));
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(n, 0);
+    let created = relay::authorize_licensee_or_bootstrap(&conn, None)
+        .expect("bootstrap")
+        .expect("created");
+    let again = relay::authorize_licensee_or_bootstrap(&conn, Some(&created.token))
+        .expect("supplied key authenticates");
+    assert!(again.is_none());
 }
 
 async fn body_json(response: axum::http::Response<Body>) -> serde_json::Value {
@@ -529,6 +559,45 @@ async fn pushing_an_envelope_updates_full_tree_and_pull_returns_a_slice() {
     assert!(mail.trees.is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn personal_store_push_does_not_erase_unrelated_relay_nodes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, _) = sample_envelope();
+    let (tree, _s2) = example_org_tree(false);
+    let a1_fp = tree
+        .nodes
+        .iter()
+        .find(|node| node.label == "M.A.1")
+        .and_then(|node| node.encryption_fingerprint.clone())
+        .expect("a1 fp");
+    let push = push_key(&conn);
+    let pull_a1 = pull_key(&conn, &a1_fp);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = relay::router(AppState::new(conn));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let url = format!("http://{addr}");
+    relay::push_inbox_with_trees(&url, &push, &envelope, std::slice::from_ref(&tree))
+        .expect("publish full tree");
+    let personal = crate::key_tree::filter_public_tree(
+        &tree,
+        &crate::key_tree::visible_labels_in_public_tree(&tree, &[String::from("M.S.2")]),
+    );
+    assert!(!personal.nodes.iter().any(|node| node.label == "M.A.1"));
+    relay::push_inbox_with_trees(&url, &push, &envelope, std::slice::from_ref(&personal))
+        .expect("push personal subgraph");
+    let for_a1 = relay::pull_inbox(&url, &pull_a1, None, None).expect("unrelated pull");
+    assert!(for_a1.trees[0]
+        .nodes
+        .iter()
+        .any(|node| node.label == "M.A.1"));
+}
+
 #[test]
 fn max_envelope_constant_is_one_mib() {
     assert_eq!(MAX_ENVELOPE_BYTES, 1024 * 1024);
@@ -653,6 +722,39 @@ fn org_tree_put_and_context_omits_unrelated_peer_sibling() {
     assert!(matches!(
         relay::get_public_tree(&conn, "missing"),
         Err(Error::TreeNotFound)
+    ));
+}
+
+#[test]
+fn merge_public_tree_keeps_nodes_absent_from_a_personal_slice() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (tree, s2) = example_org_tree(false);
+    relay::put_public_tree(&conn, &tree).expect("full");
+    let slice =
+        relay::context_for_fingerprint(&conn, "org", &keys::fingerprint(&s2)).expect("slice");
+    assert!(!node_labels(&slice).contains(&"M.A.1".to_string()));
+    let merged = relay::merge_public_tree(&conn, &slice).expect("merge slice");
+    assert_eq!(merged.generation, 2);
+    let stored = relay::get_public_tree(&conn, "org").expect("full still");
+    assert!(node_labels(&stored).contains(&"M.A.1".to_string()));
+    let a1_fp = tree
+        .nodes
+        .iter()
+        .find(|node| node.label == "M.A.1")
+        .and_then(|node| node.encryption_fingerprint.clone())
+        .expect("a1 fp");
+    let for_a1 = relay::context_for_fingerprint(&conn, "org", &a1_fp).expect("a1 context");
+    assert!(node_labels(&for_a1).contains(&"M.A.1".to_string()));
+}
+
+#[test]
+fn put_public_tree_rejects_a_link_without_a_whitelist_edge() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (mut tree, _) = example_org_tree(false);
+    tree.whitelist.clear();
+    assert!(matches!(
+        relay::put_public_tree(&conn, &tree),
+        Err(Error::InvalidBridge)
     ));
 }
 

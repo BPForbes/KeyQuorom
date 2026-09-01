@@ -1575,14 +1575,23 @@ fn resolve_relay_url(
     scope: relay::ApiKeyScope,
 ) -> Result<String> {
     if let Some(url) = explicit.filter(|s| !s.is_empty()) {
-        return Ok(db::relay_credential::normalize_url(&url));
+        let url = db::relay_credential::normalize_url(&url);
+        relay::validate_relay_url(&url)?;
+        return Ok(url);
     }
     match std::env::var("KEYQUORUM_RELAY_URL") {
-        Ok(url) if !url.is_empty() => Ok(db::relay_credential::normalize_url(&url)),
+        Ok(url) if !url.is_empty() => {
+            let url = db::relay_credential::normalize_url(&url);
+            relay::validate_relay_url(&url)?;
+            Ok(url)
+        }
         _ => {
             let stored = db::relay_credential::get_for_scope(conn, scope.as_str())?;
             match stored.as_slice() {
-                [one] => Ok(one.relay_url.clone()),
+                [one] => {
+                    relay::validate_relay_url(&one.relay_url)?;
+                    Ok(one.relay_url.clone())
+                }
                 [] => Err(Error::RelayRequest(
                     "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
                 )),
@@ -1657,6 +1666,7 @@ fn run_loadkey(db_path: &Path, api_key: Option<String>, url: Option<String>) -> 
             }
         }
     };
+    relay::validate_relay_url(&url)?;
     let token = match api_key.filter(|s| !s.is_empty()) {
         Some(token) => token,
         None => prompt_secret("Relay API key: ")?,
@@ -1689,7 +1699,7 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     continue;
                 }
                 let bytes = fs::read(&path)?;
-                let accepted = if trees.is_empty() {
+                let accepted = if trees.is_empty() || uploaded > 0 {
                     relay::push_inbox(&url, &api_key, &bytes)?
                 } else {
                     relay::push_inbox_with_trees(&url, &api_key, &bytes, &trees)?

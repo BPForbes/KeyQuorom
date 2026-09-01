@@ -9,27 +9,42 @@ pub mod relay_credential;
 /// applies the schema. Safe to call repeatedly; every statement is
 /// idempotent. The file is owner-only (0600) on Unix because this store
 /// can hold sealed shares and loaded relay API keys.
-pub fn open(path: &str) -> Result<Connection> {
+pub fn open(path: &str) -> crate::error::Result<Connection> {
     let conn = Connection::open(path)?;
+    // Restrict before schema writes so a newly created file is not left
+    // world-readable while `init` applies tables. Journal sidecars created
+    // during that work are restricted afterward.
+    restrict_db_files(path)?;
     init(&conn)?;
-    restrict_owner_only(path);
+    restrict_db_files(path)?;
     Ok(conn)
 }
 
-fn restrict_owner_only(path: &str) {
+fn restrict_db_files(path: &str) -> crate::error::Result<()> {
+    restrict_owner_only(path)?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = format!("{path}{suffix}");
+        if std::path::Path::new(&sidecar).is_file() {
+            restrict_owner_only(&sidecar)?;
+        }
+    }
+    Ok(())
+}
+
+fn restrict_owner_only(path: &str) -> crate::error::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.is_file() {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(path, perms);
-            }
+        let meta = std::fs::metadata(path)?;
+        if meta.is_file() {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
         }
     }
     #[cfg(not(unix))]
     let _ = path;
+    Ok(())
 }
 
 /// Run `f` inside `BEGIN IMMEDIATE` so a later failure rolls back earlier
@@ -44,7 +59,10 @@ pub(crate) fn with_immediate_transaction<T>(
     conn.execute("BEGIN IMMEDIATE", [])?;
     match f() {
         Ok(value) => {
-            conn.execute("COMMIT", [])?;
+            if let Err(err) = conn.execute("COMMIT", []) {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(err.into());
+            }
             Ok(value)
         }
         Err(err) => {
@@ -118,7 +136,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             }
             Err(err) => {
                 let _ = conn.execute_batch("ROLLBACK");
-                if table_has_column(conn, "key_nodes", "is_active")? {
+                let share_required = table_sql(conn, "key_nodes")?
+                    .is_some_and(|sql| sql.contains("wrapped_share IS NOT NULL"));
+                if table_has_column(conn, "key_nodes", "is_active")? && !share_required {
                     return Ok(());
                 }
                 Err(err)

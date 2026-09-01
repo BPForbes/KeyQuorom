@@ -3,8 +3,9 @@
 //!
 //! The relay never unseals envelopes and never holds wrapped shares or
 //! private keys. Full public-tree context is stored as JSON documents.
-//! Pushing envelopes updates those documents; pull returns a sliced copy
-//! for the recipient fingerprint that a personal SQLite store translates.
+//! Pushing envelopes merges the sender's public topology into those
+//! documents; pull returns a sliced copy for the recipient fingerprint
+//! that a personal SQLite store translates.
 
 mod api_key;
 mod client;
@@ -13,22 +14,22 @@ mod org_tree;
 mod server;
 
 pub use api_key::{
-    authenticate, authenticate_licensee, bootstrap_licensee_if_empty, check_hash, check_token,
-    create as create_api_key, hash_bearer, list as list_api_keys, revoke as revoke_api_key,
-    rotate as rotate_api_key, ApiKeyInfo, ApiKeyScope, AuthedKey, CreatedApiKey, CreatedLicensee,
-    KeyCheck, NewApiKey,
+    authenticate, authenticate_licensee, authorize_licensee_or_bootstrap,
+    bootstrap_licensee_if_empty, check_hash, check_token, create as create_api_key, hash_bearer,
+    list as list_api_keys, revoke as revoke_api_key, rotate as rotate_api_key, ApiKeyInfo,
+    ApiKeyScope, AuthedKey, CreatedApiKey, CreatedLicensee, KeyCheck, NewApiKey,
 };
 pub use client::{
     check_key, check_key_hash, fetch_tree_context, publish_tree, pull as pull_inbox,
-    push as push_inbox, push_with_trees as push_inbox_with_trees, InboxAccepted, InboxEnvelope,
-    InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
+    push as push_inbox, push_with_trees as push_inbox_with_trees, validate_relay_url,
+    InboxAccepted, InboxEnvelope, InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
 };
 pub use mailbox::{
     list_after, store, MailboxPage, StoredEnvelope, DEFAULT_INBOX_PAGE, MAX_INBOX_PAGE,
 };
 pub use org_tree::{
     context_for_fingerprint, contexts_for_fingerprint, get_public_tree, list_public_trees,
-    put_public_tree, slices_for_fingerprint,
+    merge_public_tree, put_public_tree, slices_for_fingerprint,
 };
 pub use server::{router, AppState, MAX_ENVELOPE_BYTES};
 
