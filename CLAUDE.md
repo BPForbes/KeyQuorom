@@ -17,10 +17,13 @@ The two must stay in step in both directions: if the commit fails, the CLI delet
 the `.kqpb` files it just wrote, because `write_owner_only` refuses to overwrite and
 leftovers would block the retry.
 
-The mailbox relay (`src/relay/`, `kq-relay`) stores opaque `.kqpb` envelopes only.
-It must never unseal them or hold organization SQLite data or private keys. API keys
-are shown once; persist only `hex(SHA-256(raw))`. Never commit bearers, `.kqpb` files,
-or the relay database.
+The mailbox relay (`src/relay/`, `kq-relay`) stores opaque `.kqpb` envelopes and
+the canonical *public* split-tree topology (labels, fingerprints, public keys,
+whitelist, established links). It must never unseal envelopes or hold wrapped
+shares or private keys. A personal SQLite file should keep only the subgraph
+that person needs (own lineage, siblings, descendants, and established-bridge
+peers plus those peers' ancestors). API keys are shown once; persist only
+`hex(SHA-256(raw))`. Never commit bearers, `.kqpb` files, or the relay database.
 
 ## Working conventions
 

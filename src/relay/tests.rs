@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::key_tree::{PublicEdge, PublicNode, PublicTree};
 use crate::keys;
 use crate::relay::{self, ApiKeyScope, AppState, NewApiKey, MAX_ENVELOPE_BYTES};
 use axum::body::Body;
@@ -381,4 +382,216 @@ async fn live_listener_round_trip_with_ureq() {
 #[test]
 fn max_envelope_constant_is_one_mib() {
     assert_eq!(MAX_ENVELOPE_BYTES, 1024 * 1024);
+}
+
+fn split_node(label: &str, parent: Option<&str>) -> PublicNode {
+    PublicNode {
+        label: label.into(),
+        parent_label: parent.map(str::to_string),
+        threshold: Some(2),
+        is_active: true,
+        encryption_fingerprint: None,
+        encryption_public_key: None,
+    }
+}
+
+fn leaf_node(label: &str, parent: &str, public_key: &[u8; 32]) -> PublicNode {
+    PublicNode {
+        label: label.into(),
+        parent_label: Some(parent.into()),
+        threshold: None,
+        is_active: true,
+        encryption_fingerprint: Some(keys::fingerprint(public_key)),
+        encryption_public_key: Some(hex::encode(public_key)),
+    }
+}
+
+fn example_org_tree(link_ma1: bool) -> (PublicTree, [u8; 32]) {
+    let (_a1_sk, a1) = keys::generate_encryption_keypair();
+    let (_a2_sk, a2) = keys::generate_encryption_keypair();
+    let (_s1_sk, s1) = keys::generate_encryption_keypair();
+    let (_s2_sk, s2) = keys::generate_encryption_keypair();
+    let mut links = vec![PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.A.2".into(),
+    }];
+    let mut whitelist = vec![
+        PublicEdge {
+            from: "M.S.2".into(),
+            to: "M.A.2".into(),
+        },
+        PublicEdge {
+            from: "M.A.2".into(),
+            to: "M.S.2".into(),
+        },
+    ];
+    if link_ma1 {
+        links.push(PublicEdge {
+            from: "M.S.2".into(),
+            to: "M.A.1".into(),
+        });
+        whitelist.push(PublicEdge {
+            from: "M.S.2".into(),
+            to: "M.A.1".into(),
+        });
+        whitelist.push(PublicEdge {
+            from: "M.A.1".into(),
+            to: "M.S.2".into(),
+        });
+    }
+    let tree = PublicTree {
+        label: "org".into(),
+        generation: 1,
+        nodes: vec![
+            split_node("M", None),
+            split_node("M.A", Some("M")),
+            split_node("M.S", Some("M")),
+            leaf_node("M.A.1", "M.A", &a1),
+            leaf_node("M.A.2", "M.A", &a2),
+            leaf_node("M.S.1", "M.S", &s1),
+            leaf_node("M.S.2", "M.S", &s2),
+        ],
+        whitelist,
+        links,
+    };
+    (tree, s2)
+}
+
+fn node_labels(tree: &PublicTree) -> Vec<String> {
+    let mut labels: Vec<_> = tree.nodes.iter().map(|n| n.label.clone()).collect();
+    labels.sort();
+    labels
+}
+
+#[test]
+fn org_tree_put_and_context_omits_unrelated_peer_sibling() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (tree, s2) = example_org_tree(false);
+    let stored = relay::put_public_tree(&conn, &tree).expect("put");
+    assert_eq!(stored.generation, 1);
+    let fp = keys::fingerprint(&s2);
+    let slice = relay::context_for_fingerprint(&conn, "org", &fp).expect("context");
+    assert_eq!(
+        node_labels(&slice),
+        vec!["M", "M.A", "M.A.2", "M.S", "M.S.1", "M.S.2"]
+    );
+
+    let mut with_ma1 = tree.clone();
+    with_ma1.links.push(PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.A.1".into(),
+    });
+    with_ma1.whitelist.push(PublicEdge {
+        from: "M.S.2".into(),
+        to: "M.A.1".into(),
+    });
+    with_ma1.whitelist.push(PublicEdge {
+        from: "M.A.1".into(),
+        to: "M.S.2".into(),
+    });
+    let stored = relay::put_public_tree(&conn, &with_ma1).expect("put again");
+    assert_eq!(stored.generation, 2);
+    let slice = relay::context_for_fingerprint(&conn, "org", &fp).expect("expanded");
+    assert!(node_labels(&slice).contains(&"M.A.1".to_string()));
+    assert!(matches!(
+        relay::context_for_fingerprint(&conn, "org", "deadbeef"),
+        Err(Error::NodeNotFound)
+    ));
+    assert!(matches!(
+        relay::get_public_tree(&conn, "missing"),
+        Err(Error::TreeNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn router_publish_and_fetch_tree_context() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (tree, s2) = example_org_tree(false);
+    let fp = keys::fingerprint(&s2);
+    let admin = admin_key(&conn);
+    let pull = pull_key(&conn, &fp);
+    let push = push_key(&conn);
+    let app = relay::router(AppState::new(conn));
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/trees")
+                .header("Authorization", format!("Bearer {pull}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&tree).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let published = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/trees")
+                .header("Authorization", format!("Bearer {admin}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&tree).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::OK);
+    let json = body_json(published).await;
+    assert_eq!(json["generation"], 1);
+
+    let push_denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/trees/org/context")
+                .header("Authorization", format!("Bearer {push}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(push_denied.status(), StatusCode::FORBIDDEN);
+
+    let got = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/trees/org/context")
+                .header("Authorization", format!("Bearer {pull}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let json = body_json(got).await;
+    let labels: Vec<&str> = json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["label"].as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"M.A.2"));
+    assert!(!labels.contains(&"M.A.1"));
+
+    let spec = app
+        .oneshot(
+            Request::builder()
+                .uri("/api-docs/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let spec_json = body_json(spec).await;
+    assert!(spec_json["paths"]["/trees"].is_object());
+    assert!(spec_json["paths"]["/trees/{label}/context"].is_object());
 }

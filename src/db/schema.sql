@@ -29,8 +29,10 @@ CREATE TABLE IF NOT EXISTS keys (
 -- One row per node in a key's split tree. A node is either a SPLIT node
 -- (threshold set, hardware_key_id/wrapped_share NULL — reconstructing it
 -- means Shamir-recovering at least `threshold` of its children's values)
--- or a LEAF (hardware_key_id/wrapped_share set, threshold NULL — a share
--- sealed to one specific hardware key). parent_id NULL marks a key's root
+-- or a LEAF (hardware_key_id set, threshold NULL — a share sealed to one
+-- specific hardware key). wrapped_share may be NULL on a leaf when this
+-- store only holds topology for that person (a peer or sibling whose
+-- sealed share lives on their device). parent_id NULL marks a key's root
 -- node. A flat "M-of-N hardware keys" quorum is just a one-level tree: a
 -- single SPLIT root with N LEAF children.
 CREATE TABLE IF NOT EXISTS key_nodes (
@@ -45,7 +47,7 @@ CREATE TABLE IF NOT EXISTS key_nodes (
     is_active         INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
     CHECK (
         (threshold IS NOT NULL AND hardware_key_id IS NULL AND wrapped_share IS NULL)
-        OR (threshold IS NULL AND hardware_key_id IS NOT NULL AND wrapped_share IS NOT NULL)
+        OR (threshold IS NULL AND hardware_key_id IS NOT NULL)
     )
 );
 

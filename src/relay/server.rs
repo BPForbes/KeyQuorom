@@ -3,14 +3,16 @@
 use super::api_key::{self, ApiKeyInfo, ApiKeyScope, CreatedApiKey, NewApiKey};
 use super::client::{ErrorBody, InboxAccepted, InboxEnvelope, InboxList};
 use super::mailbox;
+use super::org_tree;
 use crate::error::Error;
+use crate::key_tree::{PublicEdge, PublicNode, PublicTree};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -92,13 +94,16 @@ impl From<Error> for ApiError {
                 status: StatusCode::FORBIDDEN,
                 message: "forbidden".to_string(),
             },
-            Error::InvalidApiKeyRequest | Error::InvalidBridgePackage | Error::InvalidPublicKey => {
-                Self {
-                    status: StatusCode::BAD_REQUEST,
-                    message: err.to_string(),
-                }
-            }
-            Error::ApiKeyNotFound => Self {
+            Error::InvalidApiKeyRequest
+            | Error::InvalidBridgePackage
+            | Error::InvalidPublicKey
+            | Error::InvalidTreeSpec
+            | Error::DuplicateNodeLabel
+            | Error::InvalidBridge => Self {
+                status: StatusCode::BAD_REQUEST,
+                message: err.to_string(),
+            },
+            Error::ApiKeyNotFound | Error::TreeNotFound | Error::NodeNotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 message: err.to_string(),
             },
@@ -231,7 +236,17 @@ impl Modify for SecurityAddon {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, post_inbox, get_inbox, create_key, list_keys, rotate_key, revoke_key),
+    paths(
+        health,
+        post_inbox,
+        get_inbox,
+        create_key,
+        list_keys,
+        rotate_key,
+        revoke_key,
+        put_tree,
+        get_tree_context
+    ),
     components(
         schemas(
             HealthResponse,
@@ -241,13 +256,17 @@ impl Modify for SecurityAddon {
             ErrorBody,
             CreateApiKeyBody,
             ApiKeyCreated,
-            ApiKeyView
+            ApiKeyView,
+            PublicTree,
+            PublicNode,
+            PublicEdge
         )
     ),
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
-        (name = "api-keys", description = "API key administration")
+        (name = "api-keys", description = "API key administration"),
+        (name = "trees", description = "Canonical public split-tree topology")
     )
 )]
 struct ApiDoc;
@@ -451,6 +470,59 @@ async fn revoke_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    put,
+    path = "/trees",
+    tag = "trees",
+    request_body = PublicTree,
+    responses(
+        (status = 200, description = "Public tree replaced", body = PublicTree),
+        (status = 400, description = "Malformed tree", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody)
+    ),
+    security(("api_key" = []))
+)]
+async fn put_tree(
+    State(state): State<AppState>,
+    ApiToken(token): ApiToken,
+    Json(tree): Json<PublicTree>,
+) -> Result<Json<PublicTree>, ApiError> {
+    let stored = with_conn(&state, move |conn| {
+        api_key::authenticate(conn, &token, ApiKeyScope::Admin)?;
+        org_tree::put_public_tree(conn, &tree)
+    })
+    .await?;
+    Ok(Json(stored))
+}
+
+#[utoipa::path(
+    get,
+    path = "/trees/{label}/context",
+    tag = "trees",
+    params(("label" = String, Path, description = "keys.label of the published tree")),
+    responses(
+        (status = 200, description = "Visible public-tree slice for this pull key", body = PublicTree),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Unknown tree or fingerprint", body = ErrorBody)
+    ),
+    security(("api_key" = []))
+)]
+async fn get_tree_context(
+    State(state): State<AppState>,
+    ApiToken(token): ApiToken,
+    Path(label): Path<String>,
+) -> Result<Json<PublicTree>, ApiError> {
+    let slice = with_conn(&state, move |conn| {
+        let auth = api_key::authenticate(conn, &token, ApiKeyScope::InboxPull)?;
+        let fingerprint = auth.recipient_fingerprint.ok_or(Error::ApiKeyScopeDenied)?;
+        org_tree::context_for_fingerprint(conn, &label, &fingerprint)
+    })
+    .await?;
+    Ok(Json(slice))
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
@@ -459,6 +531,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api-keys", post(create_key).get(list_keys))
         .route("/api-keys/{id}/rotate", post(rotate_key))
         .route("/api-keys/{id}/revoke", post(revoke_key))
+        .route("/trees", put(put_tree))
+        .route("/trees/{label}/context", get(get_tree_context))
         .layer(DefaultBodyLimit::max(MAX_ENVELOPE_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

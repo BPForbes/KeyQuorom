@@ -1,13 +1,15 @@
-//! Online mailbox for opaque `.kqpb` envelopes.
+//! Online mailbox for opaque `.kqpb` envelopes, plus the canonical
+//! *public* split-tree topology.
 //!
-//! The relay is transport only: it stores and forwards sealed packages
-//! indexed by the recipient X25519 fingerprint from the outer header. It
-//! never unseals envelopes and never holds organization SQLite data or
-//! private keys.
+//! The relay never unseals envelopes and never holds wrapped shares or
+//! private keys. It may store public labels, encryption fingerprints,
+//! public keys, whitelist, and established links so a personal store can
+//! fetch only the slice that person needs.
 
 mod api_key;
 mod client;
 mod mailbox;
+mod org_tree;
 mod server;
 
 pub use api_key::{
@@ -15,8 +17,12 @@ pub use api_key::{
     revoke as revoke_api_key, rotate as rotate_api_key, ApiKeyInfo, ApiKeyScope, AuthedKey,
     CreatedApiKey, NewApiKey,
 };
-pub use client::{pull as pull_inbox, push as push_inbox, InboxAccepted, InboxEnvelope, InboxList};
+pub use client::{
+    fetch_tree_context, publish_tree, pull as pull_inbox, push as push_inbox, InboxAccepted,
+    InboxEnvelope, InboxList,
+};
 pub use mailbox::{list_after, store, StoredEnvelope};
+pub use org_tree::{context_for_fingerprint, get_public_tree, put_public_tree};
 pub use server::{router, AppState, MAX_ENVELOPE_BYTES};
 
 use crate::error::Result;
@@ -26,7 +32,8 @@ use std::time::Duration;
 const SCHEMA: &str = include_str!("schema.sql");
 
 /// Opens (creating if needed) the relay's own SQLite database and applies
-/// the mailbox schema. This is not the organization database.
+/// the mailbox + public-tree schema. This is not a personal organization
+/// database and must not receive wrapped shares or private keys.
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     init(&conn)?;

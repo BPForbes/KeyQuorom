@@ -48,6 +48,7 @@ pub enum Error {
     ApiKeyScopeDenied,
     ApiKeyNotFound,
     RelayRequest(String),
+    TreeNotFound,
 }
 
 impl fmt::Display for Error {
@@ -153,6 +154,7 @@ impl fmt::Display for Error {
             Error::ApiKeyScopeDenied => write!(f, "API key is not permitted for this operation"),
             Error::ApiKeyNotFound => write!(f, "no API key with that id exists"),
             Error::RelayRequest(msg) => write!(f, "relay request failed: {msg}"),
+            Error::TreeNotFound => write!(f, "no published tree with that label exists"),
         }
     }
 }

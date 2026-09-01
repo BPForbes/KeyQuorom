@@ -18,7 +18,7 @@ use keyquorum::{
     db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, relay, sharing, signing,
     vault,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
@@ -180,19 +180,9 @@ enum Command {
         #[arg(long)]
         register: bool,
     },
-    /// Print live split trees, one tree, the LCA of --node labels, or
-    /// write the live spec JSON
-    Tree {
-        /// Split-tree id from `list` / `split`. Omit to list every tree.
-        key_id: Option<i64>,
-        /// Two or more node labels or key files: print their lowest
-        /// common ancestor instead of the full tree
-        #[arg(long = "node", num_args = 2.., requires = "key_id")]
-        nodes: Vec<String>,
-        /// Write a snapshot of the live tree (active nodes and binds)
-        #[arg(long, conflicts_with = "nodes", requires = "key_id")]
-        output: Option<PathBuf>,
-    },
+    /// Print live split trees, one tree, the LCA of --node labels, write
+    /// the live spec JSON, or publish/fetch/project a public slice
+    Tree(TreeArgs),
     /// Reconstruct a key's secret from raw shares
     Reconstruct {
         key_id: i64,
@@ -302,6 +292,56 @@ impl From<CliKeyType> for KeyType {
             CliKeyType::Signing => KeyType::Signing,
         }
     }
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct TreeArgs {
+    #[command(subcommand)]
+    command: Option<TreeCommand>,
+    /// Split-tree id from `list` / `split`. Omit to list every tree.
+    key_id: Option<i64>,
+    /// Two or more node labels or key files: print their lowest
+    /// common ancestor instead of the full tree
+    #[arg(long = "node", num_args = 2.., requires = "key_id")]
+    nodes: Vec<String>,
+    /// Write a snapshot of the live tree (active nodes and binds)
+    #[arg(long, conflicts_with = "nodes", requires = "key_id")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum TreeCommand {
+    /// Upload this store's public topology (no sealed shares) to the relay
+    Publish {
+        key_id: i64,
+        /// Relay base URL (or KEYQUORUM_RELAY_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// Admin-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Download the slice this pull key is allowed to see and merge it here
+    Fetch {
+        /// Local key id to update. Default: match the published tree label.
+        key_id: Option<i64>,
+        /// Published `keys.label` when this store has no local key id yet
+        #[arg(long, required_unless_present = "key_id")]
+        label: Option<String>,
+        /// Relay base URL (or KEYQUORUM_RELAY_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// Pull-scope API key (or KEYQUORUM_RELAY_API_KEY, or a prompt)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Drop local nodes this viewpoint does not need (no network)
+    Project {
+        key_id: i64,
+        #[arg(long)]
+        as_node: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -648,7 +688,7 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         | Command::Split { .. }
         | Command::Bind { .. }
         | Command::Add { .. }
-        | Command::Tree { .. }
+        | Command::Tree(_)
         | Command::Reconstruct { .. }
         | Command::Bridge { .. } => run_tree_command(&mut conn, command)?,
         Command::Verify {
@@ -940,31 +980,7 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
             key_tree::bind_leaf_to_active_siblings(conn, key_id, &node)?;
             println!("Added {node} (node {new_id}); parent shares refreshed");
         }
-        Command::Tree {
-            key_id,
-            nodes,
-            output,
-        } => match key_id {
-            None => {
-                let trees = key_tree::list_trees(conn)?;
-                if trees.is_empty() {
-                    println!("(no split trees)");
-                } else {
-                    for tree in trees {
-                        println!("{}\t{}", tree.key_id, tree.label);
-                    }
-                }
-            }
-            Some(key_id) if nodes.is_empty() => {
-                let summary = key_tree::describe(conn, key_id)?;
-                println!("{} (key {})", summary.label, summary.key_id);
-                print_tree_node(&summary.root, 0);
-                if let Some(path) = output {
-                    write_live_spec(conn, key_id, &path)?;
-                }
-            }
-            Some(key_id) => print_lca(conn, key_id, &nodes)?,
-        },
+        Command::Tree(args) => run_tree(conn, args)?,
         Command::Reconstruct {
             key_id,
             nodes,
@@ -997,6 +1013,89 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
         | Command::Relay { .. } => unreachable!("non-tree commands are dispatched in run()"),
     }
     Ok(())
+}
+
+fn run_tree(conn: &Connection, args: TreeArgs) -> Result<()> {
+    match args.command {
+        Some(TreeCommand::Publish {
+            key_id,
+            url,
+            api_key,
+        }) => {
+            let snapshot = key_tree::export_public_tree(conn, key_id)?;
+            let url = relay_url(url)?;
+            let api_key = relay_api_key(api_key)?;
+            let stored = relay::publish_tree(&url, &api_key, &snapshot)?;
+            println!(
+                "Published {} (generation {}, {} nodes)",
+                stored.label,
+                stored.generation,
+                stored.nodes.len()
+            );
+        }
+        Some(TreeCommand::Fetch {
+            key_id,
+            label,
+            url,
+            api_key,
+        }) => {
+            let label = match (label, key_id) {
+                (Some(label), _) => label,
+                (None, Some(id)) => key_label(conn, id)?,
+                (None, None) => {
+                    fatal_usage_error("tree fetch requires a key id or --label");
+                }
+            };
+            let url = relay_url(url)?;
+            let api_key = relay_api_key(api_key)?;
+            let slice = relay::fetch_tree_context(&url, &api_key, &label)?;
+            let applied = key_tree::apply_public_tree(conn, key_id, &slice)?;
+            println!(
+                "Merged {} (generation {}, {} nodes) into key {applied}",
+                slice.label,
+                slice.generation,
+                slice.nodes.len()
+            );
+        }
+        Some(TreeCommand::Project { key_id, as_node }) => {
+            let visible = key_tree::project_local(conn, key_id, &as_node)?;
+            let mut labels: Vec<_> = visible.into_iter().collect();
+            labels.sort();
+            println!("Projected key {key_id} as {as_node}: {}", labels.join(", "));
+        }
+        None => match args.key_id {
+            None => {
+                let trees = key_tree::list_trees(conn)?;
+                if trees.is_empty() {
+                    println!("(no split trees)");
+                } else {
+                    for tree in trees {
+                        println!("{}\t{}", tree.key_id, tree.label);
+                    }
+                }
+            }
+            Some(key_id) if args.nodes.is_empty() => {
+                let summary = key_tree::describe(conn, key_id)?;
+                println!("{} (key {})", summary.label, summary.key_id);
+                print_tree_node(&summary.root, 0);
+                if let Some(path) = args.output {
+                    write_live_spec(conn, key_id, &path)?;
+                }
+            }
+            Some(key_id) => print_lca(conn, key_id, &args.nodes)?,
+        },
+    }
+    Ok(())
+}
+
+fn key_label(conn: &Connection, key_id: i64) -> Result<String> {
+    conn.query_row(
+        "SELECT label FROM keys WHERE id = ?1",
+        rusqlite::params![key_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or(Error::TreeNotFound)
 }
 
 fn run_bridge(conn: &Connection, command: BridgeCommand) -> Result<()> {

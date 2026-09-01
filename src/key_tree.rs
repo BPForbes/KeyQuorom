@@ -17,6 +17,7 @@ use blahaj::{Share, Sharks};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use utoipa::ToSchema;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
@@ -1207,6 +1208,403 @@ fn describe_row(
         },
     )?;
     Ok(row)
+}
+
+/// Public topology of a split tree: labels, thresholds, hardware
+/// fingerprints, whitelist, and established links. No wrapped shares.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct PublicTree {
+    pub label: String,
+    pub generation: u32,
+    pub nodes: Vec<PublicNode>,
+    pub whitelist: Vec<PublicEdge>,
+    pub links: Vec<PublicEdge>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct PublicNode {
+    pub label: String,
+    pub parent_label: Option<String>,
+    pub threshold: Option<u8>,
+    pub is_active: bool,
+    pub encryption_fingerprint: Option<String>,
+    pub encryption_public_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct PublicEdge {
+    pub from: String,
+    pub to: String,
+}
+
+/// Snapshot this store's tree without sealed shares — safe to publish.
+pub fn export_public_tree(conn: &Connection, key_id: i64) -> Result<PublicTree> {
+    let label: String = conn
+        .query_row(
+            "SELECT label FROM keys WHERE id = ?1",
+            params![key_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(Error::TreeNotFound)?;
+    let tree = KeyQuorumTree::load(conn, key_id)?;
+    let mut nodes = Vec::with_capacity(tree.nodes.len());
+    for node in &tree.nodes {
+        let parent_label = node.parent_idx.map(|i| tree.nodes[i].id.clone());
+        let (encryption_fingerprint, encryption_public_key) = match node.hardware_key_id {
+            Some(id) => {
+                let key = keys::get_key(conn, id)?;
+                (Some(key.fingerprint), Some(hex::encode(key.public_key)))
+            }
+            None => (None, None),
+        };
+        nodes.push(PublicNode {
+            label: node.id.clone(),
+            parent_label,
+            threshold: node.threshold.map(|t| t as u8),
+            is_active: node.is_active,
+            encryption_fingerprint,
+            encryption_public_key,
+        });
+    }
+    let listing = list_bridges(conn, key_id)?;
+    Ok(PublicTree {
+        label,
+        generation: 1,
+        nodes,
+        whitelist: listing
+            .allowed
+            .into_iter()
+            .map(|(from, to)| PublicEdge { from, to })
+            .collect(),
+        links: listing
+            .established
+            .into_iter()
+            .map(|e| PublicEdge {
+                from: e.from,
+                to: e.to,
+            })
+            .collect(),
+    })
+}
+
+/// Labels this person needs locally: own lineage, own descendants,
+/// siblings of the seed, and the fixpoint of established bridge peers
+/// (peer + peer ancestors). A peer's unrelated siblings stay out until
+/// a later fetch after a bridge reaches them. Whitelist-only pairs do
+/// not expand visibility.
+pub fn visible_labels(conn: &Connection, key_id: i64, as_label: &str) -> Result<HashSet<String>> {
+    let tree = KeyQuorumTree::load(conn, key_id)?;
+    let listing = list_bridges(conn, key_id)?;
+    let links: Vec<(String, String)> = listing
+        .established
+        .iter()
+        .map(|edge| (edge.from.clone(), edge.to.clone()))
+        .collect();
+    visible_labels_for_links(&tree, &links, as_label)
+}
+
+/// Visibility using established undirected links (not whitelist-only).
+pub fn visible_labels_for_links(
+    tree: &KeyQuorumTree,
+    links: &[(String, String)],
+    as_label: &str,
+) -> Result<HashSet<String>> {
+    let start = tree.index_by_label(as_label)?;
+    let mut parent_of = HashMap::new();
+    let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+    for node in &tree.nodes {
+        let parent = node.parent_idx.map(|i| tree.nodes[i].id.clone());
+        parent_of.insert(node.id.clone(), parent.clone());
+        if let Some(p) = parent {
+            children_of.entry(p).or_default().push(node.id.clone());
+        }
+    }
+    Ok(visible_from_maps(
+        &parent_of,
+        &children_of,
+        links,
+        std::slice::from_ref(&tree.nodes[start].id),
+    ))
+}
+
+/// Same visibility rule over a published public tree (server-side).
+pub fn visible_labels_in_public_tree(full: &PublicTree, seeds: &[String]) -> HashSet<String> {
+    let mut parent_of = HashMap::new();
+    let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+    for node in &full.nodes {
+        parent_of.insert(node.label.clone(), node.parent_label.clone());
+        if let Some(parent) = &node.parent_label {
+            children_of
+                .entry(parent.clone())
+                .or_default()
+                .push(node.label.clone());
+        }
+    }
+    let links: Vec<(String, String)> = full
+        .links
+        .iter()
+        .map(|edge| (edge.from.clone(), edge.to.clone()))
+        .collect();
+    visible_from_maps(&parent_of, &children_of, &links, seeds)
+}
+
+pub fn visible_from_maps(
+    parent_of: &HashMap<String, Option<String>>,
+    children_of: &HashMap<String, Vec<String>>,
+    links: &[(String, String)],
+    seeds: &[String],
+) -> HashSet<String> {
+    let mut visible = HashSet::new();
+    for seed in seeds {
+        if !parent_of.contains_key(seed) {
+            continue;
+        }
+        let mut cur = Some(seed.clone());
+        while let Some(label) = cur {
+            visible.insert(label.clone());
+            cur = parent_of.get(&label).cloned().flatten();
+        }
+        add_descendants(children_of, seed, &mut visible);
+        if let Some(parent) = parent_of.get(seed).cloned().flatten() {
+            if let Some(siblings) = children_of.get(&parent) {
+                for sib in siblings {
+                    visible.insert(sib.clone());
+                }
+            }
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (a, b) in links {
+            let a_vis = visible.contains(a);
+            let b_vis = visible.contains(b);
+            if a_vis == b_vis {
+                continue;
+            }
+            let incoming = if a_vis { b } else { a };
+            let mut cur = Some(incoming.clone());
+            while let Some(label) = cur {
+                if visible.insert(label.clone()) {
+                    grew = true;
+                }
+                cur = parent_of.get(&label).cloned().flatten();
+            }
+        }
+    }
+    visible
+}
+
+fn add_descendants(
+    children_of: &HashMap<String, Vec<String>>,
+    start: &str,
+    visible: &mut HashSet<String>,
+) {
+    let mut stack = vec![start.to_string()];
+    while let Some(label) = stack.pop() {
+        let Some(children) = children_of.get(&label) else {
+            continue;
+        };
+        for child in children {
+            if visible.insert(child.clone()) {
+                stack.push(child.clone());
+            }
+        }
+    }
+}
+
+pub fn filter_public_tree(full: &PublicTree, visible: &HashSet<String>) -> PublicTree {
+    PublicTree {
+        label: full.label.clone(),
+        generation: full.generation,
+        nodes: full
+            .nodes
+            .iter()
+            .filter(|n| visible.contains(&n.label))
+            .cloned()
+            .collect(),
+        whitelist: full
+            .whitelist
+            .iter()
+            .filter(|e| visible.contains(&e.from) && visible.contains(&e.to))
+            .cloned()
+            .collect(),
+        links: full
+            .links
+            .iter()
+            .filter(|e| visible.contains(&e.from) && visible.contains(&e.to))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Keep only the subgraph `as_label` needs. Sealed shares on remaining
+/// leaves are preserved.
+pub fn project_local(conn: &Connection, key_id: i64, as_label: &str) -> Result<HashSet<String>> {
+    let full = export_public_tree(conn, key_id)?;
+    let visible = visible_labels(conn, key_id, as_label)?;
+    let slice = filter_public_tree(&full, &visible);
+    apply_public_tree(conn, Some(key_id), &slice)?;
+    Ok(visible)
+}
+
+/// Merge a public slice into this store and drop nodes not in the slice.
+/// Does not overwrite an existing `wrapped_share`.
+pub fn apply_public_tree(
+    conn: &Connection,
+    key_id: Option<i64>,
+    snapshot: &PublicTree,
+) -> Result<i64> {
+    if snapshot.nodes.is_empty() {
+        return Err(Error::InvalidTreeSpec);
+    }
+    let key_id = match key_id {
+        Some(id) => {
+            let label: Option<String> = conn
+                .query_row("SELECT label FROM keys WHERE id = ?1", params![id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let label = label.ok_or(Error::TreeNotFound)?;
+            if label != snapshot.label {
+                return Err(Error::InvalidTreeSpec);
+            }
+            id
+        }
+        None => {
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM keys WHERE label = ?1",
+                    params![snapshot.label],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(id) => id,
+                None => {
+                    conn.execute(
+                        "INSERT INTO keys (label) VALUES (?1)",
+                        params![snapshot.label],
+                    )?;
+                    conn.last_insert_rowid()
+                }
+            }
+        }
+    };
+
+    let remaining: HashSet<String> = snapshot.nodes.iter().map(|n| n.label.clone()).collect();
+    if remaining.len() != snapshot.nodes.len() {
+        return Err(Error::DuplicateNodeLabel);
+    }
+    let mut pending = snapshot.nodes.clone();
+    let mut ready = HashSet::new();
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut next = Vec::new();
+        for node in pending {
+            if let Some(parent) = &node.parent_label {
+                if remaining.contains(parent) && !ready.contains(parent) {
+                    next.push(node);
+                    continue;
+                }
+            }
+            apply_public_node(conn, key_id, &node)?;
+            ready.insert(node.label.clone());
+        }
+        if next.len() == before {
+            return Err(Error::InvalidTreeSpec);
+        }
+        pending = next;
+    }
+
+    let labels: Vec<String> = conn
+        .prepare("SELECT label FROM key_nodes WHERE key_id = ?1")?
+        .query_map(params![key_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for label in labels {
+        if !remaining.contains(&label) {
+            conn.execute(
+                "DELETE FROM key_nodes WHERE key_id = ?1 AND label = ?2",
+                params![key_id, label],
+            )?;
+        }
+    }
+
+    conn.execute(
+        "DELETE FROM key_node_bridges WHERE node_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)",
+        params![key_id],
+    )?;
+    conn.execute(
+        "DELETE FROM key_node_links WHERE node_a_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)
+            OR node_b_id IN (SELECT id FROM key_nodes WHERE key_id = ?1)",
+        params![key_id],
+    )?;
+    for edge in &snapshot.whitelist {
+        allow_bridge(conn, key_id, &edge.from, &edge.to)?;
+    }
+    for edge in &snapshot.links {
+        add_bridge(conn, key_id, &edge.from, &edge.to)?;
+    }
+    Ok(key_id)
+}
+
+fn apply_public_node(conn: &Connection, key_id: i64, node: &PublicNode) -> Result<()> {
+    let parent_id: Option<i64> = match &node.parent_label {
+        Some(label) => Some(node_id_for_label(conn, key_id, label)?),
+        None => None,
+    };
+    let hardware_key_id = match (
+        node.encryption_public_key.as_deref(),
+        node.encryption_fingerprint.as_deref(),
+    ) {
+        (Some(hex_pk), expected_fp) => {
+            let pk = hex::decode(hex_pk).map_err(|_| Error::InvalidPublicKey)?;
+            let id = keys::get_or_register_encryption(conn, &node.label, &pk)?;
+            if let Some(expected_fp) = expected_fp {
+                let key = keys::get_key(conn, id)?;
+                if key.fingerprint != expected_fp {
+                    return Err(Error::InvalidPublicKey);
+                }
+            }
+            Some(id)
+        }
+        (None, Some(fp)) => Some(keys::get_key_by_fingerprint(conn, fp)?.id),
+        (None, None) => None,
+    };
+    if node.threshold.is_none() && hardware_key_id.is_none() {
+        return Err(Error::InvalidTreeSpec);
+    }
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM key_nodes WHERE key_id = ?1 AND label = ?2",
+            params![key_id, node.label],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let is_active = i64::from(u8::from(node.is_active));
+    if let Some(id) = existing {
+        conn.execute(
+            "UPDATE key_nodes SET parent_id = ?1, threshold = ?2,
+                    hardware_key_id = COALESCE(?3, hardware_key_id), is_active = ?4
+             WHERE id = ?5",
+            params![parent_id, node.threshold, hardware_key_id, is_active, id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO key_nodes (key_id, parent_id, label, threshold, hardware_key_id, is_active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key_id,
+                parent_id,
+                node.label,
+                node.threshold,
+                hardware_key_id,
+                is_active
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

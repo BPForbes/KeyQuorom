@@ -76,6 +76,28 @@ fn key_node_leaf_backed_by_encryption_key_is_allowed() {
 }
 
 #[test]
+fn key_node_topology_only_leaf_is_allowed() {
+    let conn = open_in_memory().expect("schema should apply");
+    seed_encryption_key(&conn, 1);
+    seed_key(&conn, 1);
+
+    let result = conn.execute(
+        "INSERT INTO key_nodes (key_id, label, hardware_key_id)
+             VALUES (1, 'peer', 1)",
+        [],
+    );
+    assert!(result.is_ok());
+    let share: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT wrapped_share FROM key_nodes WHERE label = 'peer'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("row");
+    assert!(share.is_none());
+}
+
+#[test]
 fn key_node_leaf_cannot_be_reassigned_to_a_signing_key_via_update() {
     let conn = open_in_memory().expect("schema should apply");
     seed_encryption_key(&conn, 1);
