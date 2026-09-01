@@ -99,6 +99,9 @@ fn init(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "provider"))]
+#[cfg(test)]
+mod test_helpers;
+
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

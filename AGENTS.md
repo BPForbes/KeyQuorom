@@ -53,6 +53,12 @@ Run format, lint, and tests before considering any change complete.
   guide exists yet.
 - Keep changes minimal and scoped to the request. Avoid speculative abstractions or
   unrelated scaffolding.
+- Put tests in their own file next to the module they cover, not in an inline
+  `#[cfg(test)]` module inside the implementation. Use `src/<module>/tests.rs`
+  (directory module: `#[cfg(test)] mod tests;`) or `src/<module>.rs` with
+  `#[cfg(test)] #[path = "<module>/tests.rs"] mod tests;`. Nested files such as
+  `src/relay/client.rs` load `src/relay/client/tests.rs` the same way. Shared
+  test helpers belong in a `#[cfg(test)]` module, not in production code.
 
 ## Security
 
