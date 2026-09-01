@@ -257,6 +257,13 @@ fn top_level_tree_and_bridge_parse() {
     .is_ok());
     assert!(Cli::try_parse_from(["keyquorum", "revoke", "3", "--evict"]).is_ok());
     assert!(Cli::try_parse_from(["keyquorum", "tree"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "publish", "1"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch", "1"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch", "--label", "master"]).is_ok());
+    assert!(Cli::try_parse_from(["keyquorum", "tree", "fetch"]).is_err());
+    assert!(
+        Cli::try_parse_from(["keyquorum", "tree", "project", "1", "--as-node", "M.S.2"]).is_err()
+    );
     assert!(Cli::try_parse_from([
         "keyquorum",
         "generate",
@@ -335,4 +342,61 @@ fn infer_root_label_from_dotted_leaves_or_fallback() {
         infer_root_label(&["M.S".into(), "M.A".into()], Some("org"), "master").unwrap(),
         "org"
     );
+}
+
+#[test]
+fn relay_push_requires_dir() {
+    assert!(Cli::try_parse_from(["keyquorum", "relay", "push"]).is_err());
+}
+
+#[test]
+fn relay_pull_requires_output_or_import() {
+    assert!(Cli::try_parse_from(["keyquorum", "relay", "pull"]).is_err());
+}
+
+#[test]
+fn relay_pull_import_requires_share_file() {
+    assert!(Cli::try_parse_from(["keyquorum", "relay", "pull", "--import"]).is_err());
+}
+
+#[test]
+fn relay_pull_import_with_share_file_parses() {
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "relay",
+        "pull",
+        "--import",
+        "--share-file",
+        "alice.key",
+        "--url",
+        "http://127.0.0.1:8787",
+    ])
+    .is_ok());
+}
+
+#[test]
+fn relay_push_with_dir_parses() {
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "relay",
+        "push",
+        "--dir",
+        "./packages",
+        "--url",
+        "http://127.0.0.1:8787",
+    ])
+    .is_ok());
+}
+
+#[test]
+fn loadkey_parses_with_and_without_positional_key() {
+    assert!(Cli::try_parse_from(["keyquorum", "loadkey"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "loadkey",
+        "kq_example",
+        "--url",
+        "http://127.0.0.1:8787",
+    ])
+    .is_ok());
 }

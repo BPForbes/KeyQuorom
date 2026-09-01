@@ -41,6 +41,17 @@ pub enum Error {
     /// Two parties whose node labels differ but reduce to the same delivery
     /// file name, which would leave one of them without an envelope.
     AmbiguousDeliveryName(String),
+    InvalidApiKey,
+    InvalidApiKeyRequest,
+    ApiKeyExpired,
+    ApiKeyRevoked,
+    ApiKeyScopeDenied,
+    ApiKeyNotFound,
+    InvalidLicenseeKey,
+    OrganizationDatabase,
+    InvalidInboxPage,
+    RelayRequest(String),
+    TreeNotFound,
 }
 
 impl fmt::Display for Error {
@@ -134,6 +145,32 @@ impl fmt::Display for Error {
                     "two bridge parties both map to the delivery file {file}; rename one node label"
                 )
             }
+            Error::InvalidApiKey => write!(f, "invalid API key"),
+            Error::InvalidApiKeyRequest => {
+                write!(
+                    f,
+                    "API key request is malformed (scope, fingerprint, or expiry)"
+                )
+            }
+            Error::ApiKeyExpired => write!(f, "API key has expired"),
+            Error::ApiKeyRevoked => write!(f, "API key has been revoked"),
+            Error::ApiKeyScopeDenied => write!(f, "API key is not permitted for this operation"),
+            Error::ApiKeyNotFound => write!(f, "no API key with that id exists"),
+            Error::InvalidLicenseeKey => {
+                write!(
+                    f,
+                    "invalid licensee key; only the licensee can mint or rotate API keys"
+                )
+            }
+            Error::OrganizationDatabase => write!(
+                f,
+                "this SQLite file is an organization database; kq-relay needs a separate relay database"
+            ),
+            Error::InvalidInboxPage => {
+                write!(f, "inbox page size must be between 1 and 500")
+            }
+            Error::RelayRequest(msg) => write!(f, "relay request failed: {msg}"),
+            Error::TreeNotFound => write!(f, "no published tree with that label exists"),
         }
     }
 }

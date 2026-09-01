@@ -17,6 +17,21 @@ the envelopes exist. The two must stay in step in both directions: if the commit
 fails, the CLI deletes the `.kqpb` files it just wrote, because `write_owner_only`
 refuses to overwrite and leftovers would block the retry.
 
+The mailbox relay (`src/relay/`, `kq-relay`) stores opaque `.kqpb` envelopes and
+the canonical *public* split-tree as JSON documents (full context). It must never
+unseal envelopes or hold wrapped shares or private keys. `relay push` merges
+the sender's public topology into those documents and leaves nodes the sender
+does not hold in place; `tree publish` (admin) replaces a document. `relay pull`
+returns a sliced copy that the personal SQLite file translates. A personal SQLite
+file should keep only the subgraph that person needs (own lineage, siblings,
+descendants, and established-bridge peers plus those peers' ancestors). API keys
+are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
+are minted only by the licensee (`kq-relay keys create|rotate` with the `kql_…`
+issuer); HTTP cannot create or rotate bearers. `keyquorum loadkey` calls
+`POST /keycheck` (no auth) and stores that hash plus a sealed bearer in the
+personal SQLite file. Later commands re-check the hash and inject the bearer.
+Never commit bearers, `.kqpb` files, or the relay database.
+
 ## Setup / build / test
 
 - Build: `cargo build`
