@@ -1360,11 +1360,7 @@ pub fn visible_from_maps(
         if !parent_of.contains_key(seed) {
             continue;
         }
-        let mut cur = Some(seed.clone());
-        while let Some(label) = cur {
-            visible.insert(label.clone());
-            cur = parent_of.get(&label).cloned().flatten();
-        }
+        walk_ancestors(parent_of, seed, &mut visible);
         add_descendants(children_of, seed, &mut visible);
         if let Some(parent) = parent_of.get(seed).cloned().flatten() {
             if let Some(siblings) = children_of.get(&parent) {
@@ -1384,16 +1380,32 @@ pub fn visible_from_maps(
                 continue;
             }
             let incoming = if a_vis { b } else { a };
-            let mut cur = Some(incoming.clone());
-            while let Some(label) = cur {
-                if visible.insert(label.clone()) {
-                    grew = true;
-                }
-                cur = parent_of.get(&label).cloned().flatten();
+            if walk_ancestors(parent_of, incoming, &mut visible) {
+                grew = true;
             }
         }
     }
     visible
+}
+
+fn walk_ancestors(
+    parent_of: &HashMap<String, Option<String>>,
+    start: &str,
+    visible: &mut HashSet<String>,
+) -> bool {
+    let mut cur = Some(start.to_string());
+    let mut seen = HashSet::new();
+    let mut grew = false;
+    while let Some(label) = cur {
+        if !seen.insert(label.clone()) {
+            break;
+        }
+        if visible.insert(label.clone()) {
+            grew = true;
+        }
+        cur = parent_of.get(&label).cloned().flatten();
+    }
+    grew
 }
 
 fn add_descendants(

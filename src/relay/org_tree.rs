@@ -11,10 +11,31 @@ use crate::key_tree::{
     filter_public_tree, visible_labels_in_public_tree, PublicEdge, PublicNode, PublicTree,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub fn put_public_tree(conn: &Connection, snapshot: &PublicTree) -> Result<PublicTree> {
     validate_public_tree(snapshot)?;
+    with_immediate_transaction(conn, || persist_public_tree(conn, snapshot))
+}
+
+fn with_immediate_transaction<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f();
+    }
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    match f() {
+        Ok(value) => {
+            conn.execute("COMMIT", [])?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(err)
+        }
+    }
+}
+
+fn persist_public_tree(conn: &Connection, snapshot: &PublicTree) -> Result<PublicTree> {
     let existing: Option<(i64, i64)> = conn
         .query_row(
             "SELECT id, generation FROM org_trees WHERE label = ?1",
@@ -239,5 +260,94 @@ pub(crate) fn validate_public_tree(tree: &PublicTree) -> Result<()> {
             return Err(Error::InvalidBridge);
         }
     }
+    let mut seen_whitelist = HashSet::new();
+    for edge in &tree.whitelist {
+        if !seen_whitelist.insert((edge.from.as_str(), edge.to.as_str())) {
+            return Err(Error::InvalidBridge);
+        }
+    }
+    let mut seen_links = HashSet::new();
+    for edge in &tree.links {
+        if !seen_links.insert((edge.from.as_str(), edge.to.as_str())) {
+            return Err(Error::InvalidBridge);
+        }
+    }
+    let mut parent_of = HashMap::new();
+    let mut root = None;
+    for node in &tree.nodes {
+        parent_of.insert(node.label.as_str(), node.parent_label.as_deref());
+        if node.parent_label.is_none() {
+            root = Some(node.label.as_str());
+        }
+    }
+    let root = root.ok_or(Error::InvalidTreeSpec)?;
+    for node in &tree.nodes {
+        if !reaches_root(&parent_of, node.label.as_str(), root) {
+            return Err(Error::InvalidTreeSpec);
+        }
+    }
     Ok(())
+}
+
+fn reaches_root(parent_of: &HashMap<&str, Option<&str>>, start: &str, root: &str) -> bool {
+    let mut cur = Some(start);
+    let mut seen = HashSet::new();
+    while let Some(label) = cur {
+        if !seen.insert(label) {
+            return false;
+        }
+        if label == root {
+            return true;
+        }
+        cur = parent_of.get(label).copied().flatten();
+    }
+    false
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+    use crate::key_tree::{PublicEdge, PublicNode, PublicTree};
+
+    fn split(label: &str, parent: Option<&str>) -> PublicNode {
+        PublicNode {
+            label: label.into(),
+            parent_label: parent.map(str::to_string),
+            threshold: Some(2),
+            is_active: true,
+            encryption_fingerprint: None,
+            encryption_public_key: None,
+        }
+    }
+
+    fn tiny_tree() -> PublicTree {
+        PublicTree {
+            label: "org".into(),
+            generation: 1,
+            nodes: vec![
+                split("M", None),
+                split("M.A", Some("M")),
+                split("M.S", Some("M")),
+            ],
+            whitelist: vec![PublicEdge {
+                from: "M.A".into(),
+                to: "M.S".into(),
+            }],
+            links: vec![],
+        }
+    }
+
+    #[test]
+    fn persist_rolls_back_when_a_duplicate_whitelist_insert_fails() {
+        let conn = crate::relay::open_in_memory().expect("schema");
+        let tree = tiny_tree();
+        put_public_tree(&conn, &tree).expect("first put");
+        let mut bad = tree.clone();
+        bad.whitelist.push(bad.whitelist[0].clone());
+        assert!(with_immediate_transaction(&conn, || persist_public_tree(&conn, &bad)).is_err());
+        let stored = get_public_tree(&conn, "org").expect("still there");
+        assert_eq!(stored.generation, 1);
+        assert_eq!(stored.nodes.len(), 3);
+        assert_eq!(stored.whitelist.len(), 1);
+    }
 }

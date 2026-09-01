@@ -205,6 +205,83 @@ fn opening_a_legacy_key_nodes_table_adds_is_active() {
 }
 
 #[test]
+fn rebuilding_share_required_key_nodes_keeps_bridge_rows() {
+    let conn = Connection::open_in_memory().expect("in-memory db");
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE keys (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL
+         );
+         CREATE TABLE hardware_keys (
+            id INTEGER PRIMARY KEY,
+            label TEXT NOT NULL,
+            key_type TEXT NOT NULL,
+            fingerprint TEXT NOT NULL UNIQUE,
+            public_key BLOB NOT NULL
+         );
+         CREATE TABLE key_nodes (
+            id INTEGER PRIMARY KEY,
+            key_id INTEGER NOT NULL REFERENCES keys(id) ON DELETE CASCADE,
+            parent_id INTEGER REFERENCES key_nodes(id) ON DELETE CASCADE,
+            label TEXT NOT NULL,
+            threshold INTEGER,
+            hardware_key_id INTEGER REFERENCES hardware_keys(id),
+            wrapped_share BLOB,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            CHECK (
+                (threshold IS NOT NULL AND hardware_key_id IS NULL AND wrapped_share IS NULL)
+                OR (threshold IS NULL AND hardware_key_id IS NOT NULL AND wrapped_share IS NOT NULL)
+            )
+         );
+         CREATE TABLE key_node_bridges (
+            node_id INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+            peer_label TEXT NOT NULL,
+            PRIMARY KEY (node_id, peer_label)
+         );
+         CREATE TABLE key_node_links (
+            node_a_id INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+            node_b_id INTEGER NOT NULL REFERENCES key_nodes(id) ON DELETE CASCADE,
+            established_at TEXT NOT NULL DEFAULT 'now',
+            PRIMARY KEY (node_a_id, node_b_id),
+            CHECK (node_a_id < node_b_id)
+         );
+         INSERT INTO keys (id, label) VALUES (1, 'legacy');
+         INSERT INTO hardware_keys (id, label, key_type, fingerprint, public_key)
+            VALUES (1, 'a', 'encryption', 'fp-a', x'01'),
+                   (2, 'b', 'encryption', 'fp-b', x'02');
+         INSERT INTO key_nodes (id, key_id, parent_id, label, threshold, is_active)
+            VALUES (1, 1, NULL, 'root', 2, 1);
+         INSERT INTO key_nodes (id, key_id, parent_id, label, hardware_key_id, wrapped_share, is_active)
+            VALUES (2, 1, 1, 'left', 1, x'aa', 1),
+                   (3, 1, 1, 'right', 2, x'bb', 1);
+         INSERT INTO key_node_bridges (node_id, peer_label) VALUES (2, 'right');
+         INSERT INTO key_node_links (node_a_id, node_b_id) VALUES (2, 3);",
+    )
+    .expect("legacy schema should apply");
+
+    init(&conn).expect("init should rebuild key_nodes");
+
+    let bridges: i64 = conn
+        .query_row("SELECT count(*) FROM key_node_bridges", [], |row| {
+            row.get(0)
+        })
+        .expect("bridges");
+    let links: i64 = conn
+        .query_row("SELECT count(*) FROM key_node_links", [], |row| row.get(0))
+        .expect("links");
+    assert_eq!(bridges, 1);
+    assert_eq!(links, 1);
+    let sql = table_sql(&conn, "key_nodes")
+        .expect("sql")
+        .expect("key_nodes");
+    assert!(
+        !sql.contains("wrapped_share IS NOT NULL"),
+        "rebuild should drop the share-required check: {sql}"
+    );
+}
+
+#[test]
 fn private_bridge_member_requires_a_signing_public_key() {
     let conn = open_in_memory().expect("schema should apply");
     conn.execute(

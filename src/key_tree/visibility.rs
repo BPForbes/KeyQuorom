@@ -2,7 +2,7 @@ use super::super::*;
 use super::common::*;
 use crate::db;
 use rusqlite::params;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 fn two_branch_org_spec(a1: i64, a2: i64, s1: i64, s2: i64) -> NodeSpec {
     NodeSpec::Split {
@@ -171,4 +171,14 @@ fn fetch_slice_can_add_a_topology_only_peer_after_a_new_bridge() {
     apply_public_tree(&personal, Some(personal_id), &slice).expect("second fetch");
     assert!(labels(&personal, personal_id).contains("M.A.1"));
     assert!(wrapped_share(&personal, personal_id, "M.A.1").is_none());
+}
+
+#[test]
+fn visible_from_maps_stops_on_a_parent_cycle() {
+    let mut parent_of = HashMap::new();
+    parent_of.insert("A".into(), Some("B".into()));
+    parent_of.insert("B".into(), Some("A".into()));
+    let children_of = HashMap::new();
+    let visible = visible_from_maps(&parent_of, &children_of, &[], &["A".to_string()]);
+    assert_eq!(visible, HashSet::from(["A".into(), "B".into()]));
 }

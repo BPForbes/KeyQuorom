@@ -50,32 +50,41 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 /// table. Databases from before `key_nodes.is_active` must be altered
 /// before any SELECT of that column.
 fn migrate(conn: &Connection) -> Result<()> {
-    // BEGIN IMMEDIATE serializes this check-and-alter against concurrent
-    // `open`s so two connections cannot both decide the column is missing.
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let outcome = (|| -> Result<()> {
-        if !table_has_column(conn, "key_nodes", "is_active")? {
-            conn.execute(
-                "ALTER TABLE key_nodes ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
-                [],
-            )?;
-        }
-        rebuild_key_nodes_if_share_required(conn)?;
-        Ok(())
-    })();
-    match outcome {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        }
-        Err(err) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            if table_has_column(conn, "key_nodes", "is_active")? {
-                return Ok(());
+    // SQLite ignores `PRAGMA foreign_keys` inside a transaction, so turn
+    // enforcement off first. `rebuild_key_nodes_if_share_required` drops
+    // and recreates `key_nodes`; with FKs still on, that would cascade
+    // through `key_node_bridges` and `key_node_links`.
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> Result<()> {
+        // BEGIN IMMEDIATE serializes this check-and-alter against concurrent
+        // `open`s so two connections cannot both decide the column is missing.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let outcome = (|| -> Result<()> {
+            if !table_has_column(conn, "key_nodes", "is_active")? {
+                conn.execute(
+                    "ALTER TABLE key_nodes ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
             }
-            Err(err)
+            rebuild_key_nodes_if_share_required(conn)?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                if table_has_column(conn, "key_nodes", "is_active")? {
+                    return Ok(());
+                }
+                Err(err)
+            }
         }
-    }
+    })();
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result
 }
 
 /// Older databases required every leaf to store `wrapped_share`. Personal
@@ -87,7 +96,6 @@ fn rebuild_key_nodes_if_share_required(conn: &Connection) -> Result<()> {
     if !sql.contains("wrapped_share IS NOT NULL") {
         return Ok(());
     }
-    conn.pragma_update(None, "foreign_keys", false)?;
     conn.execute_batch(
         "CREATE TABLE key_nodes_new (
             id                INTEGER PRIMARY KEY,
@@ -114,7 +122,6 @@ fn rebuild_key_nodes_if_share_required(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_key_nodes_hardware_key ON key_nodes (hardware_key_id);",
     )?;
     conn.execute_batch(SCHEMA)?;
-    conn.pragma_update(None, "foreign_keys", true)?;
     Ok(())
 }
 

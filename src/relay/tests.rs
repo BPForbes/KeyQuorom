@@ -508,6 +508,46 @@ fn org_tree_put_and_context_omits_unrelated_peer_sibling() {
     ));
 }
 
+#[test]
+fn put_public_tree_rejects_a_parent_cycle() {
+    let conn = relay::open_in_memory().expect("schema");
+    let tree = PublicTree {
+        label: "org".into(),
+        generation: 1,
+        nodes: vec![
+            split_node("M", None),
+            split_node("A", Some("B")),
+            split_node("B", Some("A")),
+        ],
+        whitelist: vec![],
+        links: vec![],
+    };
+    assert!(matches!(
+        relay::put_public_tree(&conn, &tree),
+        Err(Error::InvalidTreeSpec)
+    ));
+    assert!(matches!(
+        relay::get_public_tree(&conn, "org"),
+        Err(Error::TreeNotFound)
+    ));
+}
+
+#[test]
+fn put_public_tree_keeps_the_previous_tree_when_a_duplicate_edge_is_rejected() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (mut tree, _) = example_org_tree(false);
+    let stored = relay::put_public_tree(&conn, &tree).expect("put");
+    assert_eq!(stored.generation, 1);
+    tree.whitelist.push(tree.whitelist[0].clone());
+    assert!(matches!(
+        relay::put_public_tree(&conn, &tree),
+        Err(Error::InvalidBridge)
+    ));
+    let kept = relay::get_public_tree(&conn, "org").expect("kept");
+    assert_eq!(kept.generation, 1);
+    assert_eq!(kept.nodes.len(), 7);
+}
+
 #[tokio::test]
 async fn router_publish_and_fetch_tree_context() {
     let conn = relay::open_in_memory().expect("schema");
