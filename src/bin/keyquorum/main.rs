@@ -1593,7 +1593,7 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
             let api_key = relay_api_key(api_key)?;
             let listed = relay::pull_inbox(&url, &api_key, after)?;
             let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
-            let mut conn = db::open(db_path_str)?;
+            let conn = db::open(db_path_str)?;
             for slice in &listed.trees {
                 let applied = key_tree::apply_public_tree(&conn, None, slice)?;
                 println!(
@@ -1631,7 +1631,7 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     println!("Wrote {}", path.display());
                 }
                 if let Some(sk) = share_sk.as_ref() {
-                    let summary = private_bridge::import_package(&mut conn, &bytes, sk)?;
+                    let summary = private_bridge::import_package(&conn, &bytes, sk)?;
                     println!(
                         "Imported envelope {} as private bridge {} gen {}",
                         item.id, summary.uid, summary.generation
