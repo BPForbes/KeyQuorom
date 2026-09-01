@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [features]
 default = []
 # Host-side mailbox: serve + mint API keys. Provider setup only — not a
-# customer product. `cargo build --release` must not produce this binary.
+# customer product. Default `cargo build --release` must not compile it.
 provider = [
     "dep:axum",
     "dep:tokio",
@@ -25,11 +25,6 @@ provider = [
 [[bin]]
 name = "keyquorum"
 path = "src/bin/keyquorum/main.rs"
-
-[[bin]]
-name = "kq-relay"
-path = "src/bin/kq-relay/main.rs"
-required-features = ["provider"]
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }

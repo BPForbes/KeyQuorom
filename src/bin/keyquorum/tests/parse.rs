@@ -400,3 +400,32 @@ fn loadkey_parses_with_and_without_positional_key() {
     ])
     .is_ok());
 }
+
+#[cfg(feature = "provider")]
+#[test]
+fn provider_host_keys_list_parses() {
+    assert!(Cli::try_parse_from(["keyquorum", "host", "keys", "list"]).is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "--mailbox-db",
+        "mailbox.sqlite",
+        "serve",
+        "--bind",
+        "127.0.0.1:0",
+    ])
+    .is_ok());
+}
+
+#[cfg(feature = "provider")]
+#[test]
+fn provider_host_is_omitted_from_top_level_help() {
+    use clap::CommandFactory;
+    let help = Cli::command().render_long_help().to_string();
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("host")),
+        "hidden host command leaked into --help:\n{help}"
+    );
+}

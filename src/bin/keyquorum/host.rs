@@ -1,33 +1,18 @@
-//! Provider-only mailbox host. Not part of the customer product: mint
-//! licensee/API keys and serve opaque `.kqpb` envelopes. Customers use
-//! `keyquorum loadkey` with a URL and bearer they were given.
+//! Provider-only mailbox host. Compiled only with `--features provider`.
+//! Hidden from `keyquorum --help`. Customers use `loadkey` with a URL
+//! and bearer they were given.
 
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use keyquorum::error::{Error, Result};
 use keyquorum::relay::{self, ApiKeyScope, AppState, NewApiKey};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::Path;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser)]
-#[command(
-    name = "kq-relay",
-    about = "Provider mailbox host (setup only; not a customer command)",
-    version
-)]
-struct Cli {
-    /// Path to the relay-only SQLite database (not an organization store)
-    #[arg(long, global = true, default_value = "keyquorum-relay.sqlite")]
-    db: PathBuf,
-    #[command(subcommand)]
-    command: Command,
-}
-
 #[derive(Subcommand)]
-enum Command {
+pub enum HostCommand {
     /// Listen for envelope push/pull. Does not mint API keys.
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -41,7 +26,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum KeysCommand {
+pub enum KeysCommand {
     Create {
         #[arg(long)]
         scope: String,
@@ -67,23 +52,15 @@ enum KeysCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let db_path = cli.db.to_str().ok_or(Error::InvalidPath)?;
-    match cli.command {
-        Command::Serve { bind } => serve(db_path, &bind).await,
-        Command::Keys { command } => {
+pub fn run(mailbox_db: &Path, command: HostCommand) -> Result<()> {
+    let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
+    match command {
+        HostCommand::Serve { bind } => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(Error::Io)?
+            .block_on(serve(db_path, &bind)),
+        HostCommand::Keys { command } => {
             let conn = relay::open(db_path)?;
             run_keys(&conn, command)
         }
@@ -203,7 +180,7 @@ async fn serve(db_path: &str, bind: &str) -> Result<()> {
         .map_err(|e| Error::RelayRequest(format!("invalid bind address: {e}")))?;
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
-    eprintln!("kq-relay listening on http://{local}");
+    eprintln!("mailbox listening on http://{local}");
     eprintln!("Swagger UI: http://{local}/swagger-ui");
 
     axum::serve(listener, relay::router(AppState::new(conn)))

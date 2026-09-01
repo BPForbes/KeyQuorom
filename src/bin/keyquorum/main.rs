@@ -25,6 +25,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[cfg(feature = "provider")]
+mod host;
+
 /// How long a "one-time" PIN unlock stays valid before the PIN is needed
 /// again (see `pin.rs`); not configurable via the CLI in this pass.
 const PIN_TTL_SECONDS: i64 = 3600;
@@ -271,6 +274,16 @@ enum Command {
         /// Relay base URL (or KEYQUORUM_RELAY_URL)
         #[arg(long)]
         url: Option<String>,
+    },
+    /// Provider mailbox host. Hidden from --help; not a customer command.
+    #[cfg(feature = "provider")]
+    #[command(hide = true)]
+    Host {
+        /// Mailbox SQLite file (not an organization store)
+        #[arg(long, default_value = "keyquorum-relay.sqlite")]
+        mailbox_db: PathBuf,
+        #[command(subcommand)]
+        command: host::HostCommand,
     },
 }
 
@@ -683,6 +696,11 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
     match command {
         Command::Relay { command } => return run_relay(db_path, command),
         Command::Loadkey { api_key, url } => return run_loadkey(db_path, api_key, url),
+        #[cfg(feature = "provider")]
+        Command::Host {
+            mailbox_db,
+            command,
+        } => return host::run(&mailbox_db, command),
         _ => {}
     }
 
@@ -758,6 +776,10 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         Command::Pin { command } => run_pin(&conn, command)?,
         Command::Relay { .. } | Command::Loadkey { .. } => {
             unreachable!("relay commands are handled before opening the org db")
+        }
+        #[cfg(feature = "provider")]
+        Command::Host { .. } => {
+            unreachable!("host commands are handled before opening the org db")
         }
     }
 
@@ -1024,6 +1046,8 @@ fn run_tree_command(conn: &mut Connection, command: Command) -> Result<()> {
         | Command::Pin { .. }
         | Command::Relay { .. }
         | Command::Loadkey { .. } => unreachable!("non-tree commands are dispatched in run()"),
+        #[cfg(feature = "provider")]
+        Command::Host { .. } => unreachable!("non-tree commands are dispatched in run()"),
     }
     Ok(())
 }

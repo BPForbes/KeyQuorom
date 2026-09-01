@@ -387,7 +387,7 @@ pub fn authorize_licensee_or_bootstrap(
 }
 
 /// Mints the one-time licensee issuer when none exists. HTTP never sees this
-/// token; it is required by `kq-relay keys create|rotate`.
+/// token; it is required by host-local `keys create|rotate`.
 pub fn bootstrap_licensee_if_empty(conn: &Connection) -> Result<Option<CreatedLicensee>> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))?;
     if n == 0 {

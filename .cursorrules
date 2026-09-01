@@ -20,16 +20,16 @@ returns a sliced copy that the personal SQLite file translates. A personal store
 should keep only the subgraph that person needs (own lineage, siblings,
 descendants, and established-bridge peers plus those peers' ancestors). API keys
 are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
-are minted only by the licensee (`kq-relay keys create|rotate` with the `kql_…`
-issuer); HTTP cannot create or rotate bearers. `kq-relay` is **provider-only
-setup** (serve the mailbox and mint keys). Do not document it in README or
-other customer-facing docs — buyers get a URL and an API key and use
-`keyquorum loadkey` / `relay push` / `relay pull`. Default `cargo build`
-produces `keyquorum` only; build the host with `--features provider`.
-`keyquorum loadkey` calls `POST /keycheck` (no auth) and stores that hash plus
-a sealed bearer in the personal SQLite file. Later commands re-check the hash
-and inject the bearer. Never commit bearers, `.kqpb` files, or the relay
-database.
+are minted only by the licensee (host-local `keys create|rotate` with the
+`kql_…` issuer); HTTP cannot create or rotate bearers. The mailbox host is a
+**hidden** `keyquorum host` subcommand, compiled only with `--features
+provider`. Do not document it in README or other customer-facing docs — buyers
+get a URL and an API key and use `keyquorum loadkey` / `relay push` /
+`relay pull`. Default `cargo build` produces `keyquorum` without that
+subcommand. `keyquorum loadkey` calls `POST /keycheck` (no auth) and stores
+that hash plus a sealed bearer in the personal SQLite file. Later commands
+re-check the hash and inject the bearer. Never commit bearers, `.kqpb`
+files, or the relay database.
 
 Rules:
 
