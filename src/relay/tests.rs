@@ -188,16 +188,20 @@ fn mailbox_rejects_truncated_and_wrong_magic() {
 }
 
 #[test]
-fn bootstrap_admin_only_when_empty() {
+fn bootstrap_licensee_only_when_empty() {
     let conn = relay::open_in_memory().expect("schema");
-    let first = relay::bootstrap_admin_if_empty(&conn)
+    let first = relay::bootstrap_licensee_if_empty(&conn)
         .expect("bootstrap")
         .expect("created");
-    assert_eq!(first.info.scope, "admin");
-    assert!(relay::bootstrap_admin_if_empty(&conn)
+    assert!(first.token.starts_with("kql_"));
+    assert!(relay::bootstrap_licensee_if_empty(&conn)
         .expect("second")
         .is_none());
-    relay::authenticate(&conn, &first.token, ApiKeyScope::Admin).expect("admin works");
+    relay::authenticate_licensee(&conn, &first.token).expect("licensee works");
+    assert!(matches!(
+        relay::authenticate_licensee(&conn, "kq_notarealtokenvalue0123456789ABCD"),
+        Err(Error::InvalidLicenseeKey)
+    ));
 }
 
 async fn body_json(response: axum::http::Response<Body>) -> serde_json::Value {
@@ -345,6 +349,7 @@ async fn router_enforces_scopes_and_returns_opaque_bytes() {
     assert_eq!(unauth.status(), StatusCode::FORBIDDEN);
 
     let listed = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -356,6 +361,34 @@ async fn router_enforces_scopes_and_returns_opaque_bytes() {
         .await
         .unwrap();
     assert_eq!(listed.status(), StatusCode::OK);
+
+    let mint_denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys")
+                .header("Authorization", format!("Bearer {admin}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"scope":"inbox.push","label":"stolen"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mint_denied.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let rotate_gone = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys/1/rotate")
+                .header("Authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotate_gone.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

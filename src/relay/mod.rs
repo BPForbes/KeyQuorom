@@ -13,9 +13,10 @@ mod org_tree;
 mod server;
 
 pub use api_key::{
-    authenticate, bootstrap_admin_if_empty, check_hash, check_token, create as create_api_key,
-    hash_bearer, list as list_api_keys, revoke as revoke_api_key, rotate as rotate_api_key,
-    ApiKeyInfo, ApiKeyScope, AuthedKey, CreatedApiKey, KeyCheck, NewApiKey,
+    authenticate, authenticate_licensee, bootstrap_licensee_if_empty, check_hash, check_token,
+    create as create_api_key, hash_bearer, list as list_api_keys, revoke as revoke_api_key,
+    rotate as rotate_api_key, ApiKeyInfo, ApiKeyScope, AuthedKey, CreatedApiKey, CreatedLicensee,
+    KeyCheck, NewApiKey,
 };
 pub use client::{
     check_key, check_key_hash, fetch_tree_context, publish_tree, pull as pull_inbox,

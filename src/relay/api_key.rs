@@ -14,6 +14,12 @@ use zeroize::Zeroizing;
 
 const TOKEN_LEN: usize = 32;
 const TOKEN_PREFIX: &str = "kq_";
+const LICENSEE_PREFIX: &str = "kql_";
+
+#[derive(Clone, Debug)]
+pub struct CreatedLicensee {
+    pub token: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApiKeyScope {
@@ -74,21 +80,20 @@ pub struct AuthedKey {
     pub recipient_fingerprint: Option<String>,
 }
 
-fn generate_bearer() -> (String, String) {
+fn generate_prefixed_bearer(prefix: &str) -> (String, String) {
     let mut raw = Zeroizing::new([0u8; TOKEN_LEN]);
     OsRng.fill_bytes(&mut *raw);
-    let token = format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(*raw));
+    let token = format!("{prefix}{}", URL_SAFE_NO_PAD.encode(*raw));
     let token_hash = hex::encode(Sha256::digest(*raw));
     (token, token_hash)
 }
 
-/// SHA-256 of the 32 raw bearer bytes, as lowercase hex. The relay and
-/// personal stores both persist this hash rather than treating it as a
-/// login secret on its own.
-pub fn hash_bearer(token: &str) -> Result<String> {
-    let rest = token
-        .strip_prefix(TOKEN_PREFIX)
-        .ok_or(Error::InvalidApiKey)?;
+fn generate_bearer() -> (String, String) {
+    generate_prefixed_bearer(TOKEN_PREFIX)
+}
+
+fn hash_prefixed(token: &str, prefix: &str) -> Result<String> {
+    let rest = token.strip_prefix(prefix).ok_or(Error::InvalidApiKey)?;
     let raw = URL_SAFE_NO_PAD
         .decode(rest)
         .map_err(|_| Error::InvalidApiKey)?;
@@ -96,6 +101,13 @@ pub fn hash_bearer(token: &str) -> Result<String> {
         return Err(Error::InvalidApiKey);
     }
     Ok(hex::encode(Sha256::digest(raw)))
+}
+
+/// SHA-256 of the 32 raw bearer bytes, as lowercase hex. The relay and
+/// personal stores both persist this hash rather than treating it as a
+/// login secret on its own.
+pub fn hash_bearer(token: &str) -> Result<String> {
+    hash_prefixed(token, TOKEN_PREFIX)
 }
 
 fn normalize_fingerprint(fingerprint: &str) -> Result<String> {
@@ -346,20 +358,35 @@ pub fn check_hash(conn: &Connection, key_hash: &str) -> Result<KeyCheck> {
     Ok(row.unwrap_or_else(KeyCheck::invalid))
 }
 
-/// Mints a one-time admin bearer when the table is empty.
-pub fn bootstrap_admin_if_empty(conn: &Connection) -> Result<Option<CreatedApiKey>> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM api_keys", [], |row| row.get(0))?;
+/// Mints the one-time licensee issuer when none exists. HTTP never sees this
+/// token; it is required by `kq-relay keys create|rotate`.
+pub fn bootstrap_licensee_if_empty(conn: &Connection) -> Result<Option<CreatedLicensee>> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))?;
     if n == 0 {
-        Ok(Some(create(
-            conn,
-            &NewApiKey {
-                scope: ApiKeyScope::Admin,
-                recipient_fingerprint: None,
-                label: Some("bootstrap".to_string()),
-                ttl_seconds: None,
-            },
-        )?))
+        let (token, token_hash) = generate_prefixed_bearer(LICENSEE_PREFIX);
+        conn.execute(
+            "INSERT INTO licensee_issuer (id, key_hash) VALUES (1, ?1)",
+            params![token_hash],
+        )?;
+        Ok(Some(CreatedLicensee { token }))
     } else {
         Ok(None)
+    }
+}
+
+/// Confirms the caller holds the licensee issuer. Does not stamp API-key use.
+pub fn authenticate_licensee(conn: &Connection, token: &str) -> Result<()> {
+    let token_hash =
+        hash_prefixed(token, LICENSEE_PREFIX).map_err(|_| Error::InvalidLicenseeKey)?;
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM licensee_issuer WHERE id = 1 AND key_hash = ?1",
+            params![token_hash],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match found {
+        Some(_) => Ok(()),
+        None => Err(Error::InvalidLicenseeKey),
     }
 }
