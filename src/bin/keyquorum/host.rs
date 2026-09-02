@@ -1,12 +1,20 @@
 //! Provider-only mailbox host. Compiled only with `--features provider`.
 //! Hidden from `keyquorum --help`. Customers use `loadkey` with a URL
 //! and bearer they were given.
+//!
+//! `--features provider` compiles these commands; it does not authorize a
+//! host. `serve` requires a KeyQuorum-signed `provider.kqcert` and the
+//! matching relay private key. The `kql_…` issuer remains host-local
+//! API-key administration, not proof of KeyQuorum authorization.
 
 use clap::Subcommand;
 use keyquorum::error::{Error, Result};
-use keyquorum::relay::{self, ApiKeyScope, AppState, NewApiKey};
+use keyquorum::keys;
+use keyquorum::locked_files;
+use keyquorum::provider::{self, NewCertificate, KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY};
+use keyquorum::relay::{self, ApiKeyScope, AppState, NewApiKey, ProviderIdentity};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
@@ -17,11 +25,66 @@ pub enum HostCommand {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
+        /// `provider.kqcert` (or KEYQUORUM_PROVIDER_CERT)
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        /// Relay Ed25519 private key file (or KEYQUORUM_RELAY_KEY)
+        #[arg(long)]
+        relay_key: Option<PathBuf>,
+        /// Optional signed revocation list (or KEYQUORUM_PROVIDER_KRL)
+        #[arg(long)]
+        krl: Option<PathBuf>,
+    },
+    /// Generate a relay identity keypair (private key printed once).
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+    /// Issue a `provider.kqcert` with the offline provider-root private key.
+    Certify {
+        /// Root private key file (or KEYQUORUM_PROVIDER_ROOT_KEY as key text)
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+        #[arg(long)]
+        relay_public_key: PathBuf,
+        #[arg(long)]
+        provider_id: String,
+        #[arg(long)]
+        serial: String,
+        #[arg(long)]
+        issued_at: Option<String>,
+        #[arg(long)]
+        expires_at: String,
+        #[arg(long, default_value = "provider")]
+        capabilities: String,
+        #[arg(long, default_value = "KeyQuorumRoot")]
+        issuer_id: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Issue a signed provider revocation list (`.kqrl`).
+    Krl {
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+        #[arg(long)]
+        issued_at: Option<String>,
+        #[arg(long = "serial", required = true)]
+        serials: Vec<String>,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Mint, list, rotate, or revoke API keys on this host (not over HTTP)
     Keys {
         #[command(subcommand)]
         command: KeysCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IdentityCommand {
+    Generate {
+        #[arg(long)]
+        public_key_out: PathBuf,
     },
 }
 
@@ -53,14 +116,47 @@ pub enum KeysCommand {
 }
 
 pub fn run(mailbox_db: &Path, command: HostCommand) -> Result<()> {
-    let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
     match command {
-        HostCommand::Serve { bind } => tokio::runtime::Builder::new_multi_thread()
+        HostCommand::Serve {
+            bind,
+            cert,
+            relay_key,
+            krl,
+        } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(Error::Io)?
-            .block_on(serve(db_path, &bind)),
+            .block_on(serve(mailbox_db, &bind, cert, relay_key, krl)),
+        HostCommand::Identity { command } => run_identity(command),
+        HostCommand::Certify {
+            root_key,
+            relay_public_key,
+            provider_id,
+            serial,
+            issued_at,
+            expires_at,
+            capabilities,
+            issuer_id,
+            out,
+        } => run_certify(
+            root_key,
+            &relay_public_key,
+            &provider_id,
+            &serial,
+            issued_at,
+            &expires_at,
+            &capabilities,
+            &issuer_id,
+            &out,
+        ),
+        HostCommand::Krl {
+            root_key,
+            issued_at,
+            serials,
+            out,
+        } => run_krl(root_key, issued_at, &serials, &out),
         HostCommand::Keys { command } => {
+            let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
             let conn = relay::open(db_path)?;
             run_keys(&conn, command)
         }
@@ -71,6 +167,7 @@ fn print_new_licensee(issuer: &relay::CreatedLicensee) {
     eprintln!("Created licensee issuer key (shown once):");
     eprintln!("  {}", issuer.token);
     eprintln!("Only this key can mint or rotate customer API keys.");
+    eprintln!("It is not a KeyQuorum provider certificate.");
     eprintln!("Store this; it cannot be recovered from the database.");
 }
 
@@ -165,11 +262,148 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
     Ok(())
 }
 
-async fn serve(db_path: &str, bind: &str) -> Result<()> {
+fn run_identity(command: IdentityCommand) -> Result<()> {
+    match command {
+        IdentityCommand::Generate { public_key_out } => {
+            let (secret, public) = provider::generate_relay_identity();
+            locked_files::write_owner_only(&public_key_out, hex::encode(public).as_bytes())?;
+            println!("{}", hex::encode(*secret));
+            eprintln!("Public key written to {}", public_key_out.display());
+            eprintln!("Private key printed to stdout above — this tool keeps no copy of it.");
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_certify(
+    root_key: Option<PathBuf>,
+    relay_public_key: &Path,
+    provider_id: &str,
+    serial: &str,
+    issued_at: Option<String>,
+    expires_at: &str,
+    capabilities: &str,
+    issuer_id: &str,
+    out: &Path,
+) -> Result<()> {
+    let root = read_root_key(root_key)?;
+    let relay_public = read_key_array_32(relay_public_key)?;
+    let issued_at = match issued_at.filter(|s| !s.is_empty()) {
+        Some(value) => value,
+        None => provider::system_now_utc()?,
+    };
+    let capabilities = provider::parse_capabilities(capabilities)?;
+    let bytes = provider::issue_certificate(
+        &root,
+        &NewCertificate {
+            provider_id,
+            serial,
+            relay_public_key: &relay_public,
+            issued_at: &issued_at,
+            expires_at,
+            capabilities,
+            issuer_id,
+        },
+    )?;
+    locked_files::write_owner_only(out, &bytes)?;
+    eprintln!("Wrote provider certificate to {}", out.display());
+    Ok(())
+}
+
+fn run_krl(
+    root_key: Option<PathBuf>,
+    issued_at: Option<String>,
+    serials: &[String],
+    out: &Path,
+) -> Result<()> {
+    let root = read_root_key(root_key)?;
+    let issued_at = match issued_at.filter(|s| !s.is_empty()) {
+        Some(value) => value,
+        None => provider::system_now_utc()?,
+    };
+    let bytes = provider::issue_revocation_list(&root, &issued_at, serials)?;
+    locked_files::write_owner_only(out, &bytes)?;
+    eprintln!("Wrote provider revocation list to {}", out.display());
+    Ok(())
+}
+
+fn path_or_env(flag: Option<PathBuf>, env_name: &str) -> Option<PathBuf> {
+    flag.filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| match std::env::var(env_name) {
+            Ok(value) if !value.is_empty() => Some(PathBuf::from(value)),
+            _ => None,
+        })
+}
+
+fn read_key_bytes(path: &Path) -> Result<Vec<u8>> {
+    let contents = std::fs::read_to_string(path)?;
+    keys::parse_key_text(&contents)
+}
+
+fn read_key_array_32(path: &Path) -> Result<[u8; 32]> {
+    read_key_bytes(path)?
+        .try_into()
+        .map_err(|_| Error::InvalidPublicKey)
+}
+
+fn read_root_key(path: Option<PathBuf>) -> Result<[u8; 32]> {
+    if let Some(path) = path {
+        return read_key_array_32(&path);
+    }
+    match std::env::var("KEYQUORUM_PROVIDER_ROOT_KEY") {
+        Ok(value) if !value.is_empty() => keys::parse_key_text(&value)?
+            .try_into()
+            .map_err(|_| Error::InvalidPublicKey),
+        _ => Err(Error::InvalidProviderCertificate),
+    }
+}
+
+fn load_serve_identity(
+    cert: Option<PathBuf>,
+    relay_key: Option<PathBuf>,
+    krl: Option<PathBuf>,
+) -> Result<ProviderIdentity> {
+    let cert_path =
+        path_or_env(cert, "KEYQUORUM_PROVIDER_CERT").ok_or(Error::ProviderIdentityMissing)?;
+    let key_path =
+        path_or_env(relay_key, "KEYQUORUM_RELAY_KEY").ok_or(Error::ProviderIdentityMissing)?;
+    let krl_path = path_or_env(krl, "KEYQUORUM_PROVIDER_KRL");
+    let certificate = std::fs::read(&cert_path)?;
+    let relay_private_key = zeroize::Zeroizing::new(read_key_array_32(&key_path)?);
+    let now = provider::system_now_utc()?;
+    let revoked =
+        provider::load_revocation_list(&KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY, krl_path.as_deref())?;
+    let cert = provider::self_check(
+        &KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
+        &certificate,
+        &relay_private_key,
+        &now,
+        &revoked,
+    )?;
+    eprintln!(
+        "provider identity {} serial {} expires {}",
+        cert.provider_id, cert.serial, cert.expires_at
+    );
+    Ok(ProviderIdentity {
+        certificate,
+        relay_private_key,
+    })
+}
+
+async fn serve(
+    mailbox_db: &Path,
+    bind: &str,
+    cert: Option<PathBuf>,
+    relay_key: Option<PathBuf>,
+    krl: Option<PathBuf>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    let identity = load_serve_identity(cert, relay_key, krl)?;
+    let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
     let conn = relay::open(db_path)?;
     if let Some(issuer) = relay::bootstrap_licensee_if_empty(&conn)? {
         print_new_licensee(&issuer);
@@ -183,9 +417,12 @@ async fn serve(db_path: &str, bind: &str) -> Result<()> {
     eprintln!("mailbox listening on http://{local}");
     eprintln!("Swagger UI: http://{local}/swagger-ui");
 
-    axum::serve(listener, relay::router(AppState::new(conn)))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        relay::router(AppState::with_identity(conn, identity)),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 

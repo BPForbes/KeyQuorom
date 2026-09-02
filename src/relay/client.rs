@@ -2,8 +2,10 @@
 
 use crate::error::{Error, Result};
 use crate::key_tree::PublicTree;
+use crate::provider::{self, Certificate};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Duration;
 use url::Url;
@@ -77,6 +79,22 @@ pub struct KeyCheckResponse {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient_fingerprint: Option<String>,
+}
+
+/// Unauthenticated `POST /provider-identity` challenge.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProviderIdentityRequest {
+    /// Standard base64 of a 32-byte random challenge.
+    pub challenge: String,
+}
+
+/// Certificate bytes plus the relay signature over the challenge.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProviderIdentityResponse {
+    /// Standard base64 of the `provider.kqcert` bytes.
+    pub certificate: String,
+    /// Standard base64 of the 64-byte Ed25519 signature.
+    pub signature: String,
 }
 
 /// HTTPS is always accepted. HTTP is only allowed for loopback hosts so a
@@ -250,6 +268,54 @@ fn post_keycheck(base_url: &str, body: &KeyCheckRequest) -> Result<KeyCheckRespo
         .set("Content-Type", "application/json")
         .send_string(&json);
     read_json(resp)
+}
+
+/// Challenge the relay for a KeyQuorum-signed provider certificate and a
+/// signature over a fresh nonce. Official clients call this *before*
+/// sending a bearer so a modified host cannot skip authorization.
+pub fn authenticate_provider(
+    base_url: &str,
+    root_public_key: &[u8; 32],
+    now_utc: &str,
+    revoked: &HashSet<String>,
+) -> Result<Certificate> {
+    let challenge = provider::random_challenge();
+    let body = ProviderIdentityRequest {
+        challenge: base64::engine::general_purpose::STANDARD.encode(challenge),
+    };
+    let json = serde_json::to_string(&body).map_err(|e| Error::RelayRequest(e.to_string()))?;
+    let url = relay_request_url(base_url, "/provider-identity")?;
+    let result = http_agent()
+        .request_url("POST", &url)
+        .set("Content-Type", "application/json")
+        .send_string(&json);
+    let response: ProviderIdentityResponse = match result {
+        Ok(resp) => {
+            let body = resp
+                .into_string()
+                .map_err(|e| Error::RelayRequest(e.to_string()))?;
+            serde_json::from_str(&body).map_err(|_| Error::UntrustedRelay)?
+        }
+        Err(ureq::Error::Status(503, _)) => return Err(Error::UntrustedRelay),
+        Err(ureq::Error::Status(400, _)) => return Err(Error::InvalidProviderChallenge),
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            return Err(Error::RelayRequest(format!("HTTP {code}: {body}")));
+        }
+        Err(e) => return Err(Error::RelayRequest(e.to_string())),
+    };
+    let cert_bytes = base64::engine::general_purpose::STANDARD
+        .decode(response.certificate.as_bytes())
+        .map_err(|_| Error::UntrustedRelay)?;
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(response.signature.as_bytes())
+        .map_err(|_| Error::UntrustedRelay)?;
+    let signature: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| Error::UntrustedRelay)?;
+    let cert = provider::verify_certificate(root_public_key, &cert_bytes, now_utc, revoked)?;
+    provider::verify_challenge(&cert, &challenge, &signature)?;
+    Ok(cert)
 }
 
 /// Replace the relay's canonical public tree (admin scope).

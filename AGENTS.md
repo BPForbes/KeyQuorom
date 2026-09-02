@@ -27,20 +27,28 @@ file should keep only the subgraph that person needs (own lineage, siblings,
 descendants, and established-bridge peers plus those peers' ancestors). API keys
 are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
 are minted only by the licensee (host-local `keys create|rotate` with the
-`kql_…` issuer); HTTP cannot create or rotate bearers. The mailbox host is a
-**hidden** `keyquorum host` subcommand, compiled only with `--features
-provider`. Do not document it in README or other customer-facing docs — buyers
-get a URL and an API key and use `keyquorum loadkey` / `relay push` /
+`kql_…` issuer); HTTP cannot create or rotate bearers. The `kql_…` issuer is
+host-local mailbox administration, not proof that an organization is a
+KeyQuorum-authorized provider. The mailbox host is a **hidden**
+`keyquorum host` subcommand, compiled only with `--features provider`. That
+feature is a build capability, not authorization. A trusted relay also
+requires a KeyQuorum-signed `provider.kqcert` and the matching relay private
+key; official clients challenge `POST /provider-identity` and disconnect if
+the certificate, signature, expiry, capabilities, or revocation check fails.
+Do not document `host` in README or other customer-facing docs — buyers get
+a URL and an API key and use `keyquorum loadkey` / `relay push` /
 `relay pull`. Default `cargo build` produces `keyquorum` without that
-subcommand. `keyquorum loadkey` calls `POST /keycheck` (no auth) and stores
-that hash plus a sealed bearer in the personal SQLite file. Later commands
-re-check the hash and inject the bearer. Never commit bearers, `.kqpb`
-files, or the relay database.
+subcommand. `keyquorum loadkey` authenticates the relay, then calls
+`POST /keycheck` (no auth) and stores that hash plus a sealed bearer in the
+personal SQLite file. Later commands re-check the hash and inject the
+bearer. Never commit bearers, `.kqpb` files, `*.kqcert`, `*.kqrl`, provider
+root keys, or the relay database.
 
 ## Setup / build / test
 
 - Build (customer CLI): `cargo build --release` (no mailbox host subcommand)
-- Build (provider mailbox): `cargo build --release --features provider`
+- Build (provider-capable binary): `cargo build --release --features provider`
+  (compiles host capabilities; authorization is a signed `provider.kqcert`)
 - Test: `cargo test --locked --all-targets --all-features`
 - Lint: `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - Format: `cargo fmt`
@@ -67,7 +75,8 @@ files, so treat it as security-sensitive:
 
 - Never commit private keys, tokens, `.env` files, secrets, or plaintext copies of
   protected/test files. See `.gitignore` for excluded patterns (`*.key`, `*.pem`,
-  `*.secret`, `*.token`, `*.kqkey`, `*.kqpb`, `*.kqbn`, `secrets/`, `keys/`,
+  `*.secret`, `*.token`, `*.kqkey`, `*.kqpb`, `*.kqbn`, `*.kqcert`, `*.kqrl`,
+  `secrets/`, `keys/`, `provider-secrets/`,
   `test-keys/`, etc.).
 - Take extra care with code touching key derivation, encryption/decryption, or
   quorum/threshold logic — bugs there are security bugs, not just correctness bugs.

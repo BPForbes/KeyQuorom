@@ -44,9 +44,12 @@ build/
 *.kqkey
 *.kqpb
 *.kqbn
+*.kqcert
+*.kqrl
 secrets/
 keys/
 test-keys/
+provider-secrets/
 
 # Local encrypted/decrypted test files
 tmp/

@@ -15,8 +15,8 @@ use keyquorum::key_tree::{NodeSpec, TreeNodeSummary};
 use keyquorum::keys::KeyType;
 use keyquorum::pin::ResourceType;
 use keyquorum::{
-    db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, relay, sharing, signing,
-    vault,
+    db, export, key_tree, keys, locked_files, pin, private_bridge, provider, quorum, relay,
+    sharing, signing, vault,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeSet, HashMap};
@@ -275,7 +275,7 @@ enum Command {
         #[arg(long)]
         url: Option<String>,
     },
-    /// Provider mailbox host. Hidden from --help; not a customer command.
+    /// Provider mailbox host (capability build). Hidden from --help.
     #[cfg(feature = "provider")]
     #[command(hide = true)]
     Host {
@@ -1593,6 +1593,26 @@ fn persist_checked_key(
     )
 }
 
+/// Official clients verify a KeyQuorum-signed provider certificate before
+/// sending a bearer. A modified relay cannot skip this check.
+fn authenticate_official_relay(url: &str) -> Result<()> {
+    let now = provider::system_now_utc()?;
+    let krl_path = std::env::var("KEYQUORUM_PROVIDER_KRL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let revoked = provider::load_revocation_list(
+        &provider::KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
+        krl_path.as_deref().map(Path::new),
+    )?;
+    relay::authenticate_provider(
+        url,
+        &provider::KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
+        &now,
+        &revoked,
+    )?;
+    Ok(())
+}
+
 fn resolve_relay_url(
     conn: &Connection,
     explicit: Option<String>,
@@ -1636,6 +1656,7 @@ fn resolve_relay_auth(
     required: relay::ApiKeyScope,
 ) -> Result<(String, String)> {
     let url = resolve_relay_url(conn, explicit_url, required)?;
+    authenticate_official_relay(&url)?;
     let provided = explicit_key.filter(|s| !s.is_empty()).or_else(|| {
         match std::env::var("KEYQUORUM_RELAY_API_KEY") {
             Ok(key) if !key.is_empty() => Some(key),
@@ -1691,6 +1712,7 @@ fn run_loadkey(db_path: &Path, api_key: Option<String>, url: Option<String>) -> 
         }
     };
     relay::validate_relay_url(&url)?;
+    authenticate_official_relay(&url)?;
     let token = match api_key.filter(|s| !s.is_empty()) {
         Some(token) => token,
         None => prompt_secret("Relay API key: ")?,
