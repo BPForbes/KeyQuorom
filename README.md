@@ -290,6 +290,8 @@ ids for inspection.
 
 ```sh
 keyquorum access password --state 0 --source ./secret.txt --encrypted-path ./secret.txt.kqenc
+keyquorum access password --state 0 --source ./secret.txt --encrypted-path ./secret.txt.kqenc \
+  --expires "2026-12-31 23:59"
 keyquorum access password --state 1 --id 1 --output ./secret.txt
 
 keyquorum vault add "Email" --username alice
@@ -314,8 +316,17 @@ keyquorum export credential 1 --recipient-key-file bob.pub --output cred.kqxb
 keyquorum export file 1 --recipient-key-file bob.pub --output file.kqxb
 
 keyquorum share create-file 1 --ttl-seconds 3600 --pin
+keyquorum share create-file 1 --expires "2026-12-31 23:59"
 keyquorum share redeem-file
 ```
+
+`--expires` is UTC (`yyyy-mm-dd hh:mm`). After that instant, redeem, unlock, or a
+scan deletes the ciphertext from disk and drops the file's database row.
+`--ttl-seconds` is a relative share-link lifetime and does not remove the file.
+
+`relay push --expires "2026-12-31 23:59"` stamps the same UTC cutoff on each
+uploaded envelope. Inbox pull skips expired rows and removes them from the
+mailbox so the recipient cannot fetch the file after the date.
 
 ### Mailbox
 

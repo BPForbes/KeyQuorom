@@ -1,6 +1,9 @@
 use super::*;
 use crate::db;
+use crate::locked_files;
 use crate::vault;
+use rusqlite::params;
+use std::fs;
 
 fn seed_credential(conn: &Connection) -> i64 {
     vault::add_credential(conn, "Email", None, "s3cr3t", "master-pw")
@@ -129,4 +132,69 @@ fn concurrent_redemption_allows_exactly_one_success() {
 
     assert_eq!(successes, 1);
     assert_eq!(rejections, 1);
+}
+
+fn seed_locked_file(conn: &Connection) -> (i64, tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let source_path = dir.path().join("secret.txt");
+    let encrypted_path = dir.path().join("secret.txt.kqenc");
+    fs::write(&source_path, b"ttl file").unwrap();
+    let file_id = locked_files::lock_file(conn, &source_path, &encrypted_path, "hunter2")
+        .expect("lock_file should succeed");
+    (file_id, dir, encrypted_path)
+}
+
+#[test]
+fn date_based_file_share_redeems_before_expiry() {
+    let conn = db::open_in_memory().expect("schema should apply");
+    let (file_id, _dir, encrypted_path) = seed_locked_file(&conn);
+    let expires_at = locked_files::parse_expires_utc("2099-12-31 23:59").expect("valid expiry");
+
+    let share = create_file_share_until(&conn, file_id, &expires_at, None)
+        .expect("create_file_share_until should succeed");
+    let resolved = redeem_file_share(&conn, &share.token).expect("redeem before expiry");
+
+    assert_eq!(resolved, file_id);
+    assert!(encrypted_path.exists());
+}
+
+#[test]
+fn late_access_of_date_based_file_share_deletes_ciphertext() {
+    let conn = db::open_in_memory().expect("schema should apply");
+    let (file_id, _dir, encrypted_path) = seed_locked_file(&conn);
+    let expires_at = locked_files::parse_expires_utc("2099-12-31 23:59").expect("valid expiry");
+    let share = create_file_share_until(&conn, file_id, &expires_at, None)
+        .expect("create_file_share_until should succeed");
+
+    conn.execute(
+        "UPDATE password_locked_files SET expires_at = datetime('now', '-1 minutes') WHERE id = ?1",
+        params![file_id],
+    )
+    .expect("stamp a past file expiry");
+
+    let result = redeem_file_share(&conn, &share.token);
+    assert!(matches!(result, Err(Error::FileExpired)));
+    assert!(!encrypted_path.exists());
+
+    let file_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM password_locked_files WHERE id = ?1)",
+            params![file_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!file_exists);
+}
+
+#[test]
+fn relative_ttl_share_expiry_does_not_delete_the_file() {
+    let conn = db::open_in_memory().expect("schema should apply");
+    let (file_id, _dir, encrypted_path) = seed_locked_file(&conn);
+
+    let share =
+        create_file_share(&conn, file_id, -1, None).expect("create_file_share should succeed");
+    let result = redeem_file_share(&conn, &share.token);
+
+    assert!(matches!(result, Err(Error::ShareExpired)));
+    assert!(encrypted_path.exists());
 }

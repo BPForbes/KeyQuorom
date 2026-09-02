@@ -205,6 +205,29 @@ fn opening_a_legacy_key_nodes_table_adds_is_active() {
 }
 
 #[test]
+fn opening_legacy_password_locked_files_adds_expires_at() {
+    let conn = Connection::open_in_memory().expect("in-memory db");
+    conn.execute_batch(
+        "CREATE TABLE password_locked_files (
+                id                INTEGER PRIMARY KEY,
+                name              TEXT NOT NULL,
+                encrypted_path    TEXT NOT NULL UNIQUE,
+                kdf_salt          BLOB NOT NULL,
+                nonce             BLOB NOT NULL,
+                created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             );
+             INSERT INTO password_locked_files (name, encrypted_path, kdf_salt, nonce)
+             VALUES ('secret', '/tmp/x', x'00', x'00');",
+    )
+    .expect("legacy schema should apply");
+
+    assert!(!table_has_column(&conn, "password_locked_files", "expires_at").unwrap());
+    init(&conn).expect("init should migrate the legacy table");
+    assert!(table_has_column(&conn, "password_locked_files", "expires_at").unwrap());
+    init(&conn).expect("a second init must be idempotent");
+}
+
+#[test]
 fn rebuilding_share_required_key_nodes_keeps_bridge_rows() {
     let conn = Connection::open_in_memory().expect("in-memory db");
     conn.execute_batch(

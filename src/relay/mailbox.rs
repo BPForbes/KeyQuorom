@@ -26,14 +26,25 @@ pub struct MailboxPage {
 }
 
 pub fn store(conn: &Connection, envelope: &[u8]) -> Result<(i64, String, bool)> {
+    store_until(conn, envelope, None)
+}
+
+/// Store an opaque envelope, optionally with a UTC expiry
+/// (`YYYY-MM-DD HH:MM:00`). The host scan and inbox pull drop expired rows.
+pub fn store_until(
+    conn: &Connection,
+    envelope: &[u8],
+    expires_at: Option<&str>,
+) -> Result<(i64, String, bool)> {
     let recipient_public_key = private_bridge::routing_public_key(envelope)?;
     let fingerprint = keys::fingerprint(&recipient_public_key);
     let content_hash = hex::encode(Sha256::digest(envelope));
 
     conn.execute(
-        "INSERT OR IGNORE INTO mailbox (recipient_fingerprint, envelope, content_hash)
-         VALUES (?1, ?2, ?3)",
-        params![fingerprint, envelope, content_hash],
+        "INSERT OR IGNORE INTO mailbox
+            (recipient_fingerprint, envelope, content_hash, expires_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![fingerprint, envelope, content_hash, expires_at],
     )?;
 
     if conn.changes() == 1 {
@@ -62,10 +73,12 @@ pub fn list_after(
     };
     let after = after.unwrap_or(0);
     let fetch = page.saturating_add(1);
+    purge_expired(conn)?;
     let mut stmt = conn.prepare(
         "SELECT id, recipient_fingerprint, envelope
          FROM mailbox
          WHERE recipient_fingerprint = ?1 AND id > ?2
+           AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
          ORDER BY id ASC
          LIMIT ?3",
     )?;
@@ -87,4 +100,16 @@ pub fn list_after(
         envelopes,
         next_after,
     })
+}
+
+/// Deletes mailbox rows whose date-based TTL has passed. The sealed
+/// envelope bytes live in this table, so the DELETE is what removes them
+/// from disk (the SQLite file).
+pub fn purge_expired(conn: &Connection) -> Result<u64> {
+    conn.execute(
+        "DELETE FROM mailbox
+         WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')",
+        [],
+    )?;
+    Ok(conn.changes())
 }

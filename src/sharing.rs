@@ -1,5 +1,7 @@
 //! Time-limited, revocable share links for vault credentials and
-//! password-locked files.
+//! password-locked files. File shares may use a relative `--ttl-seconds`
+//! lifetime or a date-based UTC `--expires`; the latter stamps the file
+//! itself, and a late redeem or unlock deletes the ciphertext from disk.
 //!
 //! A share's bearer token is only ever returned to the caller once, at
 //! creation time; the database stores just a SHA-256 hash of it, looked up
@@ -7,6 +9,7 @@
 //! usable tokens.
 
 use crate::error::{Error, Result};
+use crate::locked_files;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use rand::rngs::OsRng;
@@ -63,23 +66,38 @@ fn create_share(
     table: &str,
     id_column: &str,
     resource_id: i64,
-    ttl_seconds: i64,
+    ttl_seconds: Option<i64>,
+    expires_at: Option<&str>,
     max_uses: Option<i64>,
 ) -> Result<Share> {
     let (token, token_hash) = generate_token();
 
-    conn.execute(
-        &format!(
-            "INSERT INTO {table} ({id_column}, token_hash, expires_at, max_uses)
-             VALUES (?1, ?2, datetime('now', ?3), ?4)"
-        ),
-        params![
-            resource_id,
-            token_hash,
-            format!("{ttl_seconds:+} seconds"),
-            max_uses
-        ],
-    )?;
+    match (ttl_seconds, expires_at) {
+        (Some(ttl_seconds), None) => {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} ({id_column}, token_hash, expires_at, max_uses)
+                     VALUES (?1, ?2, datetime('now', ?3), ?4)"
+                ),
+                params![
+                    resource_id,
+                    token_hash,
+                    format!("{ttl_seconds:+} seconds"),
+                    max_uses
+                ],
+            )?;
+        }
+        (None, Some(expires_at)) => {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} ({id_column}, token_hash, expires_at, max_uses)
+                     VALUES (?1, ?2, ?3, ?4)"
+                ),
+                params![resource_id, token_hash, expires_at, max_uses],
+            )?;
+        }
+        _ => return Err(Error::InvalidExpiresAt),
+    }
 
     let id = conn.last_insert_rowid();
     let expires_at: String = conn.query_row(
@@ -175,7 +193,8 @@ pub fn create_credential_share(
         "credential_shares",
         "credential_id",
         credential_id,
-        ttl_seconds,
+        Some(ttl_seconds),
+        None,
         max_uses,
     )
 }
@@ -199,12 +218,51 @@ pub fn create_file_share(
         "file_shares",
         "file_id",
         file_id,
-        ttl_seconds,
+        Some(ttl_seconds),
+        None,
         max_uses,
     )
 }
 
+/// Date-based file share: the file itself expires at `expires_at` (UTC
+/// `YYYY-MM-DD HH:MM:00`). A late redeem or unlock deletes the ciphertext.
+pub fn create_file_share_until(
+    conn: &Connection,
+    file_id: i64,
+    expires_at: &str,
+    max_uses: Option<i64>,
+) -> Result<Share> {
+    locked_files::set_expires_at(conn, file_id, expires_at)?;
+    create_share(
+        conn,
+        "file_shares",
+        "file_id",
+        file_id,
+        None,
+        Some(expires_at),
+        max_uses,
+    )
+}
+
+/// Drops an expired date-based TTL file (ciphertext + row) when the share
+/// token resolves to one. Unknown tokens are left for redemption to reject.
+pub fn purge_expired_file_share(conn: &Connection, token: &str) -> Result<()> {
+    let token_hash = hash_token(token)?;
+    let file_id: Option<i64> = conn
+        .query_row(
+            "SELECT file_id FROM file_shares WHERE token_hash = ?1",
+            params![token_hash],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(file_id) = file_id else {
+        return Ok(());
+    };
+    locked_files::purge_if_expired(conn, file_id)
+}
+
 pub fn redeem_file_share(conn: &Connection, token: &str) -> Result<i64> {
+    purge_expired_file_share(conn, token)?;
     redeem_share(conn, "file_shares", "file_id", token)
 }
 

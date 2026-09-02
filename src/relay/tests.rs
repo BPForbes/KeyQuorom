@@ -172,6 +172,49 @@ fn mailbox_list_after_pages_and_rejects_invalid_limits() {
 }
 
 #[test]
+fn mailbox_scan_deletes_expired_envelopes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (live, fingerprint) = sample_envelope();
+    relay::store_until(&conn, &live, Some("2099-12-31 23:59:00")).expect("store live");
+    let (_sk, pk) = keys::generate_encryption_keypair();
+    let dead = fake_kqpb(pk, b"stale");
+    let dead_fp = keys::fingerprint(&pk);
+    relay::store_until(&conn, &dead, Some("2099-12-31 23:59:00")).expect("store dead");
+    conn.execute(
+        "UPDATE mailbox SET expires_at = datetime('now', '-1 minutes')
+         WHERE recipient_fingerprint = ?1",
+        rusqlite::params![dead_fp],
+    )
+    .expect("stamp past expiry");
+
+    let purged = relay::purge_expired_envelopes(&conn).expect("scan");
+    assert_eq!(purged, 1);
+    let live_page = relay::list_after(&conn, &fingerprint, None, None).expect("list live");
+    assert_eq!(live_page.envelopes.len(), 1);
+    let dead_page = relay::list_after(&conn, &dead_fp, None, None).expect("list dead");
+    assert!(dead_page.envelopes.is_empty());
+}
+
+#[test]
+fn mailbox_list_hides_expired_envelopes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, fingerprint) = sample_envelope();
+    relay::store_until(&conn, &envelope, Some("2099-12-31 23:59:00")).expect("store");
+    conn.execute(
+        "UPDATE mailbox SET expires_at = datetime('now', '-1 minutes')",
+        [],
+    )
+    .expect("stamp past expiry");
+
+    let listed = relay::list_after(&conn, &fingerprint, None, None).expect("list");
+    assert!(listed.envelopes.is_empty());
+    let remaining: i64 = conn
+        .query_row("SELECT count(*) FROM mailbox", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
 fn mailbox_rejects_truncated_and_wrong_magic() {
     let conn = relay::open_in_memory().expect("schema");
     assert!(matches!(

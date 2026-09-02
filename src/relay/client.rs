@@ -47,6 +47,10 @@ pub struct InboxPush {
     /// Nodes the sender does not hold stay on the relay.
     #[serde(default)]
     pub trees: Vec<PublicTree>,
+    /// UTC expiry as `YYYY-MM-DD HH:MM:00`. After this instant the host
+    /// scan and inbox pull delete the envelope so it cannot be fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -204,9 +208,22 @@ pub fn push_with_trees(
     envelope: &[u8],
     trees: &[PublicTree],
 ) -> Result<InboxAccepted> {
+    push_with_trees_until(base_url, api_key, envelope, trees, None)
+}
+
+/// Like [`push_with_trees`], and stamps a UTC envelope expiry the host scan
+/// will delete after.
+pub fn push_with_trees_until(
+    base_url: &str,
+    api_key: &str,
+    envelope: &[u8],
+    trees: &[PublicTree],
+    expires_at: Option<&str>,
+) -> Result<InboxAccepted> {
     let body = InboxPush {
         bytes: base64::engine::general_purpose::STANDARD.encode(envelope),
         trees: trees.to_vec(),
+        expires_at: expires_at.map(str::to_owned),
     };
     let json = serde_json::to_string(&body).map_err(|e| Error::RelayRequest(e.to_string()))?;
     let url = relay_request_url(base_url, "/inbox")?;
