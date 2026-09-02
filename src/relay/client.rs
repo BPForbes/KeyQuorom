@@ -1,5 +1,6 @@
 //! HTTP JSON wire types and a synchronous `ureq` client for the relay.
 
+use super::register::{RegisterRequest, RegisterResponse};
 use crate::error::{Error, Result};
 use crate::key_tree::PublicTree;
 use crate::provider::{self, Certificate};
@@ -252,6 +253,26 @@ pub fn pull(
         url.set_query(Some(&params.join("&")));
     }
     let resp = with_key(http_agent().request_url("GET", &url), api_key).call();
+    read_json(resp)
+}
+
+/// Mint a bearer via unauthenticated `POST /api/v1/{provider_id}/register`.
+pub fn register(
+    base_url: &str,
+    provider_id: &str,
+    request: &RegisterRequest,
+) -> Result<RegisterResponse> {
+    let json = serde_json::to_string(request).map_err(|e| Error::RelayRequest(e.to_string()))?;
+    let path = format!(
+        "/api/{}/{}/register",
+        super::register::API_VERSION,
+        urlencoding_label(provider_id)
+    );
+    let url = relay_request_url(base_url, &path)?;
+    let resp = http_agent()
+        .request_url("POST", &url)
+        .set("Content-Type", "application/json")
+        .send_string(&json);
     read_json(resp)
 }
 

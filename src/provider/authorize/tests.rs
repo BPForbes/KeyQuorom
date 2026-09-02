@@ -406,17 +406,6 @@ fn approved_hardware_on_signed_corporate_network_succeeds() {
 }
 
 #[test]
-fn api_root_cannot_be_generated_twice() {
-    let conn = relay::open_in_memory().expect("schema");
-    let first = relay::create_licensee_issuer_if_empty(&conn).expect("first");
-    assert!(first.token.starts_with("kql_"));
-    assert!(matches!(
-        relay::create_licensee_issuer_if_empty(&conn),
-        Err(Error::ApiRootAlreadyExists)
-    ));
-}
-
-#[test]
 fn sqlite_insert_cannot_bypass_signed_policy() {
     let fix = authorized_fixture();
     let conn = relay::open_in_memory().expect("schema");

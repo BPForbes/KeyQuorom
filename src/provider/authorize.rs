@@ -1,6 +1,6 @@
 //! Combined provider gates for official API-root generation.
 //!
-//! Official `kql_…` minting requires a KeyQuorum-signed certificate,
+//! Official privileged provider operations require a KeyQuorum-signed certificate,
 //! a matching relay key, a signed Corporate Network (VPN tunnel or
 //! associated Wi-Fi), and proof of authorized provider hardware.
 //! Caller-supplied CIDRs/SSIDs and SQLite rows are not authority.

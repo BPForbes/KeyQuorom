@@ -7,6 +7,7 @@ use super::client::{
 };
 use super::mailbox;
 use super::org_tree;
+use super::register::{self, RegisterRequest, RegisterResponse};
 use crate::error::Error;
 use crate::key_tree::{PublicEdge, PublicNode, PublicTree};
 use axum::body::Bytes;
@@ -55,6 +56,10 @@ impl AppState {
             db: Arc::new(Mutex::new(conn)),
             identity: Some(Arc::new(identity)),
         }
+    }
+
+    pub fn identity(&self) -> Option<Arc<ProviderIdentity>> {
+        self.identity.clone()
     }
 }
 
@@ -124,6 +129,7 @@ impl From<Error> for ApiError {
             | Error::InvalidInboxPage
             | Error::InvalidBridgePackage
             | Error::InvalidPublicKey
+            | Error::SignatureVerificationFailed
             | Error::InvalidTreeSpec
             | Error::DuplicateNodeLabel
             | Error::InvalidBridge
@@ -133,7 +139,10 @@ impl From<Error> for ApiError {
                 status: StatusCode::BAD_REQUEST,
                 message: err.to_string(),
             },
-            Error::ApiKeyNotFound | Error::TreeNotFound | Error::NodeNotFound => Self {
+            Error::ApiKeyNotFound
+            | Error::TreeNotFound
+            | Error::NodeNotFound
+            | Error::UnknownProvider => Self {
                 status: StatusCode::NOT_FOUND,
                 message: err.to_string(),
             },
@@ -242,6 +251,7 @@ impl Modify for SecurityAddon {
     paths(
         health,
         post_keycheck,
+        post_register,
         post_inbox,
         get_inbox,
         list_keys,
@@ -255,6 +265,8 @@ impl Modify for SecurityAddon {
             HealthResponse,
             KeyCheckRequest,
             KeyCheckResponse,
+            RegisterRequest,
+            RegisterResponse,
             InboxAccepted,
             InboxEnvelope,
             InboxList,
@@ -271,7 +283,7 @@ impl Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
-        (name = "api-keys", description = "List and revoke API keys; minting is licensee-only on the host"),
+        (name = "api-keys", description = "List and revoke API keys; mint via unauthenticated register"),
         (name = "trees", description = "Canonical public split-tree topology"),
         (name = "provider", description = "KeyQuorum-signed relay identity")
     )
@@ -353,6 +365,34 @@ async fn post_keycheck(
         _ => return Err(Error::InvalidApiKeyRequest.into()),
     };
     Ok(Json(keycheck_response(check)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/{provider_id}/register",
+    tag = "api-keys",
+    params(("provider_id" = String, Path, description = "Certified provider group id")),
+    request_body = RegisterRequest,
+    responses(
+        (status = 201, description = "Minted bearer plus KeyQuorum-signed receipt", body = RegisterResponse),
+        (status = 400, description = "Malformed proof or unsupported scope", body = ErrorBody),
+        (status = 404, description = "Provider id does not match this host", body = ErrorBody),
+        (status = 503, description = "Host has no provider identity", body = ErrorBody)
+    )
+)]
+async fn post_register(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    Json(body): Json<RegisterRequest>,
+) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
+    let identity = state.identity().ok_or(Error::ProviderIdentityMissing)?;
+    let cert = crate::provider::parse_certificate(&identity.certificate)?;
+    let relay_key = identity.relay_private_key.clone();
+    let registered = with_conn(&state, move |conn| {
+        register::register(conn, &provider_id, &cert.provider_id, &relay_key, &body)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(registered)))
 }
 
 #[utoipa::path(
@@ -597,6 +637,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/keycheck", post(post_keycheck))
         .route("/provider-identity", post(post_provider_identity))
+        .route("/api/v1/{provider_id}/register", post(post_register))
         .route("/inbox", post(post_inbox).get(get_inbox))
         .route("/api-keys", get(list_keys))
         .route("/api-keys/{id}/revoke", post(revoke_key))

@@ -4,22 +4,21 @@
 //!
 //! `--features provider` compiles these commands; it does not authorize a
 //! host. `serve` requires a KeyQuorum-signed `provider.kqcert` and the
-//! matching relay private key. It does not mint the `kql_…` API root.
-//! Official API-root minting is `api-root generate`: cert, signed
-//! `provider-policy.kqpolicy`, Corporate Network id, and hardware
-//! proof-of-possession. Caller `--network` / `--ssid` values are a
-//! ceremony/dev presence check for `root generate` only — they are not
-//! production authority. Production networks come from the signed policy.
+//! matching relay private key. Customer API keys are minted by
+//! unauthenticated `POST /api/v1/{provider_id}/register` after a hardware
+//! possession proof; the KeyQuorum relay identity key signs the receipt.
+//! Caller `--network` / `--ssid` values are a ceremony/dev presence check
+//! for `root generate` only — they are not production authority.
+//! Production networks come from the signed policy.
 
 use clap::Subcommand;
 use keyquorum::db;
 use keyquorum::error::{Error, Result};
 use keyquorum::keys::{self, KeyType};
 use keyquorum::locked_files;
-use keyquorum::provider::authorize::{self, ApiRootRequest};
-use keyquorum::provider::hardware_auth::{self, HardwareAuthority, ProviderChallenge};
+use keyquorum::provider::hardware_auth::HardwareAuthority;
 use keyquorum::provider::policy::{
-    self, CorporateNetwork, HardwareAuthorityEntry, NetworkMode, NewPolicy, PERM_API_ROOT_GENERATE,
+    self, CorporateNetwork, HardwareAuthorityEntry, NetworkMode, NewPolicy,
 };
 use keyquorum::provider::{self, NewCertificate, KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY};
 use keyquorum::relay::{self, ApiKeyScope, AppState, NewApiKey, ProviderIdentity};
@@ -107,11 +106,6 @@ pub enum HostCommand {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    /// Official `kql_…` API-root minting.
-    ApiRoot {
-        #[command(subcommand)]
-        command: ApiRootCommand,
-    },
 }
 
 #[derive(Subcommand)]
@@ -172,35 +166,6 @@ pub enum PolicyCommand {
 }
 
 #[derive(Subcommand)]
-pub enum ApiRootCommand {
-    /// Mint the licensee issuer after all provider gates succeed.
-    Generate {
-        #[arg(long)]
-        cert: Option<PathBuf>,
-        #[arg(long)]
-        relay_key: Option<PathBuf>,
-        #[arg(long)]
-        krl: Option<PathBuf>,
-        /// Signed policy (or KEYQUORUM_PROVIDER_POLICY)
-        #[arg(long)]
-        policy: Option<PathBuf>,
-        /// Selects a Corporate Network already listed in the signed policy.
-        #[arg(long)]
-        network_id: String,
-        /// File-based stand-in for the hardware signing key (tests/dev).
-        #[arg(long)]
-        hardware_key: Option<PathBuf>,
-        #[arg(long)]
-        hardware_public_key: Option<PathBuf>,
-        #[arg(long)]
-        hardware_signature: Option<String>,
-        /// Rejected: caller CIDRs are not production authority.
-        #[arg(long = "network")]
-        networks: Vec<String>,
-    },
-}
-
-#[derive(Subcommand)]
 pub enum IdentityCommand {
     Generate {
         #[arg(long)]
@@ -220,9 +185,6 @@ pub enum KeysCommand {
         label: Option<String>,
         #[arg(long)]
         ttl_seconds: Option<i64>,
-        /// Licensee issuer (`kql_…`). Prompted or KEYQUORUM_LICENSEE_KEY if omitted.
-        #[arg(long)]
-        licensee_key: Option<String>,
     },
     List,
     Revoke {
@@ -230,8 +192,6 @@ pub enum KeysCommand {
     },
     Rotate {
         id: i64,
-        #[arg(long)]
-        licensee_key: Option<String>,
     },
 }
 
@@ -295,41 +255,7 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
         }
         HostCommand::Root { command } => run_root(command),
         HostCommand::Policy { command } => run_policy(command),
-        HostCommand::ApiRoot { command } => {
-            let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
-            let conn = relay::open(db_path)?;
-            run_api_root(&conn, command)
-        }
     }
-}
-
-fn print_new_licensee(issuer: &relay::CreatedLicensee) {
-    eprintln!("Created licensee issuer key (shown once):");
-    eprintln!("  {}", issuer.token);
-    eprintln!("Only this key can mint or rotate customer API keys.");
-    eprintln!("It is not a KeyQuorum provider certificate.");
-    eprintln!("Store this; it cannot be recovered from the database.");
-}
-
-fn licensee_secret(explicit: Option<String>) -> Result<String> {
-    if let Some(key) = explicit.filter(|s| !s.is_empty()) {
-        return Ok(key);
-    }
-    match std::env::var("KEYQUORUM_LICENSEE_KEY") {
-        Ok(key) if !key.is_empty() => Ok(key),
-        _ => rpassword::prompt_password("Licensee key: ").map_err(Error::from),
-    }
-}
-
-fn require_licensee(conn: &rusqlite::Connection, explicit: Option<String>) -> Result<()> {
-    relay::authenticate_licensee(conn, &licensee_secret(explicit)?)
-}
-
-fn authorize_mint(conn: &rusqlite::Connection, licensee_key: Option<String>) -> Result<()> {
-    if !relay::licensee_issuer_exists(conn)? {
-        return Err(Error::ApiRootMissing);
-    }
-    require_licensee(conn, licensee_key)
 }
 
 fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
@@ -339,9 +265,7 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
             fingerprint,
             label,
             ttl_seconds,
-            licensee_key,
         } => {
-            authorize_mint(conn, licensee_key)?;
             let created = relay::create_api_key(
                 conn,
                 &NewApiKey {
@@ -382,8 +306,7 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
             relay::revoke_api_key(conn, id)?;
             println!("Revoked API key {id}");
         }
-        KeysCommand::Rotate { id, licensee_key } => {
-            authorize_mint(conn, licensee_key)?;
+        KeysCommand::Rotate { id } => {
             let created = relay::rotate_api_key(conn, id)?;
             println!("Rotated API key {id} -> {}", created.info.id);
             println!("token (shown once): {}", created.token);
@@ -448,33 +371,6 @@ fn run_policy(command: PolicyCommand) -> Result<()> {
             hardware_threshold,
             &permissions,
             &out,
-        ),
-    }
-}
-
-fn run_api_root(conn: &rusqlite::Connection, command: ApiRootCommand) -> Result<()> {
-    match command {
-        ApiRootCommand::Generate {
-            cert,
-            relay_key,
-            krl,
-            policy,
-            network_id,
-            hardware_key,
-            hardware_public_key,
-            hardware_signature,
-            networks,
-        } => run_api_root_generate(
-            conn,
-            cert,
-            relay_key,
-            krl,
-            policy,
-            &network_id,
-            hardware_key,
-            hardware_public_key,
-            hardware_signature,
-            &networks,
         ),
     }
 }
@@ -594,121 +490,6 @@ fn collect_networks(
         });
     }
     Ok(out)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_api_root_generate(
-    conn: &rusqlite::Connection,
-    cert: Option<PathBuf>,
-    relay_key: Option<PathBuf>,
-    krl: Option<PathBuf>,
-    policy: Option<PathBuf>,
-    network_id: &str,
-    hardware_key: Option<PathBuf>,
-    hardware_public_key: Option<PathBuf>,
-    hardware_signature: Option<String>,
-    networks: &[String],
-) -> Result<()> {
-    let identity = load_serve_identity(cert, relay_key, krl)?;
-    let policy_path =
-        path_or_env(policy, "KEYQUORUM_PROVIDER_POLICY").ok_or(Error::InvalidProviderPolicy)?;
-    let policy_bytes = std::fs::read(&policy_path)?;
-    let now = provider::system_now_utc()?;
-    let cert = provider::parse_certificate(&identity.certificate)?;
-    let nonce = *keyquorum::crypto::random_key();
-    let (hardware_public_key, hardware_signature) = hardware_proof(
-        &cert,
-        network_id,
-        &now,
-        &nonce,
-        hardware_key,
-        hardware_public_key,
-        hardware_signature,
-    )?;
-    let local_addrs = provider::root_network::list_local_addresses()?;
-    let wifi_links = provider::network::list_wifi_links()?;
-    let revoked = std::collections::HashSet::new();
-    let outcome = authorize::authorize_api_root_generation(&ApiRootRequest {
-        root_public_key: &KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
-        certificate: &identity.certificate,
-        relay_private_key: &identity.relay_private_key,
-        policy: &policy_bytes,
-        now_utc: &now,
-        revoked: &revoked,
-        network_id,
-        local_addrs: &local_addrs,
-        wifi_links: &wifi_links,
-        caller_networks: networks,
-        hardware_public_key: &hardware_public_key,
-        hardware_signature: &hardware_signature,
-        timestamp: &now,
-        nonce: &nonce,
-    });
-    match outcome {
-        Ok(authorized) => {
-            let issuer = relay::create_licensee_issuer_if_empty(conn);
-            let success = issuer.is_ok();
-            let _ = relay::record_provider_auth_event(
-                conn,
-                PERM_API_ROOT_GENERATE,
-                Some(&authorized.certificate.provider_id),
-                Some(&authorized.network_id),
-                Some(&authorized.hardware_fingerprint),
-                success,
-            );
-            let issuer = issuer?;
-            print_new_licensee(&issuer);
-            Ok(())
-        }
-        Err(err) => {
-            let _ = relay::record_provider_auth_event(
-                conn,
-                PERM_API_ROOT_GENERATE,
-                Some(&cert.provider_id),
-                Some(network_id),
-                None,
-                false,
-            );
-            Err(err)
-        }
-    }
-}
-
-fn hardware_proof(
-    cert: &provider::Certificate,
-    network_id: &str,
-    timestamp: &str,
-    nonce: &[u8; 32],
-    hardware_key: Option<PathBuf>,
-    hardware_public_key: Option<PathBuf>,
-    hardware_signature: Option<String>,
-) -> Result<([u8; 32], [u8; 64])> {
-    if let Some(path) = hardware_key {
-        let secret = read_key_array_32(&path)?;
-        let public = ed25519_dalek::SigningKey::from_bytes(&secret)
-            .verifying_key()
-            .to_bytes();
-        let challenge = ProviderChallenge {
-            provider_id: &cert.provider_id,
-            relay_id: &cert.relay_public_key,
-            network_policy_id: network_id,
-            timestamp,
-            nonce,
-            required_authority: HardwareAuthority::ProviderApiRoot,
-        };
-        let signature = hardware_auth::sign_provider_hardware(&secret, &challenge)?;
-        return Ok((public, signature));
-    }
-    let public_path = hardware_public_key.ok_or(Error::ProviderHardwareDenied)?;
-    let signature_hex = hardware_signature.ok_or(Error::ProviderHardwareDenied)?;
-    let public = read_key_array_32(&public_path)?;
-    let signature = parse_signature_hex(&signature_hex)?;
-    Ok((public, signature))
-}
-
-fn parse_signature_hex(value: &str) -> Result<[u8; 64]> {
-    let bytes = hex::decode(value.trim()).map_err(|_| Error::ProviderHardwareDenied)?;
-    bytes.try_into().map_err(|_| Error::ProviderHardwareDenied)
 }
 
 fn run_identity(command: IdentityCommand) -> Result<()> {
@@ -857,9 +638,6 @@ async fn serve(
     let identity = load_serve_identity(cert, relay_key, krl)?;
     let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
     let conn = relay::open(db_path)?;
-    if !relay::licensee_issuer_exists(&conn)? {
-        eprintln!("API root is not present; customer keys cannot be minted until api-root generate succeeds");
-    }
 
     let addr: SocketAddr = bind
         .parse()

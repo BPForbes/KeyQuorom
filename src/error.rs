@@ -51,6 +51,7 @@ pub enum Error {
     ApiKeyScopeDenied,
     ApiKeyNotFound,
     InvalidLicenseeKey,
+    UnknownProvider,
     OrganizationDatabase,
     InvalidInboxPage,
     RelayRequest(String),
@@ -191,6 +192,7 @@ impl fmt::Display for Error {
                     "invalid licensee key; only the licensee can mint or rotate API keys"
                 )
             }
+            Error::UnknownProvider => write!(f, "provider id does not match this mailbox"),
             Error::OrganizationDatabase => write!(
                 f,
                 "this SQLite file is an organization database; the mailbox needs a separate database"
@@ -263,7 +265,7 @@ impl fmt::Display for Error {
             }
             Error::ApiRootMissing => write!(
                 f,
-                "API root has not been generated; use host api-root generate"
+                "API root has not been generated"
             ),
             Error::ApiRootAlreadyExists => {
                 write!(f, "API root already exists on this mailbox")

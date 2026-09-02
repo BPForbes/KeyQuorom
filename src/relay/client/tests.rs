@@ -425,3 +425,54 @@ async fn authenticate_provider_rejects_missing_expired_and_revoked() {
     .unwrap_err();
     assert!(matches!(err, Error::ProviderCertificateRevoked));
 }
+
+#[cfg(feature = "provider")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn register_client_mints_without_a_bearer() {
+    use crate::provider::test_helpers::issued_identity;
+    use crate::relay::{ProviderIdentity, RegisterRequest};
+
+    let issued = issued_identity("2027-09-02 00:00:00");
+    let provider_id = "Acme Security Services".to_string();
+    let conn = relay::open_in_memory().expect("schema");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = relay::router(AppState::with_identity(
+        conn,
+        ProviderIdentity {
+            certificate: issued.certificate,
+            relay_private_key: issued.relay_private,
+        },
+    ));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let url = format!("http://{addr}");
+    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
+    let (public, signature) = relay::sign_register_proof(&hw_sk, &provider_id).expect("sign");
+    let receipt = {
+        let url = url.clone();
+        let provider_id = provider_id.clone();
+        tokio::task::spawn_blocking(move || {
+            register(
+                &url,
+                &provider_id,
+                &RegisterRequest {
+                    public_key: hex::encode(public),
+                    signature: hex::encode(signature),
+                    scope: None,
+                    label: Some("desk".into()),
+                },
+            )
+        })
+        .await
+        .expect("join")
+        .expect("register");
+    };
+    assert!(receipt.token.starts_with("kq_"));
+    assert_eq!(receipt.hardware_fingerprint, keys::fingerprint(&hw_pk));
+    let key_hash = relay::hash_bearer(&receipt.token).expect("hash");
+    relay::verify_receipt(&issued.relay_public, &receipt, &key_hash, &hw_pk).expect("receipt");
+}

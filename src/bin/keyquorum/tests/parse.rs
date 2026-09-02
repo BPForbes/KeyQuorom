@@ -591,19 +591,14 @@ fn provider_host_identity_and_certify_parse() {
     .is_ok());
     assert!(Cli::try_parse_from([
         "keyquorum",
-        "host",
-        "api-root",
-        "generate",
-        "--cert",
-        "provider.kqcert",
-        "--relay-key",
-        "relay.key",
-        "--policy",
-        "provider.kqpolicy",
-        "--network-id",
-        "corp-vpn",
+        "relay",
+        "register",
+        "--url",
+        "http://127.0.0.1:8787",
+        "--provider-id",
+        "acme",
         "--hardware-key",
-        "provider-hw.key",
+        "hw.key",
     ])
     .is_ok());
 }

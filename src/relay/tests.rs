@@ -228,24 +228,20 @@ fn mailbox_rejects_truncated_and_wrong_magic() {
 }
 
 #[test]
-fn create_licensee_issuer_is_once_only_and_audit_has_no_secrets() {
+fn provider_auth_audit_has_no_secrets() {
     let conn = relay::open_in_memory().expect("schema");
-    assert!(!relay::licensee_issuer_exists(&conn).expect("exists"));
-    let first = relay::create_licensee_issuer_if_empty(&conn).expect("mint");
-    assert!(first.token.starts_with("kql_"));
-    assert!(matches!(
-        relay::create_licensee_issuer_if_empty(&conn),
-        Err(Error::ApiRootAlreadyExists)
-    ));
-    relay::record_provider_auth_event(
+    let created = relay::create_api_key(
         &conn,
-        "api-root.generate",
-        Some("Acme"),
-        Some("corp-vpn"),
-        Some("abcd"),
-        true,
+        &relay::NewApiKey {
+            scope: relay::ApiKeyScope::InboxPush,
+            recipient_fingerprint: None,
+            label: Some("desk".into()),
+            ttl_seconds: None,
+        },
     )
-    .expect("audit");
+    .expect("mint");
+    relay::record_provider_auth_event(&conn, "register", Some("Acme"), None, Some("abcd"), true)
+        .expect("audit");
     let (op, success, fingerprint): (String, i64, String) = conn
         .query_row(
             "SELECT operation, success, hardware_fingerprints FROM provider_auth_events",
@@ -253,7 +249,7 @@ fn create_licensee_issuer_is_once_only_and_audit_has_no_secrets() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("row");
-    assert_eq!(op, "api-root.generate");
+    assert_eq!(op, "register");
     assert_eq!(success, 1);
     assert_eq!(fingerprint, "abcd");
     let token_hits: i64 = conn
@@ -261,58 +257,11 @@ fn create_licensee_issuer_is_once_only_and_audit_has_no_secrets() {
             "SELECT COUNT(*) FROM provider_auth_events
              WHERE operation = ?1 OR provider_id = ?1 OR network_id = ?1
                 OR hardware_fingerprints = ?1",
-            [first.token.as_str()],
+            [created.token.as_str()],
             |row| row.get(0),
         )
         .expect("token search");
     assert_eq!(token_hits, 0);
-}
-
-#[test]
-fn bootstrap_licensee_only_when_empty() {
-    let conn = relay::open_in_memory().expect("schema");
-    let first = relay::bootstrap_licensee_if_empty(&conn)
-        .expect("bootstrap")
-        .expect("created");
-    assert!(first.token.starts_with("kql_"));
-    assert!(relay::bootstrap_licensee_if_empty(&conn)
-        .expect("second")
-        .is_none());
-    relay::authenticate_licensee(&conn, &first.token).expect("licensee works");
-    assert!(matches!(
-        relay::authenticate_licensee(&conn, "kq_notarealtokenvalue0123456789ABCD"),
-        Err(Error::InvalidLicenseeKey)
-    ));
-}
-
-#[test]
-fn supplied_licensee_key_does_not_bootstrap_an_empty_issuer_store() {
-    let conn = relay::open_in_memory().expect("schema");
-    assert!(matches!(
-        relay::authorize_licensee_or_bootstrap(
-            &conn,
-            Some("kql_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-        ),
-        Err(Error::InvalidLicenseeKey)
-    ));
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))
-        .expect("count");
-    assert_eq!(n, 0);
-    assert!(matches!(
-        relay::authorize_licensee_or_bootstrap(&conn, Some("")),
-        Err(Error::InvalidLicenseeKey)
-    ));
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))
-        .expect("count after empty");
-    assert_eq!(n, 0);
-    let created = relay::authorize_licensee_or_bootstrap(&conn, None)
-        .expect("bootstrap")
-        .expect("created");
-    let again = relay::authorize_licensee_or_bootstrap(&conn, Some(&created.token))
-        .expect("supplied key authenticates");
-    assert!(again.is_none());
 }
 
 #[test]
