@@ -64,6 +64,8 @@ pub enum Error {
     InvalidProviderChallenge,
     UntrustedRelay,
     ProviderIdentityMissing,
+    InvalidRootNetwork,
+    RootNetworkRequired,
 }
 
 impl fmt::Display for Error {
@@ -223,6 +225,11 @@ impl fmt::Display for Error {
                     "mailbox host is not configured with a provider identity"
                 )
             }
+            Error::InvalidRootNetwork => write!(f, "root-network CIDR is malformed"),
+            Error::RootNetworkRequired => write!(
+                f,
+                "provider root keys can only be generated on an authorized VPN tunnel"
+            ),
         }
     }
 }

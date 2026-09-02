@@ -35,7 +35,9 @@ feature is a build capability, not authorization. A trusted relay also
 requires a KeyQuorum-signed `provider.kqcert` and the matching relay private
 key; official clients challenge `POST /provider-identity` and disconnect if
 the certificate, signature, expiry, capabilities, or revocation check fails.
-Do not document `host` in README or other customer-facing docs — buyers get
+`host root generate` is allowed only when this machine has a tunnel address
+in `--network` / `KEYQUORUM_ROOT_NETWORKS` (a presence check, not a root of
+trust). Do not document `host` in README or other customer-facing docs — buyers get
 a URL and an API key and use `keyquorum loadkey` / `relay push` /
 `relay pull`. Default `cargo build` produces `keyquorum` without that
 subcommand. `keyquorum loadkey` authenticates the relay, then calls

@@ -4,8 +4,10 @@
 //!
 //! `--features provider` compiles these commands; it does not authorize a
 //! host. `serve` requires a KeyQuorum-signed `provider.kqcert` and the
-//! matching relay private key. The `kql_…` issuer remains host-local
-//! API-key administration, not proof of KeyQuorum authorization.
+//! matching relay private key. `root generate` is allowed only on a
+//! configured VPN tunnel (`--network` / `KEYQUORUM_ROOT_NETWORKS`). The
+//! `kql_…` issuer remains host-local API-key administration, not proof of
+//! KeyQuorum authorization.
 
 use clap::Subcommand;
 use keyquorum::db;
@@ -87,6 +89,23 @@ pub enum HostCommand {
     Keys {
         #[command(subcommand)]
         command: KeysCommand,
+    },
+    /// Seller-root keypair. Allowed only on a configured VPN tunnel.
+    Root {
+        #[command(subcommand)]
+        command: RootCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RootCommand {
+    /// Print the root private key once. Requires --network or KEYQUORUM_ROOT_NETWORKS.
+    Generate {
+        #[arg(long)]
+        public_key_out: PathBuf,
+        /// Seller VPN CIDR (repeatable). Example: 10.8.0.0/24
+        #[arg(long = "network")]
+        networks: Vec<String>,
     },
 }
 
@@ -183,6 +202,7 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
             let conn = relay::open(db_path)?;
             run_keys(&conn, command)
         }
+        HostCommand::Root { command } => run_root(command),
     }
 }
 
@@ -283,6 +303,24 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_root(command: RootCommand) -> Result<()> {
+    match command {
+        RootCommand::Generate {
+            public_key_out,
+            networks,
+        } => {
+            let networks = provider::root_network::networks_from_cli_or_env(&networks)?;
+            provider::root_network::require_authorized_tunnel(&networks)?;
+            let (secret, public) = provider::generate_relay_identity();
+            locked_files::write_owner_only(&public_key_out, hex::encode(public).as_bytes())?;
+            println!("{}", hex::encode(*secret));
+            eprintln!("Public key written to {}", public_key_out.display());
+            eprintln!("Root private key printed to stdout above — this tool keeps no copy of it.");
+            Ok(())
+        }
+    }
 }
 
 fn run_identity(command: IdentityCommand) -> Result<()> {
