@@ -333,8 +333,8 @@ mailbox so the recipient cannot fetch the file after the date.
 The hosted mailbox carries sealed `.kqpb` envelopes and public-tree slices.
 It indexes packages by the recipient fingerprint in the outer header and
 never unseals them. Wrapped shares and private keys stay on the device.
-Your provider gives you a URL and an API key; you do not run or administer
-the mailbox. Official `loadkey` / `relay` commands authenticate that host
+Your seller gives you a URL and an API key; you do not run the mailbox or
+mint keys. Official `loadkey` / `relay` commands authenticate that host
 with a KeyQuorum-signed provider certificate before sending a bearer.
 
 ```sh

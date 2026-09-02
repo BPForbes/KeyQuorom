@@ -20,10 +20,12 @@ returns a sliced copy that the personal SQLite file translates. A personal store
 should keep only the subgraph that person needs (own lineage, siblings,
 descendants, and established-bridge peers plus those peers' ancestors). API keys
 are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
-are minted only by the licensee (host-local `keys create|rotate` with the
-`kql_…` issuer); HTTP cannot create or rotate bearers. The `kql_…` issuer is
-host-local mailbox administration, not proof that an organization is a
-KeyQuorum-authorized provider. The mailbox host is a **hidden**
+are minted only by KeyQuorum (host-local `keys create|rotate` on a relay
+that already holds a signed `provider.kqcert` and matching relay key).
+HTTP cannot create or rotate bearers. Customers never mint keys; they
+receive a `kq_…` bearer. The `kql_…` issuer is an internal operator lock
+created only after that identity check, not a customer credential and not
+proof of authorization by itself. The mailbox host is a **hidden**
 `keyquorum host` subcommand, compiled only with `--features provider`. That
 feature is a build capability, not authorization. A trusted relay also
 requires a KeyQuorum-signed `provider.kqcert` and the matching relay private

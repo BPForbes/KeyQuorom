@@ -3,9 +3,10 @@
 //! and bearer they were given.
 //!
 //! `--features provider` compiles these commands; it does not authorize a
-//! host. `serve` requires a KeyQuorum-signed `provider.kqcert` and the
-//! matching relay private key. The `kql_…` issuer remains host-local
-//! API-key administration, not proof of KeyQuorum authorization.
+//! host. `serve` and customer-API-key minting require a KeyQuorum-signed
+//! `provider.kqcert` and the matching relay private key. Customers never
+//! mint keys: they receive a `kq_…` bearer. The `kql_…` issuer is an
+//! internal operator lock created only after that identity check.
 
 use clap::Subcommand;
 use keyquorum::db;
@@ -110,7 +111,16 @@ pub enum KeysCommand {
         label: Option<String>,
         #[arg(long)]
         ttl_seconds: Option<i64>,
-        /// Licensee issuer (`kql_…`). Prompted or KEYQUORUM_LICENSEE_KEY if omitted.
+        /// `provider.kqcert` (or KEYQUORUM_PROVIDER_CERT)
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        /// Relay Ed25519 private key file (or KEYQUORUM_RELAY_KEY)
+        #[arg(long)]
+        relay_key: Option<PathBuf>,
+        /// Optional signed revocation list (or KEYQUORUM_PROVIDER_KRL)
+        #[arg(long)]
+        krl: Option<PathBuf>,
+        /// Internal operator lock (`kql_…`). Prompted or KEYQUORUM_LICENSEE_KEY if omitted.
         #[arg(long)]
         licensee_key: Option<String>,
     },
@@ -120,6 +130,12 @@ pub enum KeysCommand {
     },
     Rotate {
         id: i64,
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        #[arg(long)]
+        relay_key: Option<PathBuf>,
+        #[arg(long)]
+        krl: Option<PathBuf>,
         #[arg(long)]
         licensee_key: Option<String>,
     },
@@ -187,10 +203,9 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
 }
 
 fn print_new_licensee(issuer: &relay::CreatedLicensee) {
-    eprintln!("Created licensee issuer key (shown once):");
+    eprintln!("Created internal operator key (shown once):");
     eprintln!("  {}", issuer.token);
-    eprintln!("Only this key can mint or rotate customer API keys.");
-    eprintln!("It is not a KeyQuorum provider certificate.");
+    eprintln!("This mints customer API keys on this host. It is not a customer credential.");
     eprintln!("Store this; it cannot be recovered from the database.");
 }
 
@@ -208,7 +223,14 @@ fn require_licensee(conn: &rusqlite::Connection, explicit: Option<String>) -> Re
     relay::authenticate_licensee(conn, &licensee_secret(explicit)?)
 }
 
-fn authorize_mint(conn: &rusqlite::Connection, licensee_key: Option<String>) -> Result<()> {
+fn authorize_mint(
+    conn: &rusqlite::Connection,
+    cert: Option<PathBuf>,
+    relay_key: Option<PathBuf>,
+    krl: Option<PathBuf>,
+    licensee_key: Option<String>,
+) -> Result<()> {
+    load_serve_identity(cert, relay_key, krl)?;
     let supplied = licensee_key.filter(|s| !s.is_empty()).or_else(|| {
         match std::env::var("KEYQUORUM_LICENSEE_KEY") {
             Ok(key) if !key.is_empty() => Some(key),
@@ -232,9 +254,12 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
             fingerprint,
             label,
             ttl_seconds,
+            cert,
+            relay_key,
+            krl,
             licensee_key,
         } => {
-            authorize_mint(conn, licensee_key)?;
+            authorize_mint(conn, cert, relay_key, krl, licensee_key)?;
             let created = relay::create_api_key(
                 conn,
                 &NewApiKey {
@@ -275,8 +300,14 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
             relay::revoke_api_key(conn, id)?;
             println!("Revoked API key {id}");
         }
-        KeysCommand::Rotate { id, licensee_key } => {
-            authorize_mint(conn, licensee_key)?;
+        KeysCommand::Rotate {
+            id,
+            cert,
+            relay_key,
+            krl,
+            licensee_key,
+        } => {
+            authorize_mint(conn, cert, relay_key, krl, licensee_key)?;
             let created = relay::rotate_api_key(conn, id)?;
             println!("Rotated API key {id} -> {}", created.info.id);
             println!("token (shown once): {}", created.token);

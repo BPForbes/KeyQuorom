@@ -469,6 +469,19 @@ fn provider_host_keys_list_parses() {
         Cli::try_parse_from(["keyquorum", "host", "serve", "--scan-interval-seconds", "0",])
             .is_err()
     );
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "keys",
+        "create",
+        "--scope",
+        "inbox.push",
+        "--cert",
+        "provider.kqcert",
+        "--relay-key",
+        "relay.key",
+    ])
+    .is_ok());
 }
 
 #[cfg(feature = "provider")]

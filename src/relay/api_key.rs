@@ -389,8 +389,9 @@ pub fn authorize_licensee_or_bootstrap(
     bootstrap_licensee_if_empty(conn)
 }
 
-/// Mints the one-time licensee issuer when none exists. HTTP never sees this
-/// token; it is required by host-local `keys create|rotate`.
+/// Mints the one-time internal operator issuer when none exists. HTTP never
+/// sees this token. The host CLI must already have verified a KeyQuorum-signed
+/// provider identity before calling this; it is not a public mint path.
 pub fn bootstrap_licensee_if_empty(conn: &Connection) -> Result<Option<CreatedLicensee>> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))?;
     if n == 0 {
