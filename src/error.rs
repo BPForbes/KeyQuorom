@@ -65,6 +65,7 @@ pub enum Error {
     InvalidProviderChallenge,
     UntrustedRelay,
     ProviderIdentityMissing,
+    ProviderPolicyMissing,
     InvalidRootNetwork,
     RootNetworkRequired,
     InvalidProviderPolicy,
@@ -233,6 +234,12 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "mailbox host is not configured with a provider identity"
+                )
+            }
+            Error::ProviderPolicyMissing => {
+                write!(
+                    f,
+                    "mailbox host is not configured with a provider policy"
                 )
             }
             Error::InvalidRootNetwork => write!(f, "root-network CIDR is malformed"),

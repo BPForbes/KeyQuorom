@@ -256,7 +256,8 @@ pub fn pull(
     read_json(resp)
 }
 
-/// Mint a bearer via unauthenticated `POST /api/v1/{provider_id}/register`.
+/// Mint a bearer via `POST /api/v1/{provider_id}/register`.
+/// The caller must prove listed service-provider hardware; no API key.
 pub fn register(
     base_url: &str,
     provider_id: &str,

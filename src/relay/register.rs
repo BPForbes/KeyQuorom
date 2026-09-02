@@ -1,15 +1,17 @@
-//! Unauthenticated API-key registration.
+//! Service-provider API-key registration.
 //!
-//! `POST /api/v1/{provider_id}/register` mints a `kq_…` bearer after the
-//! caller proves possession of a hardware signing key. The provider id is
-//! the group; the hardware public key and `keys::fingerprint` identify
-//! who registered and when. The KeyQuorum relay identity key signs that
-//! binding. The raw bearer is returned once; only `hex(SHA-256(raw))`
-//! is stored.
+//! `POST /api/v1/{provider_id}/register` is not API-key protected. Only a
+//! hardware token listed in this host's KeyQuorum-signed provider policy
+//! can mint. The provider id is the group; the hardware public key and
+//! `keys::fingerprint` identify which service provider registered and
+//! when. The KeyQuorum relay identity key signs that binding. The raw
+//! bearer is returned once; only `hex(SHA-256(raw))` is stored.
 
 use super::api_key::{self, ApiKeyScope, NewApiKey};
 use crate::error::{Error, Result};
-use crate::keys;
+use crate::keys::{self, KeyType};
+use crate::provider::hardware_auth::HardwareAuthority;
+use crate::provider::policy::ProviderPolicy;
 use crate::signing;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -183,14 +185,43 @@ fn parse_scope(scope: Option<&str>) -> Result<ApiKeyScope> {
     }
 }
 
-/// Mint a bearer after a hardware possession proof and record who registered.
+fn authorize_service_provider(
+    policy: &ProviderPolicy,
+    provider_id: &str,
+    relay_public_key: &[u8; KEY_LEN],
+    fingerprint: &str,
+) -> Result<()> {
+    if policy.provider_id != provider_id {
+        return Err(Error::UnknownProvider);
+    }
+    if policy.relay_public_key != *relay_public_key {
+        return Err(Error::RelayIdentityMismatch);
+    }
+    let entry = policy
+        .hardware_entry(fingerprint)
+        .ok_or(Error::ProviderHardwareDenied)?;
+    if entry.revoked {
+        return Err(Error::ProviderHardwareRevoked);
+    }
+    if entry.key_type != KeyType::Signing {
+        return Err(Error::WrongKeyType);
+    }
+    match entry.authority {
+        HardwareAuthority::ProviderApiRoot | HardwareAuthority::ProviderRelayAdmin => Ok(()),
+    }
+}
+
+/// Mint a bearer after a listed service-provider hardware proof.
 ///
 /// `path_provider_id` must equal this host's certified `expected_provider_id`.
+/// The hardware fingerprint must appear in `policy`.
 pub fn register(
     conn: &Connection,
     path_provider_id: &str,
     expected_provider_id: &str,
+    relay_public_key: &[u8; KEY_LEN],
     relay_private_key: &[u8; KEY_LEN],
+    policy: &ProviderPolicy,
     request: &RegisterRequest,
 ) -> Result<RegisterResponse> {
     if path_provider_id != expected_provider_id {
@@ -200,6 +231,7 @@ pub fn register(
     let public_key = parse_hex_array::<KEY_LEN>(&request.public_key)?;
     let signature = parse_hex_array::<SIG_LEN>(&request.signature)?;
     let fingerprint = verify_register_proof(path_provider_id, &public_key, &signature)?;
+    authorize_service_provider(policy, expected_provider_id, relay_public_key, &fingerprint)?;
     let scope = parse_scope(request.scope.as_deref())?;
     let recipient_fingerprint = match scope {
         ApiKeyScope::InboxPull => Some(fingerprint.clone()),

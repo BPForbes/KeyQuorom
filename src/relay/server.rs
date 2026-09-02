@@ -10,6 +10,7 @@ use super::org_tree;
 use super::register::{self, RegisterRequest, RegisterResponse};
 use crate::error::Error;
 use crate::key_tree::{PublicEdge, PublicNode, PublicTree};
+use crate::provider::policy::ProviderPolicy;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -41,6 +42,7 @@ pub struct ProviderIdentity {
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     identity: Option<Arc<ProviderIdentity>>,
+    policy: Option<Arc<ProviderPolicy>>,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
         Self {
             db: Arc::new(Mutex::new(conn)),
             identity: None,
+            policy: None,
         }
     }
 
@@ -55,11 +58,28 @@ impl AppState {
         Self {
             db: Arc::new(Mutex::new(conn)),
             identity: Some(Arc::new(identity)),
+            policy: None,
+        }
+    }
+
+    pub fn with_identity_and_policy(
+        conn: Connection,
+        identity: ProviderIdentity,
+        policy: ProviderPolicy,
+    ) -> Self {
+        Self {
+            db: Arc::new(Mutex::new(conn)),
+            identity: Some(Arc::new(identity)),
+            policy: Some(Arc::new(policy)),
         }
     }
 
     pub fn identity(&self) -> Option<Arc<ProviderIdentity>> {
         self.identity.clone()
+    }
+
+    pub fn policy(&self) -> Option<Arc<ProviderPolicy>> {
+        self.policy.clone()
     }
 }
 
@@ -121,7 +141,9 @@ impl From<Error> for ApiError {
             Error::InvalidApiKey | Error::ApiKeyExpired | Error::ApiKeyRevoked => {
                 Self::unauthorized()
             }
-            Error::ApiKeyScopeDenied => Self {
+            Error::ApiKeyScopeDenied
+            | Error::ProviderHardwareDenied
+            | Error::ProviderHardwareRevoked => Self {
                 status: StatusCode::FORBIDDEN,
                 message: "forbidden".to_string(),
             },
@@ -135,7 +157,8 @@ impl From<Error> for ApiError {
             | Error::InvalidBridge
             | Error::InvalidProviderChallenge
             | Error::InvalidExpiresAt
-            | Error::ExpiresAtInPast => Self {
+            | Error::ExpiresAtInPast
+            | Error::WrongKeyType => Self {
                 status: StatusCode::BAD_REQUEST,
                 message: err.to_string(),
             },
@@ -146,7 +169,11 @@ impl From<Error> for ApiError {
                 status: StatusCode::NOT_FOUND,
                 message: err.to_string(),
             },
-            Error::ProviderIdentityMissing => Self {
+            Error::ProviderIdentityMissing
+            | Error::ProviderPolicyMissing
+            | Error::InvalidProviderPolicy
+            | Error::ProviderPolicyExpired
+            | Error::RelayIdentityMismatch => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: err.to_string(),
             },
@@ -283,7 +310,7 @@ impl Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
-        (name = "api-keys", description = "List and revoke API keys; mint via unauthenticated register"),
+        (name = "api-keys", description = "List and revoke API keys; register is service-provider hardware only"),
         (name = "trees", description = "Canonical public split-tree topology"),
         (name = "provider", description = "KeyQuorum-signed relay identity")
     )
@@ -376,8 +403,9 @@ async fn post_keycheck(
     responses(
         (status = 201, description = "Minted bearer plus KeyQuorum-signed receipt", body = RegisterResponse),
         (status = 400, description = "Malformed proof or unsupported scope", body = ErrorBody),
+        (status = 403, description = "Hardware is not a listed service provider", body = ErrorBody),
         (status = 404, description = "Provider id does not match this host", body = ErrorBody),
-        (status = 503, description = "Host has no provider identity", body = ErrorBody)
+        (status = 503, description = "Host has no provider identity or policy", body = ErrorBody)
     )
 )]
 async fn post_register(
@@ -386,10 +414,19 @@ async fn post_register(
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
     let identity = state.identity().ok_or(Error::ProviderIdentityMissing)?;
+    let policy = state.policy().ok_or(Error::ProviderPolicyMissing)?;
     let cert = crate::provider::parse_certificate(&identity.certificate)?;
     let relay_key = identity.relay_private_key.clone();
     let registered = with_conn(&state, move |conn| {
-        register::register(conn, &provider_id, &cert.provider_id, &relay_key, &body)
+        register::register(
+            conn,
+            &provider_id,
+            &cert.provider_id,
+            &cert.relay_public_key,
+            &relay_key,
+            &policy,
+            &body,
+        )
     })
     .await?;
     Ok((StatusCode::CREATED, Json(registered)))

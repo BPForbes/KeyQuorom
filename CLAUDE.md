@@ -26,15 +26,17 @@ returns a sliced copy that the personal SQLite file translates. A personal SQLit
 file should keep only the subgraph that person needs (own lineage, siblings,
 descendants, and established-bridge peers plus those peers' ancestors). API keys
 are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
-are minted by unauthenticated `POST /api/v1/{provider_id}/register` after a
-hardware signing proof. The path provider id is the group; the hardware
-public key and fingerprint identify who registered and when. The KeyQuorum
-relay identity key signs that binding. Official clients still only talk to a
-relay that proves a KeyQuorum-root-signed cert. The mailbox host is a
-**hidden** `keyquorum host` subcommand, compiled only with `--features
-provider`. That feature is a build capability, not authorization. A trusted
-relay also requires a KeyQuorum-signed `provider.kqcert` and the matching
-relay private key; official clients challenge `POST /provider-identity` and
+are minted only by a service provider. `POST /api/v1/{provider_id}/register`
+is not API-key protected; the caller must prove possession of hardware
+listed in this host's KeyQuorum-signed provider policy. The path provider
+id is the group; the hardware public key and fingerprint identify which
+service provider registered and when. The KeyQuorum relay identity key
+signs that binding. Official clients still only talk to a relay that proves
+a KeyQuorum-root-signed cert. The mailbox host is a **hidden**
+`keyquorum host` subcommand, compiled only with `--features provider`.
+That feature is a build capability, not authorization. A trusted relay also
+requires a KeyQuorum-signed `provider.kqcert` and the matching relay
+private key; official clients challenge `POST /provider-identity` and
 disconnect if the certificate, signature, expiry, capabilities, or
 revocation check fails. `host root generate` is allowed only when this
 machine is on a configured VPN tunnel (`--network` /
@@ -43,7 +45,7 @@ machine is on a configured VPN tunnel (`--network` /
 those caller values are not compiled in. Caller `--network` CIDRs and
 `--ssid` values are not production authority. Do not document
 `host` in README or other customer-facing docs — buyers get
-a URL and use `keyquorum loadkey` / `relay register` / `relay push` /
+a URL and an API key and use `keyquorum loadkey` / `relay push` /
 `relay pull`. Default `cargo build` produces `keyquorum` without that
 subcommand. `keyquorum loadkey` authenticates the relay, then calls
 `POST /keycheck` (no auth) and stores that hash plus a sealed bearer in the

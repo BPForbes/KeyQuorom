@@ -4,9 +4,10 @@
 //!
 //! `--features provider` compiles these commands; it does not authorize a
 //! host. `serve` requires a KeyQuorum-signed `provider.kqcert` and the
-//! matching relay private key. Customer API keys are minted by
-//! unauthenticated `POST /api/v1/{provider_id}/register` after a hardware
-//! possession proof; the KeyQuorum relay identity key signs the receipt.
+//! matching relay private key. Customer API keys are minted only by a
+//! service provider: `POST /api/v1/{provider_id}/register` after a
+//! possession proof from hardware listed in the signed provider policy.
+//! The KeyQuorum relay identity key signs the receipt.
 //! Caller `--network` / `--ssid` values are a ceremony/dev presence check
 //! for `root generate` only — they are not production authority.
 //! Production networks come from the signed policy.
@@ -45,6 +46,9 @@ pub enum HostCommand {
         /// Optional signed revocation list (or KEYQUORUM_PROVIDER_KRL)
         #[arg(long)]
         krl: Option<PathBuf>,
+        /// Signed policy listing service-provider hardware (or KEYQUORUM_PROVIDER_POLICY)
+        #[arg(long)]
+        policy: Option<PathBuf>,
         /// Personal/org SQLite to scan for date-based TTL files. Defaults
         /// to the global `--db` when that file already exists.
         #[arg(long)]
@@ -202,6 +206,7 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
             cert,
             relay_key,
             krl,
+            policy,
             scan_db,
             scan_interval_seconds,
         } => {
@@ -216,6 +221,7 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
                     cert,
                     relay_key,
                     krl,
+                    policy,
                     scan_db,
                     scan_interval_seconds,
                 ))
@@ -621,6 +627,30 @@ fn load_serve_identity(
     })
 }
 
+fn load_serve_policy(
+    policy: Option<PathBuf>,
+    cert: &provider::Certificate,
+) -> Result<Option<policy::ProviderPolicy>> {
+    let Some(path) = path_or_env(policy, "KEYQUORUM_PROVIDER_POLICY") else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&path)?;
+    let now = provider::system_now_utc()?;
+    let loaded = policy::verify_policy(&KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY, &bytes, &now)?;
+    if loaded.provider_id != cert.provider_id {
+        return Err(Error::InvalidProviderPolicy);
+    }
+    if loaded.relay_public_key != cert.relay_public_key {
+        return Err(Error::RelayIdentityMismatch);
+    }
+    eprintln!(
+        "provider policy {} lists {} hardware token(s)",
+        loaded.policy_id,
+        loaded.hardware.len()
+    );
+    Ok(Some(loaded))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     mailbox_db: &Path,
@@ -628,6 +658,7 @@ async fn serve(
     cert: Option<PathBuf>,
     relay_key: Option<PathBuf>,
     krl: Option<PathBuf>,
+    policy: Option<PathBuf>,
     scan_db: Option<PathBuf>,
     scan_interval_seconds: u64,
 ) -> Result<()> {
@@ -636,6 +667,8 @@ async fn serve(
         .init();
 
     let identity = load_serve_identity(cert, relay_key, krl)?;
+    let parsed = provider::parse_certificate(&identity.certificate)?;
+    let policy = load_serve_policy(policy, &parsed)?;
     let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
     let conn = relay::open(db_path)?;
 
@@ -650,7 +683,10 @@ async fn serve(
         eprintln!("TTL file scan: {}", path.display());
     }
 
-    let state = AppState::with_identity(conn, identity);
+    let state = match policy {
+        Some(policy) => AppState::with_identity_and_policy(conn, identity, policy),
+        None => AppState::with_identity(conn, identity),
+    };
     spawn_ttl_scan(state.db.clone(), scan_db, scan_interval_seconds);
 
     axum::serve(listener, relay::router(state))

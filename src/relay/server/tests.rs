@@ -709,7 +709,7 @@ fn register_body(provider_id: &str, hardware_private: &[u8; 32]) -> String {
 }
 
 #[tokio::test]
-async fn register_requires_identity_and_matching_provider() {
+async fn register_requires_identity_policy_and_listed_hardware() {
     let conn = relay::open_in_memory().expect("schema");
     let (hw_sk, _) = keys::generate_signing_keypair();
     let app = router(AppState::new(conn));
@@ -728,18 +728,38 @@ async fn register_requires_identity_and_matching_provider() {
 }
 
 #[tokio::test]
-async fn register_mints_unauthenticated_key_signed_by_keyquorum() {
+async fn register_mints_only_for_listed_service_provider_hardware() {
+    use crate::provider::test_helpers::listed_provider_policy;
+
     let issued = issued_identity("2027-09-02 00:00:00");
     let provider_id = "Acme Security Services";
     let conn = relay::open_in_memory().expect("schema");
     let (hw_sk, hw_pk) = keys::generate_signing_keypair();
-    let app = router(AppState::with_identity(
+    let (customer_sk, _) = keys::generate_signing_keypair();
+    let fingerprint = keys::fingerprint(&hw_pk);
+    let policy = listed_provider_policy(provider_id, issued.relay_public, &[fingerprint.as_str()]);
+    let app = router(AppState::with_identity_and_policy(
         conn,
         ProviderIdentity {
             certificate: issued.certificate,
             relay_private_key: issued.relay_private,
         },
+        policy,
     ));
+
+    let stranger = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/Acme%20Security%20Services/register")
+                .header("Content-Type", "application/json")
+                .body(Body::from(register_body(provider_id, &customer_sk)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stranger.status(), StatusCode::FORBIDDEN);
 
     let wrong = app
         .clone()

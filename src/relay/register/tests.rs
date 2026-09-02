@@ -1,22 +1,30 @@
 use super::*;
 use crate::keys;
+use crate::provider::test_helpers::listed_provider_policy;
 use crate::relay;
 use crate::signing;
 
+#[allow(clippy::too_many_arguments)]
 fn register_one(
     conn: &rusqlite::Connection,
     provider_id: &str,
+    relay_public: &[u8; 32],
     relay_private: &[u8; 32],
     hardware_private: &[u8; 32],
+    hardware_public: &[u8; 32],
     scope: Option<&str>,
     label: Option<&str>,
 ) -> RegisterResponse {
     let (public, signature) = sign_register_proof(hardware_private, provider_id).expect("sign");
+    let fingerprint = keys::fingerprint(hardware_public);
+    let policy = listed_provider_policy(provider_id, *relay_public, &[fingerprint.as_str()]);
     register(
         conn,
         provider_id,
         provider_id,
+        relay_public,
         relay_private,
+        &policy,
         &RegisterRequest {
             public_key: hex::encode(public),
             signature: hex::encode(signature),
@@ -33,7 +41,16 @@ fn register_mints_key_and_tracks_hardware() {
     let (relay_sk, relay_pk) = keys::generate_signing_keypair();
     let (hw_sk, hw_pk) = keys::generate_signing_keypair();
     let provider_id = "Acme Security Services";
-    let receipt = register_one(&conn, provider_id, &relay_sk, &hw_sk, None, Some("desk"));
+    let receipt = register_one(
+        &conn,
+        provider_id,
+        &relay_pk,
+        &relay_sk,
+        &hw_sk,
+        &hw_pk,
+        None,
+        Some("desk"),
+    );
     assert!(receipt.token.starts_with("kq_"));
     assert_eq!(receipt.scope, "inbox.push");
     assert_eq!(receipt.provider_id, provider_id);
@@ -54,11 +71,29 @@ fn register_mints_key_and_tracks_hardware() {
 #[test]
 fn same_hardware_can_register_again_and_history_is_kept() {
     let conn = relay::open_in_memory().expect("schema");
-    let (relay_sk, _) = keys::generate_signing_keypair();
-    let (hw_sk, _) = keys::generate_signing_keypair();
+    let (relay_sk, relay_pk) = keys::generate_signing_keypair();
+    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
     let provider_id = "acme";
-    let first = register_one(&conn, provider_id, &relay_sk, &hw_sk, None, Some("a"));
-    let second = register_one(&conn, provider_id, &relay_sk, &hw_sk, None, Some("b"));
+    let first = register_one(
+        &conn,
+        provider_id,
+        &relay_pk,
+        &relay_sk,
+        &hw_sk,
+        &hw_pk,
+        None,
+        Some("a"),
+    );
+    let second = register_one(
+        &conn,
+        provider_id,
+        &relay_pk,
+        &relay_sk,
+        &hw_sk,
+        &hw_pk,
+        None,
+        Some("b"),
+    );
     assert_ne!(first.id, second.id);
     assert_ne!(first.token, second.token);
     let rows = list_for_provider(&conn, provider_id).expect("list");
@@ -70,9 +105,18 @@ fn same_hardware_can_register_again_and_history_is_kept() {
 #[test]
 fn pull_scope_binds_recipient_to_hardware_fingerprint() {
     let conn = relay::open_in_memory().expect("schema");
-    let (relay_sk, _) = keys::generate_signing_keypair();
+    let (relay_sk, relay_pk) = keys::generate_signing_keypair();
     let (hw_sk, hw_pk) = keys::generate_signing_keypair();
-    let receipt = register_one(&conn, "acme", &relay_sk, &hw_sk, Some("inbox.pull"), None);
+    let receipt = register_one(
+        &conn,
+        "acme",
+        &relay_pk,
+        &relay_sk,
+        &hw_sk,
+        &hw_pk,
+        Some("inbox.pull"),
+        None,
+    );
     assert_eq!(receipt.scope, "inbox.pull");
     let info = relay::list_api_keys(&conn).expect("list");
     assert_eq!(
@@ -82,17 +126,48 @@ fn pull_scope_binds_recipient_to_hardware_fingerprint() {
 }
 
 #[test]
-fn wrong_provider_path_is_rejected() {
+fn customer_hardware_is_denied() {
     let conn = relay::open_in_memory().expect("schema");
-    let (relay_sk, _) = keys::generate_signing_keypair();
+    let (relay_sk, relay_pk) = keys::generate_signing_keypair();
     let (hw_sk, _) = keys::generate_signing_keypair();
     let (public, signature) = sign_register_proof(&hw_sk, "acme").expect("sign");
+    let other = "ab".repeat(32);
+    let policy = listed_provider_policy("acme", relay_pk, &[other.as_str()]);
+    assert!(matches!(
+        register(
+            &conn,
+            "acme",
+            "acme",
+            &relay_pk,
+            &relay_sk,
+            &policy,
+            &RegisterRequest {
+                public_key: hex::encode(public),
+                signature: hex::encode(signature),
+                scope: None,
+                label: None,
+            },
+        ),
+        Err(Error::ProviderHardwareDenied)
+    ));
+}
+
+#[test]
+fn wrong_provider_path_is_rejected() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (relay_sk, relay_pk) = keys::generate_signing_keypair();
+    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
+    let (public, signature) = sign_register_proof(&hw_sk, "acme").expect("sign");
+    let fingerprint = keys::fingerprint(&hw_pk);
+    let policy = listed_provider_policy("acme", relay_pk, &[fingerprint.as_str()]);
     assert!(matches!(
         register(
             &conn,
             "other",
             "acme",
+            &relay_pk,
             &relay_sk,
+            &policy,
             &RegisterRequest {
                 public_key: hex::encode(public),
                 signature: hex::encode(signature),
@@ -107,15 +182,19 @@ fn wrong_provider_path_is_rejected() {
 #[test]
 fn admin_scope_is_refused() {
     let conn = relay::open_in_memory().expect("schema");
-    let (relay_sk, _) = keys::generate_signing_keypair();
-    let (hw_sk, _) = keys::generate_signing_keypair();
+    let (relay_sk, relay_pk) = keys::generate_signing_keypair();
+    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
     let (public, signature) = sign_register_proof(&hw_sk, "acme").expect("sign");
+    let fingerprint = keys::fingerprint(&hw_pk);
+    let policy = listed_provider_policy("acme", relay_pk, &[fingerprint.as_str()]);
     assert!(matches!(
         register(
             &conn,
             "acme",
             "acme",
+            &relay_pk,
             &relay_sk,
+            &policy,
             &RegisterRequest {
                 public_key: hex::encode(public),
                 signature: hex::encode(signature),
@@ -130,17 +209,21 @@ fn admin_scope_is_refused() {
 #[test]
 fn forged_signature_is_rejected() {
     let conn = relay::open_in_memory().expect("schema");
-    let (relay_sk, _) = keys::generate_signing_keypair();
-    let (hw_sk, _) = keys::generate_signing_keypair();
+    let (relay_sk, relay_pk) = keys::generate_signing_keypair();
+    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
     let (public, _) = sign_register_proof(&hw_sk, "acme").expect("sign");
     let (other_sk, _) = keys::generate_signing_keypair();
     let forged = signing::sign(&other_sk, &register_preimage("acme", &public).expect("pre"));
+    let fingerprint = keys::fingerprint(&hw_pk);
+    let policy = listed_provider_policy("acme", relay_pk, &[fingerprint.as_str()]);
     assert!(matches!(
         register(
             &conn,
             "acme",
             "acme",
+            &relay_pk,
             &relay_sk,
+            &policy,
             &RegisterRequest {
                 public_key: hex::encode(public),
                 signature: hex::encode(forged),

@@ -432,6 +432,8 @@ async fn register_client_mints_without_a_bearer() {
     use crate::provider::test_helpers::issued_identity;
     use crate::relay::{ProviderIdentity, RegisterRequest};
 
+    use crate::provider::test_helpers::listed_provider_policy;
+
     let issued = issued_identity("2027-09-02 00:00:00");
     let provider_id = "Acme Security Services".to_string();
     let conn = relay::open_in_memory().expect("schema");
@@ -439,18 +441,21 @@ async fn register_client_mints_without_a_bearer() {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let app = relay::router(AppState::with_identity(
+    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
+    let fingerprint = keys::fingerprint(&hw_pk);
+    let policy = listed_provider_policy(&provider_id, issued.relay_public, &[fingerprint.as_str()]);
+    let app = relay::router(AppState::with_identity_and_policy(
         conn,
         ProviderIdentity {
             certificate: issued.certificate,
             relay_private_key: issued.relay_private,
         },
+        policy,
     ));
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
     let url = format!("http://{addr}");
-    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
     let (public, signature) = relay::sign_register_proof(&hw_sk, &provider_id).expect("sign");
     let receipt = {
         let url = url.clone();
