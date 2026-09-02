@@ -262,6 +262,7 @@ async fn push_rolls_back_trees_and_envelope_when_a_later_tree_is_invalid() {
     let body = serde_json::to_vec(&relay::InboxPush {
         bytes: STANDARD.encode(&envelope),
         trees: vec![good, cyclic],
+        expires_at: None,
     })
     .unwrap();
     let app = router(AppState::new(conn));
@@ -545,4 +546,59 @@ async fn keycheck_route_is_public() {
         .unwrap();
     assert_eq!(unknown.status(), StatusCode::OK);
     assert_eq!(body_json(unknown).await["valid"], false);
+}
+
+#[tokio::test]
+async fn inbox_pull_drops_expired_envelopes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, fingerprint) = sample_envelope();
+    relay::store_until(&conn, &envelope, Some("2099-12-31 23:59:00")).expect("store");
+    conn.execute(
+        "UPDATE mailbox SET expires_at = datetime('now', '-1 minutes')",
+        [],
+    )
+    .expect("expire");
+    let pull = pull_key(&conn, &fingerprint);
+    let app = router(AppState::new(conn));
+    let got = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {pull}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let json = body_json(got).await;
+    assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn inbox_push_rejects_a_past_expires() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, _) = sample_envelope();
+    let push = push_key(&conn);
+    let app = router(AppState::new(conn));
+    let body = serde_json::to_vec(&relay::InboxPush {
+        bytes: STANDARD.encode(&envelope),
+        trees: vec![],
+        expires_at: Some("2000-01-01 00:00:00".into()),
+    })
+    .unwrap();
+    let denied = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {push}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
 }

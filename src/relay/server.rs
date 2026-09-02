@@ -110,7 +110,9 @@ impl From<Error> for ApiError {
             | Error::InvalidPublicKey
             | Error::InvalidTreeSpec
             | Error::DuplicateNodeLabel
-            | Error::InvalidBridge => Self {
+            | Error::InvalidBridge
+            | Error::InvalidExpiresAt
+            | Error::ExpiresAtInPast => Self {
                 status: StatusCode::BAD_REQUEST,
                 message: err.to_string(),
             },
@@ -320,17 +322,20 @@ async fn post_inbox(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<InboxAccepted>), ApiError> {
-    let (envelope, trees) = parse_inbox_body(&headers, &body)?;
+    let (envelope, trees, expires_at) = parse_inbox_body(&headers, &body)?;
     if envelope.len() > MAX_ENVELOPE_BYTES {
         return Err(Error::BundleFieldTooLarge.into());
     }
     let (id, fingerprint, duplicate) = with_conn(&state, move |conn| {
         api_key::authenticate(conn, &token, ApiKeyScope::InboxPush)?;
         crate::db::with_immediate_transaction(conn, || {
+            if let Some(expires_at) = expires_at.as_deref() {
+                crate::locked_files::require_future_expires_utc(conn, expires_at)?;
+            }
             for tree in &trees {
                 org_tree::merge_public_tree(conn, tree)?;
             }
-            mailbox::store(conn, &envelope)
+            mailbox::store_until(conn, &envelope, expires_at.as_deref())
         })
     })
     .await?;
@@ -351,7 +356,7 @@ async fn post_inbox(
 fn parse_inbox_body(
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(Vec<u8>, Vec<PublicTree>), ApiError> {
+) -> Result<(Vec<u8>, Vec<PublicTree>, Option<String>), ApiError> {
     let is_json = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -363,13 +368,17 @@ fn parse_inbox_body(
                 .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"))
         });
     if !is_json {
-        return Ok((body.to_vec(), Vec::new()));
+        return Ok((body.to_vec(), Vec::new(), None));
     }
     let push: InboxPush = serde_json::from_slice(body).map_err(|_| Error::InvalidBridgePackage)?;
+    let expires_at = match push.expires_at {
+        Some(raw) => Some(crate::locked_files::parse_expires_utc(&raw)?),
+        None => None,
+    };
     let envelope = STANDARD
         .decode(push.bytes.as_bytes())
         .map_err(|_| Error::InvalidBridgePackage)?;
-    Ok((envelope, push.trees))
+    Ok((envelope, push.trees, expires_at))
 }
 
 #[utoipa::path(

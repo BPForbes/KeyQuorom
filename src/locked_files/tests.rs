@@ -131,6 +131,10 @@ fn parse_expires_utc_accepts_yyyy_mm_dd_hh_mm() {
         "2026-12-31 23:59:00"
     );
     assert_eq!(
+        parse_expires_utc("2026-12-31 23:59:00").expect("normalized form"),
+        "2026-12-31 23:59:00"
+    );
+    assert_eq!(
         parse_expires_utc("2024-02-29 00:00").expect("leap day"),
         "2024-02-29 00:00:00"
     );
@@ -141,7 +145,6 @@ fn parse_expires_utc_rejects_malformed_and_impossible_dates() {
     for value in [
         "2026-12-31",
         "2026-12-31T23:59",
-        "2026-12-31 23:59:00",
         "2026-1-1 1:1",
         "2026-13-01 00:00",
         "2026-02-29 00:00",
@@ -220,4 +223,37 @@ fn unlock_before_expiry_leaves_ciphertext() {
     let plaintext = unlock_file(&conn, id, "hunter2").expect("unlock before expiry");
     assert_eq!(plaintext, b"the quorum has been reached");
     assert!(encrypted_path.exists());
+}
+
+#[test]
+fn scan_purges_only_expired_ttl_files() {
+    let conn = db::open_in_memory().expect("schema should apply");
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let live_source = dir.path().join("live.txt");
+    let dead_source = dir.path().join("dead.txt");
+    let live_enc = dir.path().join("live.txt.kqenc");
+    let dead_enc = dir.path().join("dead.txt.kqenc");
+    fs::write(&live_source, b"live").unwrap();
+    fs::write(&dead_source, b"dead").unwrap();
+
+    let live = lock_file_until(
+        &conn,
+        &live_source,
+        &live_enc,
+        "hunter2",
+        Some("2099-12-31 23:59:00"),
+    )
+    .expect("lock live");
+    let dead = lock_file(&conn, &dead_source, &dead_enc, "hunter2").expect("lock dead");
+    conn.execute(
+        "UPDATE password_locked_files SET expires_at = datetime('now', '-1 minutes') WHERE id = ?1",
+        params![dead],
+    )
+    .expect("stamp past expiry");
+
+    let purged = purge_expired(&conn).expect("scan");
+    assert_eq!(purged, 1);
+    assert!(live_enc.exists());
+    assert!(!dead_enc.exists());
+    unlock_file(&conn, live, "hunter2").expect("live file remains");
 }

@@ -108,7 +108,7 @@ pub fn parse_expires_utc(value: &str) -> Result<String> {
     };
     let date_parts: Vec<&str> = date.split('-').collect();
     let time_parts: Vec<&str> = time.split(':').collect();
-    if date_parts.len() != 3 || time_parts.len() != 2 {
+    if date_parts.len() != 3 || (time_parts.len() != 2 && time_parts.len() != 3) {
         return Err(Error::InvalidExpiresAt);
     }
     let year = parse_fixed_digits(date_parts[0], 4).ok_or(Error::InvalidExpiresAt)?;
@@ -116,10 +116,16 @@ pub fn parse_expires_utc(value: &str) -> Result<String> {
     let day = parse_fixed_digits(date_parts[2], 2).ok_or(Error::InvalidExpiresAt)?;
     let hour = parse_fixed_digits(time_parts[0], 2).ok_or(Error::InvalidExpiresAt)?;
     let minute = parse_fixed_digits(time_parts[1], 2).ok_or(Error::InvalidExpiresAt)?;
+    let second = if time_parts.len() == 3 {
+        parse_fixed_digits(time_parts[2], 2).ok_or(Error::InvalidExpiresAt)?
+    } else {
+        0
+    };
     if year == 0
         || !(1..=12).contains(&month)
         || !(0..=23).contains(&hour)
         || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
     {
         return Err(Error::InvalidExpiresAt);
     }
@@ -127,7 +133,7 @@ pub fn parse_expires_utc(value: &str) -> Result<String> {
         return Err(Error::InvalidExpiresAt);
     }
     Ok(format!(
-        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:00"
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
     ))
 }
 
@@ -178,6 +184,24 @@ pub fn purge_if_expired(conn: &Connection, file_id: i64) -> Result<()> {
     }
     destroy_file(conn, file_id, &encrypted_path)?;
     Err(Error::FileExpired)
+}
+
+/// Deletes every password-locked file whose date-based TTL has passed.
+/// Used by unlock/redeem and by the mailbox host's periodic scan.
+pub fn purge_expired(conn: &Connection) -> Result<u64> {
+    let mut stmt = conn.prepare(
+        "SELECT id, encrypted_path FROM password_locked_files
+         WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
+    let mut purged = 0u64;
+    for (file_id, encrypted_path) in rows {
+        destroy_file(conn, file_id, &encrypted_path)?;
+        purged += 1;
+    }
+    Ok(purged)
 }
 
 fn destroy_file(conn: &Connection, file_id: i64, encrypted_path: &str) -> Result<()> {

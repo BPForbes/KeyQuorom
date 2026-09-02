@@ -4,9 +4,12 @@
 
 use clap::Subcommand;
 use keyquorum::error::{Error, Result};
-use keyquorum::relay::{self, ApiKeyScope, AppState, NewApiKey};
+use keyquorum::relay::{ApiKeyScope, AppState, NewApiKey};
+use keyquorum::{db, locked_files, relay};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
@@ -17,6 +20,13 @@ pub enum HostCommand {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
+        /// Personal/org SQLite to scan for date-based TTL files. Defaults
+        /// to the global `--db` when that file already exists.
+        #[arg(long)]
+        scan_db: Option<PathBuf>,
+        /// How often to delete expired mailbox envelopes and TTL files.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+        scan_interval_seconds: u64,
     },
     /// Mint, list, rotate, or revoke API keys on this host (not over HTTP)
     Keys {
@@ -52,14 +62,21 @@ pub enum KeysCommand {
     },
 }
 
-pub fn run(mailbox_db: &Path, command: HostCommand) -> Result<()> {
+pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()> {
     let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
     match command {
-        HostCommand::Serve { bind } => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(Error::Io)?
-            .block_on(serve(db_path, &bind)),
+        HostCommand::Serve {
+            bind,
+            scan_db,
+            scan_interval_seconds,
+        } => {
+            let scan_db = scan_db.or_else(|| org_db.is_file().then(|| org_db.to_path_buf()));
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(Error::Io)?
+                .block_on(serve(db_path, &bind, scan_db, scan_interval_seconds))
+        }
         HostCommand::Keys { command } => {
             let conn = relay::open(db_path)?;
             run_keys(&conn, command)
@@ -165,7 +182,12 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
     Ok(())
 }
 
-async fn serve(db_path: &str, bind: &str) -> Result<()> {
+async fn serve(
+    db_path: &str,
+    bind: &str,
+    scan_db: Option<PathBuf>,
+    scan_interval_seconds: u64,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -182,11 +204,52 @@ async fn serve(db_path: &str, bind: &str) -> Result<()> {
     let local = listener.local_addr()?;
     eprintln!("mailbox listening on http://{local}");
     eprintln!("Swagger UI: http://{local}/swagger-ui");
+    if let Some(path) = &scan_db {
+        eprintln!("TTL file scan: {}", path.display());
+    }
 
-    axum::serve(listener, relay::router(AppState::new(conn)))
+    let state = AppState::new(conn);
+    spawn_ttl_scan(state.db.clone(), scan_db, scan_interval_seconds);
+
+    axum::serve(listener, relay::router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+fn spawn_ttl_scan(
+    mailbox: Arc<Mutex<rusqlite::Connection>>,
+    scan_db: Option<PathBuf>,
+    interval_seconds: u64,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds));
+        loop {
+            ticker.tick().await;
+            let envelopes = {
+                let conn = mailbox
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                relay::purge_expired_envelopes(&conn)
+            };
+            match envelopes {
+                Ok(n) if n > 0 => tracing::info!("purged {n} expired mailbox envelope(s)"),
+                Ok(_) => {}
+                Err(err) => tracing::warn!("mailbox TTL scan failed: {err}"),
+            }
+            if let Some(path) = scan_db.as_ref().filter(|path| path.is_file()) {
+                let Some(path) = path.to_str() else {
+                    tracing::warn!("TTL file scan path is not valid UTF-8");
+                    continue;
+                };
+                match db::open(path).and_then(|conn| locked_files::purge_expired(&conn)) {
+                    Ok(n) if n > 0 => tracing::info!("purged {n} expired TTL file(s)"),
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!("TTL file scan failed: {err}"),
+                }
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

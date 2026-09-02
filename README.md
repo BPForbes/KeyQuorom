@@ -317,9 +317,13 @@ keyquorum share create-file 1 --expires "2026-12-31 23:59"
 keyquorum share redeem-file
 ```
 
-`--expires` is UTC (`yyyy-mm-dd hh:mm`). After that instant, redeem or unlock
-deletes the ciphertext from disk and drops the file's database row. `--ttl-seconds`
-is a relative share-link lifetime and does not remove the file.
+`--expires` is UTC (`yyyy-mm-dd hh:mm`). After that instant, redeem, unlock, or a
+scan deletes the ciphertext from disk and drops the file's database row.
+`--ttl-seconds` is a relative share-link lifetime and does not remove the file.
+
+`relay push --expires "2026-12-31 23:59"` stamps the same UTC cutoff on each
+uploaded envelope. Inbox pull skips expired rows and removes them from the
+mailbox so the recipient cannot fetch the file after the date.
 
 ### Mailbox
 

@@ -455,6 +455,20 @@ fn provider_host_keys_list_parses() {
         "127.0.0.1:0",
     ])
     .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "serve",
+        "--scan-db",
+        "org.sqlite",
+        "--scan-interval-seconds",
+        "15",
+    ])
+    .is_ok());
+    assert!(
+        Cli::try_parse_from(["keyquorum", "host", "serve", "--scan-interval-seconds", "0",])
+            .is_err()
+    );
 }
 
 #[cfg(feature = "provider")]

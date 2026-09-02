@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS mailbox (
     envelope                BLOB NOT NULL,
     content_hash            TEXT NOT NULL,
     created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- UTC cutoff `YYYY-MM-DD HH:MM:00`. NULL means the envelope does not expire.
+    -- The host scan (and inbox pull) delete expired rows so they cannot be fetched.
+    expires_at              TEXT,
     UNIQUE (recipient_fingerprint, content_hash)
 );
 

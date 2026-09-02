@@ -22,11 +22,13 @@ pub use api_key::{
 };
 pub use client::{
     check_key, check_key_hash, fetch_tree_context, publish_tree, pull as pull_inbox,
-    push as push_inbox, push_with_trees as push_inbox_with_trees, validate_relay_url,
-    InboxAccepted, InboxEnvelope, InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
+    push as push_inbox, push_with_trees as push_inbox_with_trees,
+    push_with_trees_until as push_inbox_with_trees_until, validate_relay_url, InboxAccepted,
+    InboxEnvelope, InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
 };
 pub use mailbox::{
-    list_after, store, MailboxPage, StoredEnvelope, DEFAULT_INBOX_PAGE, MAX_INBOX_PAGE,
+    list_after, purge_expired as purge_expired_envelopes, store, store_until, MailboxPage,
+    StoredEnvelope, DEFAULT_INBOX_PAGE, MAX_INBOX_PAGE,
 };
 pub use org_tree::{
     context_for_fingerprint, contexts_for_fingerprint, get_public_tree, list_public_trees,
@@ -96,6 +98,23 @@ fn init(conn: &Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.execute_batch(SCHEMA)?;
+    migrate(conn)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+/// `CREATE TABLE IF NOT EXISTS` never adds columns to an already-created
+/// table. Mailboxes from before envelope TTL need `expires_at`.
+fn migrate(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "mailbox", "expires_at")? {
+        conn.execute("ALTER TABLE mailbox ADD COLUMN expires_at TEXT", [])?;
+    }
     Ok(())
 }
 

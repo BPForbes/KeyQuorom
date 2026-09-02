@@ -632,6 +632,10 @@ enum RelayCommand {
         /// Push-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
         #[arg(long)]
         api_key: Option<String>,
+        /// UTC expiry as `yyyy-mm-dd hh:mm`. After this instant the mailbox
+        /// host scan (and inbox pull) delete the envelope.
+        #[arg(long, value_parser = parse_expires_arg)]
+        expires: Option<String>,
     },
     /// Download envelopes and the public-tree slice for this pull key
     Pull {
@@ -709,7 +713,7 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         Command::Host {
             mailbox_db,
             command,
-        } => return host::run(&mailbox_db, command),
+        } => return host::run(&mailbox_db, db_path, command),
         _ => {}
     }
 
@@ -1736,7 +1740,15 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
     let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
     let conn = db::open(db_path_str)?;
     match command {
-        RelayCommand::Push { dir, url, api_key } => {
+        RelayCommand::Push {
+            dir,
+            url,
+            api_key,
+            expires,
+        } => {
+            if let Some(expires) = expires.as_deref() {
+                locked_files::require_future_expires_utc(&conn, expires)?;
+            }
             let (url, api_key) =
                 resolve_relay_auth(&conn, url, api_key, relay::ApiKeyScope::InboxPush)?;
             let trees = export_local_public_trees(&conn)?;
@@ -1749,10 +1761,18 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     continue;
                 }
                 let bytes = fs::read(&path)?;
-                let accepted = if trees.is_empty() || uploaded > 0 {
-                    relay::push_inbox(&url, &api_key, &bytes)?
+                let attach_trees = !trees.is_empty() && uploaded == 0;
+                let accepted = if expires.is_some() || attach_trees {
+                    let trees = if attach_trees { trees.as_slice() } else { &[] };
+                    relay::push_inbox_with_trees_until(
+                        &url,
+                        &api_key,
+                        &bytes,
+                        trees,
+                        expires.as_deref(),
+                    )?
                 } else {
-                    relay::push_inbox_with_trees(&url, &api_key, &bytes, &trees)?
+                    relay::push_inbox(&url, &api_key, &bytes)?
                 };
                 println!(
                     "{} -> id {} ({})",
