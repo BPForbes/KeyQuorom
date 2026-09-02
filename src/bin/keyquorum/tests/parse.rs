@@ -473,6 +473,58 @@ fn provider_host_keys_list_parses() {
 
 #[cfg(feature = "provider")]
 #[test]
+fn provider_host_identity_and_certify_parse() {
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "identity",
+        "generate",
+        "--public-key-out",
+        "relay.pub",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "certify",
+        "--relay-public-key",
+        "relay.pub",
+        "--provider-id",
+        "acme",
+        "--serial",
+        "KQP-1",
+        "--expires-at",
+        "2027-09-02 00:00:00",
+        "--out",
+        "provider.kqcert",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "krl",
+        "--serial",
+        "KQP-1",
+        "--out",
+        "revocations.kqrl",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "serve",
+        "--cert",
+        "provider.kqcert",
+        "--relay-key",
+        "relay.key",
+        "--krl",
+        "revocations.kqrl",
+    ])
+    .is_ok());
+}
+
+#[cfg(feature = "provider")]
+#[test]
 fn provider_host_is_omitted_from_top_level_help() {
     use clap::CommandFactory;
     let help = Cli::command().render_long_help().to_string();

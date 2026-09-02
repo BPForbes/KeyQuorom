@@ -10,8 +10,10 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Host-side mailbox: serve + mint API keys. Provider setup only — not a
-# customer product. Default `cargo build --release` must not compile it.
+# Compiles mailbox-host *capabilities* (hidden `host` subcommand). This is
+# not authorization: a trusted provider also needs a KeyQuorum-signed
+# provider.kqcert and the matching relay private key. Default
+# `cargo build --release` stays the customer edition.
 provider = [
     "dep:axum",
     "dep:tokio",

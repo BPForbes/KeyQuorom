@@ -56,6 +56,14 @@ pub enum Error {
     RelayRequest(String),
     TreeNotFound,
     StalePublicTree,
+    InvalidProviderCertificate,
+    ProviderCertificateRevoked,
+    ProviderCertificateExpired,
+    ProviderCapabilityDenied,
+    RelayIdentityMismatch,
+    InvalidProviderChallenge,
+    UntrustedRelay,
+    ProviderIdentityMissing,
 }
 
 impl fmt::Display for Error {
@@ -186,6 +194,33 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "public tree generation is older than the copy already stored"
+                )
+            }
+            Error::InvalidProviderCertificate => {
+                write!(f, "provider certificate is missing or invalid")
+            }
+            Error::ProviderCertificateRevoked => {
+                write!(f, "provider certificate has been revoked")
+            }
+            Error::ProviderCertificateExpired => write!(f, "provider certificate has expired"),
+            Error::ProviderCapabilityDenied => {
+                write!(f, "provider certificate lacks required capabilities")
+            }
+            Error::RelayIdentityMismatch => {
+                write!(
+                    f,
+                    "relay private key does not match the provider certificate"
+                )
+            }
+            Error::InvalidProviderChallenge => write!(f, "provider identity challenge is invalid"),
+            Error::UntrustedRelay => write!(
+                f,
+                "relay did not present a trusted KeyQuorum provider identity"
+            ),
+            Error::ProviderIdentityMissing => {
+                write!(
+                    f,
+                    "mailbox host is not configured with a provider identity"
                 )
             }
         }

@@ -3,7 +3,7 @@
 use super::api_key::{self, ApiKeyInfo, ApiKeyScope};
 use super::client::{
     ErrorBody, InboxAccepted, InboxEnvelope, InboxList, InboxPush, KeyCheckRequest,
-    KeyCheckResponse,
+    KeyCheckResponse, ProviderIdentityRequest, ProviderIdentityResponse,
 };
 use super::mailbox;
 use super::org_tree;
@@ -26,18 +26,34 @@ use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
+use zeroize::Zeroizing;
 
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
+
+/// Live provider identity presented on `POST /provider-identity`.
+pub struct ProviderIdentity {
+    pub certificate: Vec<u8>,
+    pub relay_private_key: Zeroizing<[u8; 32]>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    identity: Option<Arc<ProviderIdentity>>,
 }
 
 impl AppState {
     pub fn new(conn: Connection) -> Self {
         Self {
             db: Arc::new(Mutex::new(conn)),
+            identity: None,
+        }
+    }
+
+    pub fn with_identity(conn: Connection, identity: ProviderIdentity) -> Self {
+        Self {
+            db: Arc::new(Mutex::new(conn)),
+            identity: Some(Arc::new(identity)),
         }
     }
 }
@@ -111,6 +127,7 @@ impl From<Error> for ApiError {
             | Error::InvalidTreeSpec
             | Error::DuplicateNodeLabel
             | Error::InvalidBridge
+            | Error::InvalidProviderChallenge
             | Error::InvalidExpiresAt
             | Error::ExpiresAtInPast => Self {
                 status: StatusCode::BAD_REQUEST,
@@ -118,6 +135,10 @@ impl From<Error> for ApiError {
             },
             Error::ApiKeyNotFound | Error::TreeNotFound | Error::NodeNotFound => Self {
                 status: StatusCode::NOT_FOUND,
+                message: err.to_string(),
+            },
+            Error::ProviderIdentityMissing => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
                 message: err.to_string(),
             },
             Error::BundleFieldTooLarge => Self {
@@ -226,7 +247,8 @@ impl Modify for SecurityAddon {
         list_keys,
         revoke_key,
         put_tree,
-        get_tree_context
+        get_tree_context,
+        post_provider_identity
     ),
     components(
         schemas(
@@ -241,14 +263,17 @@ impl Modify for SecurityAddon {
             ApiKeyView,
             PublicTree,
             PublicNode,
-            PublicEdge
+            PublicEdge,
+            ProviderIdentityRequest,
+            ProviderIdentityResponse
         )
     ),
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
         (name = "api-keys", description = "List and revoke API keys; minting is licensee-only on the host"),
-        (name = "trees", description = "Canonical public split-tree topology")
+        (name = "trees", description = "Canonical public split-tree topology"),
+        (name = "provider", description = "KeyQuorum-signed relay identity")
     )
 )]
 struct ApiDoc;
@@ -261,6 +286,35 @@ struct ApiDoc;
 )]
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+#[utoipa::path(
+    post,
+    path = "/provider-identity",
+    tag = "provider",
+    request_body = ProviderIdentityRequest,
+    responses(
+        (status = 200, description = "Certificate plus signature over the challenge", body = ProviderIdentityResponse),
+        (status = 400, description = "Challenge is not 32 bytes", body = ErrorBody),
+        (status = 503, description = "Host has no provider identity", body = ErrorBody)
+    )
+)]
+async fn post_provider_identity(
+    State(state): State<AppState>,
+    Json(body): Json<ProviderIdentityRequest>,
+) -> Result<Json<ProviderIdentityResponse>, ApiError> {
+    let identity = state
+        .identity
+        .clone()
+        .ok_or(Error::ProviderIdentityMissing)?;
+    let challenge = STANDARD
+        .decode(body.challenge.as_bytes())
+        .map_err(|_| Error::InvalidProviderChallenge)?;
+    let signature = crate::provider::sign_challenge(&identity.relay_private_key, &challenge)?;
+    Ok(Json(ProviderIdentityResponse {
+        certificate: STANDARD.encode(&identity.certificate),
+        signature: STANDARD.encode(signature),
+    }))
 }
 
 fn keycheck_response(check: api_key::KeyCheck) -> KeyCheckResponse {
@@ -542,6 +596,7 @@ pub fn router(state: AppState) -> Router {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
         .route("/keycheck", post(post_keycheck))
+        .route("/provider-identity", post(post_provider_identity))
         .route("/inbox", post(post_inbox).get(get_inbox))
         .route("/api-keys", get(list_keys))
         .route("/api-keys/{id}/revoke", post(revoke_key))

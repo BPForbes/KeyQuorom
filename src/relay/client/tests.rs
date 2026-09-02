@@ -305,3 +305,123 @@ async fn check_key_client_and_stored_hash_can_push() {
         .expect("push");
     assert!(accepted.id > 0);
 }
+
+#[cfg(feature = "provider")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticate_provider_accepts_a_signed_identity() {
+    use crate::provider::test_helpers::{empty_revoked, issued_identity};
+    use crate::relay::ProviderIdentity;
+
+    let issued = issued_identity("2027-09-02 00:00:00");
+    let conn = relay::open_in_memory().expect("schema");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = relay::router(AppState::with_identity(
+        conn,
+        ProviderIdentity {
+            certificate: issued.certificate.clone(),
+            relay_private_key: issued.relay_private.clone(),
+        },
+    ));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let url = format!("http://{addr}");
+    let root = issued.root_public;
+    let cert = tokio::task::spawn_blocking(move || {
+        authenticate_provider(&url, &root, "2026-09-02 12:00:00", &empty_revoked())
+    })
+    .await
+    .expect("join")
+    .expect("authenticate");
+    assert_eq!(cert.serial, "KQP-000184");
+}
+
+#[cfg(feature = "provider")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticate_provider_rejects_missing_expired_and_revoked() {
+    use crate::error::Error;
+    use crate::provider::test_helpers::{empty_revoked, issued_identity};
+    use crate::relay::ProviderIdentity;
+    use std::collections::HashSet;
+
+    let conn = relay::open_in_memory().expect("schema");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let url = format!("http://{addr}");
+    let app = relay::router(AppState::new(conn));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let missing_url = url.clone();
+    let missing = tokio::task::spawn_blocking(move || {
+        authenticate_provider(
+            &missing_url,
+            &[0u8; 32],
+            "2026-09-02 12:00:00",
+            &empty_revoked(),
+        )
+    })
+    .await
+    .expect("join")
+    .unwrap_err();
+    assert!(matches!(missing, Error::UntrustedRelay));
+
+    let expired = issued_identity("2020-01-01 00:00:00");
+    let conn = relay::open_in_memory().expect("schema");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = relay::router(AppState::with_identity(
+        conn,
+        ProviderIdentity {
+            certificate: expired.certificate.clone(),
+            relay_private_key: expired.relay_private.clone(),
+        },
+    ));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let url = format!("http://{addr}");
+    let root = expired.root_public;
+    let err = tokio::task::spawn_blocking(move || {
+        authenticate_provider(&url, &root, "2026-09-02 12:00:00", &empty_revoked())
+    })
+    .await
+    .expect("join")
+    .unwrap_err();
+    assert!(matches!(err, Error::ProviderCertificateExpired));
+
+    let live = issued_identity("2027-09-02 00:00:00");
+    let conn = relay::open_in_memory().expect("schema");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let app = relay::router(AppState::with_identity(
+        conn,
+        ProviderIdentity {
+            certificate: live.certificate.clone(),
+            relay_private_key: live.relay_private.clone(),
+        },
+    ));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let url = format!("http://{addr}");
+    let root = live.root_public;
+    let err = tokio::task::spawn_blocking(move || {
+        let mut revoked = HashSet::new();
+        revoked.insert("KQP-000184".into());
+        authenticate_provider(&url, &root, "2026-09-02 12:00:00", &revoked)
+    })
+    .await
+    .expect("join")
+    .unwrap_err();
+    assert!(matches!(err, Error::ProviderCertificateRevoked));
+}

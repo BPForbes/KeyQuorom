@@ -23,7 +23,10 @@ hardware/USB integration exists.
 
 ## Getting Started
 
-Build the CLI with `cargo build --release`; the binary is `target/release/keyquorum`.
+Build the customer CLI with `cargo build --release`; the binary is `target/release/keyquorum`.
+`--features provider` compiles mailbox-host capabilities into the same crate. That
+flag is not authorization: official clients trust a relay only when it presents a
+KeyQuorum-signed provider certificate and proves possession of the matching key.
 Passwords, PINs, and hardware-key material are always prompted for interactively (or read
 from a `--share-file` key path) rather than taken as plain arguments. Run `keyquorum --help` for
 the full command list.
@@ -331,7 +334,8 @@ The hosted mailbox carries sealed `.kqpb` envelopes and public-tree slices.
 It indexes packages by the recipient fingerprint in the outer header and
 never unseals them. Wrapped shares and private keys stay on the device.
 Your provider gives you a URL and an API key; you do not run or administer
-the mailbox.
+the mailbox. Official `loadkey` / `relay` commands authenticate that host
+with a KeyQuorum-signed provider certificate before sending a bearer.
 
 ```sh
 export KEYQUORUM_RELAY_URL=https://relay.example.com
@@ -344,9 +348,12 @@ keyquorum --db alice.sqlite relay pull --import --share-file alice.key
 keyquorum relay push --dir ./bridge-packages --api-key "$PUSH_KEY"
 ```
 
-`loadkey` checks the key with the mailbox, then stores the key hash and a
-sealed copy of the bearer in the personal database. Later `relay` /
-`tree fetch` commands re-check that hash before using the key.
+`loadkey` first verifies the relay's KeyQuorum-signed identity, then checks
+the key with the mailbox, then stores the key hash and a sealed copy of the
+bearer in the personal database. Later `relay` / `tree fetch` commands
+repeat that identity check and re-check the hash before using the key.
+An optional signed revocation list can be pointed at with
+`KEYQUORUM_PROVIDER_KRL`.
 
 `relay push` also uploads every public tree in `--db` and **merges** it
 into the mailbox (unrelated nodes stay put). `relay pull` merges the
@@ -378,7 +385,7 @@ These still need a private-key custody model (a software file, OS keychain, or r
 
 ## Security
 
-This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, API key bearers, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded.
+This project handles cryptographic key material and encrypted user data. Never commit private keys, tokens, secrets, API key bearers, provider certificates, revocation lists, or plaintext copies of protected files to this repository — see `.gitignore` for patterns already excluded. Compiling with `--features provider` does not make a host a trusted KeyQuorum provider.
 
 The hosted mailbox cannot decrypt `.kqpb` envelopes and must not be given wrapped shares or private keys. It stores the canonical *public* tree as JSON documents (labels, fingerprints, public keys, policy). Sending envelopes with `relay push` updates those documents from the sender's `--db`. Pulling returns a sliced copy for the pull-key fingerprint, which the CLI translates into local SQLite. Personal devices load a bearer with `keyquorum loadkey` (or `--api-key` once); they keep the hash and a sealed copy of the bearer in the owner-only org database. Recover a lost bearer by loading the replacement your provider issues; recover a missed update by pulling again and importing on the device that holds the matching decryption key.
 

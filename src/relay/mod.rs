@@ -21,10 +21,11 @@ pub use api_key::{
     ApiKeyScope, AuthedKey, CreatedApiKey, CreatedLicensee, KeyCheck, NewApiKey,
 };
 pub use client::{
-    check_key, check_key_hash, fetch_tree_context, publish_tree, pull as pull_inbox,
-    push as push_inbox, push_with_trees as push_inbox_with_trees,
+    authenticate_provider, check_key, check_key_hash, fetch_tree_context, publish_tree,
+    pull as pull_inbox, push as push_inbox, push_with_trees as push_inbox_with_trees,
     push_with_trees_until as push_inbox_with_trees_until, validate_relay_url, InboxAccepted,
     InboxEnvelope, InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
+    ProviderIdentityRequest, ProviderIdentityResponse,
 };
 pub use mailbox::{
     list_after, purge_expired as purge_expired_envelopes, store, store_until, MailboxPage,
@@ -35,7 +36,7 @@ pub use org_tree::{
     merge_public_tree, put_public_tree, slices_for_fingerprint,
 };
 #[cfg(feature = "provider")]
-pub use server::{router, AppState, MAX_ENVELOPE_BYTES};
+pub use server::{router, AppState, ProviderIdentity, MAX_ENVELOPE_BYTES};
 
 use crate::error::{Error, Result};
 use rusqlite::Connection;
