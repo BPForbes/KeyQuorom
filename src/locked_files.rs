@@ -122,7 +122,9 @@ pub fn parse_expires_utc(value: &str) -> Result<String> {
     if day < 1 || day > days_in_month(year, month) {
         return Err(Error::InvalidExpiresAt);
     }
-    Ok(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:00"))
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:00"
+    ))
 }
 
 /// Rejects a parsed UTC expiry that is not strictly after SQLite `now`.
