@@ -51,6 +51,7 @@ pub enum Error {
     ApiKeyScopeDenied,
     ApiKeyNotFound,
     InvalidLicenseeKey,
+    UnknownProvider,
     OrganizationDatabase,
     InvalidInboxPage,
     RelayRequest(String),
@@ -64,12 +65,9 @@ pub enum Error {
     InvalidProviderChallenge,
     UntrustedRelay,
     ProviderIdentityMissing,
-    InvalidRootNetwork,
-    RootNetworkRequired,
+    ProviderPolicyMissing,
     InvalidProviderPolicy,
     ProviderPolicyExpired,
-    ProviderNetworkModeUnsupported,
-    CallerNetworkNotAuthoritative,
     ProviderHardwareDenied,
     ProviderHardwareRevoked,
     ApiRootMissing,
@@ -191,6 +189,7 @@ impl fmt::Display for Error {
                     "invalid licensee key; only the licensee can mint or rotate API keys"
                 )
             }
+            Error::UnknownProvider => write!(f, "provider id does not match this mailbox"),
             Error::OrganizationDatabase => write!(
                 f,
                 "this SQLite file is an organization database; the mailbox needs a separate database"
@@ -233,25 +232,16 @@ impl fmt::Display for Error {
                     "mailbox host is not configured with a provider identity"
                 )
             }
-            Error::InvalidRootNetwork => write!(f, "root-network CIDR is malformed"),
-            Error::RootNetworkRequired => write!(
-                f,
-                "this operation requires an authorized Corporate Wi-Fi or VPN presence"
-            ),
+            Error::ProviderPolicyMissing => {
+                write!(
+                    f,
+                    "mailbox host is not configured with a provider policy"
+                )
+            }
             Error::InvalidProviderPolicy => {
                 write!(f, "provider policy is missing or invalid")
             }
             Error::ProviderPolicyExpired => write!(f, "provider policy has expired"),
-            Error::ProviderNetworkModeUnsupported => {
-                write!(
-                    f,
-                    "this Corporate Network mode is not implemented yet"
-                )
-            }
-            Error::CallerNetworkNotAuthoritative => write!(
-                f,
-                "caller-supplied --network CIDRs are not production authority; select a signed --network-id"
-            ),
             Error::ProviderHardwareDenied => {
                 write!(
                     f,
@@ -263,7 +253,7 @@ impl fmt::Display for Error {
             }
             Error::ApiRootMissing => write!(
                 f,
-                "API root has not been generated; use host api-root generate"
+                "API root has not been generated"
             ),
             Error::ApiRootAlreadyExists => {
                 write!(f, "API root already exists on this mailbox")

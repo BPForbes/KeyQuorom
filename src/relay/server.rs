@@ -56,6 +56,10 @@ impl AppState {
             identity: Some(Arc::new(identity)),
         }
     }
+
+    pub fn identity(&self) -> Option<Arc<ProviderIdentity>> {
+        self.identity.clone()
+    }
 }
 
 struct ApiToken(String);
@@ -124,12 +128,14 @@ impl From<Error> for ApiError {
             | Error::InvalidInboxPage
             | Error::InvalidBridgePackage
             | Error::InvalidPublicKey
+            | Error::SignatureVerificationFailed
             | Error::InvalidTreeSpec
             | Error::DuplicateNodeLabel
             | Error::InvalidBridge
             | Error::InvalidProviderChallenge
             | Error::InvalidExpiresAt
-            | Error::ExpiresAtInPast => Self {
+            | Error::ExpiresAtInPast
+            | Error::WrongKeyType => Self {
                 status: StatusCode::BAD_REQUEST,
                 message: err.to_string(),
             },
@@ -271,7 +277,7 @@ impl Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
-        (name = "api-keys", description = "List and revoke API keys; minting is licensee-only on the host"),
+        (name = "api-keys", description = "List and revoke API keys"),
         (name = "trees", description = "Canonical public split-tree topology"),
         (name = "provider", description = "KeyQuorum-signed relay identity")
     )

@@ -5,9 +5,8 @@
 -- (the full org context). Pushing envelopes updates those documents.
 -- Personal devices translate a sliced copy into local SQLite.
 
--- One issuer credential for the KeyQuorum licensee. Customer API keys are
--- minted only with this secret via host-local `keys` on the mailbox; HTTP cannot
--- create or rotate bearers. The table stores `hex(SHA-256(raw))` only.
+-- Legacy single-row issuer table. New mailboxes leave this empty.
+-- API keys are not minted over HTTP.
 CREATE TABLE IF NOT EXISTS licensee_issuer (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     key_hash    TEXT NOT NULL,

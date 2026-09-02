@@ -528,8 +528,6 @@ fn provider_host_identity_and_certify_parse() {
         "generate",
         "--public-key-out",
         "provider-root.pub",
-        "--network",
-        "10.8.0.0/24",
     ])
     .is_ok());
     assert!(Cli::try_parse_from([
@@ -539,8 +537,38 @@ fn provider_host_identity_and_certify_parse() {
         "generate",
         "--public-key-out",
         "provider-root.pub",
+        "--network",
+        "10.8.0.0/24",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "root",
+        "generate",
+        "--public-key-out",
+        "provider-root.pub",
         "--ssid",
         "Office",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "policy",
+        "issue",
+        "--relay-public-key",
+        "relay.pub",
+        "--provider-id",
+        "acme",
+        "--policy-id",
+        "KQP-POL-1",
+        "--expires-at",
+        "2027-09-02 00:00:00",
+        "--hardware-fingerprint",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--out",
+        "provider.kqpolicy",
     ])
     .is_ok());
     assert!(Cli::try_parse_from([
@@ -563,49 +591,29 @@ fn provider_host_identity_and_certify_parse() {
         "--out",
         "provider.kqpolicy",
     ])
-    .is_ok());
+    .is_err());
     assert!(Cli::try_parse_from([
         "keyquorum",
-        "host",
-        "policy",
-        "issue",
-        "--relay-public-key",
-        "relay.pub",
+        "relay",
+        "register",
+        "--url",
+        "http://127.0.0.1:8787",
         "--provider-id",
         "acme",
-        "--policy-id",
-        "KQP-POL-1",
-        "--expires-at",
-        "2027-09-02 00:00:00",
-        "--hardware-fingerprint",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "--network-mode",
-        "wifi",
-        "--ssid",
-        "Office",
-        "--corporate-network",
-        "corp-wifi",
-        "--out",
-        "provider.kqpolicy",
+        "--hardware-key",
+        "hw.key",
     ])
-    .is_ok());
+    .is_err());
     assert!(Cli::try_parse_from([
         "keyquorum",
         "host",
-        "api-root",
-        "generate",
-        "--cert",
-        "provider.kqcert",
-        "--relay-key",
-        "relay.key",
-        "--policy",
-        "provider.kqpolicy",
-        "--network-id",
-        "corp-vpn",
-        "--hardware-key",
-        "provider-hw.key",
+        "keys",
+        "create",
+        "--scope",
+        "inbox.push",
     ])
-    .is_ok());
+    .is_err());
+    assert!(Cli::try_parse_from(["keyquorum", "host", "keys", "rotate", "--id", "1"]).is_err());
 }
 
 #[cfg(feature = "provider")]

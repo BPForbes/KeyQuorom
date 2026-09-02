@@ -26,24 +26,15 @@ returns a sliced copy that the personal SQLite file translates. A personal SQLit
 file should keep only the subgraph that person needs (own lineage, siblings,
 descendants, and established-bridge peers plus those peers' ancestors). API keys
 are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
-are minted only by the licensee (host-local `keys create|rotate` with the
-`kql_…` issuer); HTTP cannot create or rotate bearers. The `kql_…` issuer is
-host-local mailbox administration, not proof that an organization is a
-KeyQuorum-authorized provider. The mailbox host is a **hidden**
-`keyquorum host` subcommand, compiled only with `--features provider`. That
-feature is a build capability, not authorization. A trusted relay also
-requires a KeyQuorum-signed `provider.kqcert` and the matching relay private
-key; official clients challenge `POST /provider-identity` and disconnect if
-the certificate, signature, expiry, capabilities, or revocation check fails.
-`host root generate` is allowed only when this machine is on a configured
-VPN tunnel (`--network` / `KEYQUORUM_ROOT_NETWORKS`) or associated
-Corporate Wi-Fi (`--ssid` / `KEYQUORUM_ROOT_SSIDS`). That is a presence
-check, not a root of trust, and those caller values are not compiled in.
-Official `kql_…` minting is `host api-root generate` and requires
-the signed cert, a provider-root-signed `provider-policy.kqpolicy`, a
-`--network-id` that already appears in that policy, and a hardware
-proof-of-possession. Caller `--network` CIDRs and `--ssid` values are not
-production authority. `host serve` does not bootstrap an API root. Do not document
+are issued out of band; HTTP cannot create or rotate bearers. Official
+clients still only talk to a relay that proves
+a KeyQuorum-root-signed cert. The mailbox host is a **hidden**
+`keyquorum host` subcommand, compiled only with `--features provider`.
+That feature is a build capability, not authorization. A trusted relay also
+requires a KeyQuorum-signed `provider.kqcert` and the matching relay
+private key; official clients challenge `POST /provider-identity` and
+disconnect if the certificate, signature, expiry, capabilities, or
+revocation check fails. Do not document
 `host` in README or other customer-facing docs — buyers get
 a URL and an API key and use `keyquorum loadkey` / `relay push` /
 `relay pull`. Default `cargo build` produces `keyquorum` without that

@@ -403,9 +403,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 
 pub mod authorize;
 pub mod hardware_auth;
-pub mod network;
 pub mod policy;
-pub mod root_network;
 
 #[cfg(test)]
 #[path = "provider/test_helpers.rs"]

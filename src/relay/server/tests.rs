@@ -48,6 +48,7 @@ async fn router_health_and_openapi_are_public() {
     assert!(json["paths"]["/api-keys"].is_object());
     assert!(json["paths"]["/keycheck"].is_object());
     assert!(json["paths"]["/keycheck"]["post"].get("security").is_none());
+    assert!(json["paths"]["/api/v1/{provider_id}/register"].is_null());
     assert!(json["paths"]["/provider-identity"].is_object());
     assert!(json["paths"]["/provider-identity"]["post"]
         .get("security")

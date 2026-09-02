@@ -14,12 +14,6 @@ use zeroize::Zeroizing;
 
 const TOKEN_LEN: usize = 32;
 const TOKEN_PREFIX: &str = "kq_";
-const LICENSEE_PREFIX: &str = "kql_";
-
-#[derive(Clone, Debug)]
-pub struct CreatedLicensee {
-    pub token: String,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApiKeyScope {
@@ -371,53 +365,6 @@ pub fn check_hash(conn: &Connection, key_hash: &str) -> Result<KeyCheck> {
     Ok(row.unwrap_or_else(KeyCheck::invalid))
 }
 
-pub fn licensee_issuer_exists(conn: &Connection) -> Result<bool> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))?;
-    Ok(n > 0)
-}
-
-/// Authenticate a supplied licensee key, or mint the issuer when none exists.
-///
-/// A supplied key is never ignored in favor of a fresh bootstrap, so a
-/// mistyped `--db` path cannot mint against a new empty issuer store.
-/// Official hosts must not call this; they mint through `api-root generate`.
-pub fn authorize_licensee_or_bootstrap(
-    conn: &Connection,
-    supplied: Option<&str>,
-) -> Result<Option<CreatedLicensee>> {
-    if let Some(key) = supplied {
-        if key.is_empty() {
-            return Err(Error::InvalidLicenseeKey);
-        }
-        authenticate_licensee(conn, key)?;
-        return Ok(None);
-    }
-    bootstrap_licensee_if_empty(conn)
-}
-
-/// Mints the official API-root once. Fails if an issuer already exists.
-pub fn create_licensee_issuer_if_empty(conn: &Connection) -> Result<CreatedLicensee> {
-    if licensee_issuer_exists(conn)? {
-        return Err(Error::ApiRootAlreadyExists);
-    }
-    let (token, token_hash) = generate_prefixed_bearer(LICENSEE_PREFIX);
-    conn.execute(
-        "INSERT INTO licensee_issuer (id, key_hash) VALUES (1, ?1)",
-        params![token_hash],
-    )?;
-    Ok(CreatedLicensee { token })
-}
-
-/// Test helper around `create_licensee_issuer_if_empty`. Official `host serve`
-/// does not call this.
-pub fn bootstrap_licensee_if_empty(conn: &Connection) -> Result<Option<CreatedLicensee>> {
-    match create_licensee_issuer_if_empty(conn) {
-        Ok(created) => Ok(Some(created)),
-        Err(Error::ApiRootAlreadyExists) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
 /// Record a privileged provider-auth attempt. Never store secrets.
 pub fn record_provider_auth_event(
     conn: &Connection,
@@ -440,21 +387,4 @@ pub fn record_provider_auth_event(
         ],
     )?;
     Ok(())
-}
-
-/// Confirms the caller holds the licensee issuer. Does not stamp API-key use.
-pub fn authenticate_licensee(conn: &Connection, token: &str) -> Result<()> {
-    let token_hash =
-        hash_prefixed(token, LICENSEE_PREFIX).map_err(|_| Error::InvalidLicenseeKey)?;
-    let found: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM licensee_issuer WHERE id = 1 AND key_hash = ?1",
-            params![token_hash],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match found {
-        Some(_) => Ok(()),
-        None => Err(Error::InvalidLicenseeKey),
-    }
 }

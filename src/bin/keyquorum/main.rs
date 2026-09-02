@@ -1625,7 +1625,7 @@ fn persist_checked_key(
 
 /// Official clients verify a KeyQuorum-signed provider certificate before
 /// sending a bearer. A modified relay cannot skip this check.
-fn authenticate_official_relay(url: &str) -> Result<()> {
+fn authenticate_official_relay(url: &str) -> Result<provider::Certificate> {
     let now = provider::system_now_utc()?;
     let krl_path = std::env::var("KEYQUORUM_PROVIDER_KRL")
         .ok()
@@ -1639,8 +1639,7 @@ fn authenticate_official_relay(url: &str) -> Result<()> {
         &provider::KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
         &now,
         &revoked,
-    )?;
-    Ok(())
+    )
 }
 
 fn resolve_relay_url(
