@@ -12,9 +12,49 @@ fn share_options_reject_unusable_limits() {
             "0",
         ],
         ["keyquorum", "share", "create-file", "1", "--max-uses", "-1"],
+        [
+            "keyquorum",
+            "share",
+            "create-file",
+            "1",
+            "--expires",
+            "2026-12-31",
+        ],
+        [
+            "keyquorum",
+            "share",
+            "create-file",
+            "1",
+            "--expires",
+            "2026-13-01 00:00",
+        ],
     ] {
         assert!(Cli::try_parse_from(args).is_err());
     }
+
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "share",
+        "create-file",
+        "1",
+        "--expires",
+        "2026-12-31 23:59",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "access",
+        "password",
+        "--state",
+        "0",
+        "--source",
+        "secret.txt",
+        "--encrypted-path",
+        "secret.txt.kqenc",
+        "--expires",
+        "2026-12-31 23:59",
+    ])
+    .is_ok());
 }
 
 #[test]

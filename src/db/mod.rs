@@ -132,6 +132,12 @@ fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+            if !table_has_column(conn, "password_locked_files", "expires_at")? {
+                conn.execute(
+                    "ALTER TABLE password_locked_files ADD COLUMN expires_at TEXT",
+                    [],
+                )?;
+            }
             rebuild_key_nodes_if_share_required(conn)?;
             Ok(())
         })();

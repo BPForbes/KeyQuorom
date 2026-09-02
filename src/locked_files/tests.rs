@@ -123,3 +123,101 @@ fn locking_rejects_a_non_utf8_encrypted_path() {
     assert!(matches!(result, Err(Error::InvalidPath)));
     assert!(!encrypted_path.exists());
 }
+
+#[test]
+fn parse_expires_utc_accepts_yyyy_mm_dd_hh_mm() {
+    assert_eq!(
+        parse_expires_utc("2026-12-31 23:59").expect("valid expiry"),
+        "2026-12-31 23:59:00"
+    );
+    assert_eq!(
+        parse_expires_utc("2024-02-29 00:00").expect("leap day"),
+        "2024-02-29 00:00:00"
+    );
+}
+
+#[test]
+fn parse_expires_utc_rejects_malformed_and_impossible_dates() {
+    for value in [
+        "2026-12-31",
+        "2026-12-31T23:59",
+        "2026-12-31 23:59:00",
+        "2026-1-1 1:1",
+        "2026-13-01 00:00",
+        "2026-02-29 00:00",
+        "2026-04-31 00:00",
+        "2026-12-31 24:00",
+        "2026-12-31 23:60",
+        "0000-01-01 00:00",
+    ] {
+        assert!(
+            matches!(parse_expires_utc(value), Err(Error::InvalidExpiresAt)),
+            "{value} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn unlock_after_expiry_deletes_ciphertext_and_row() {
+    let conn = db::open_in_memory().expect("schema should apply");
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let source_path = dir.path().join("secret.txt");
+    let encrypted_path = dir.path().join("secret.txt.kqenc");
+    fs::write(&source_path, b"the quorum has been reached").unwrap();
+
+    let id = lock_file(&conn, &source_path, &encrypted_path, "hunter2")
+        .expect("lock_file should succeed");
+    conn.execute(
+        "UPDATE password_locked_files SET expires_at = datetime('now', '-1 minutes') WHERE id = ?1",
+        params![id],
+    )
+    .expect("stamp a past expiry");
+
+    let result = unlock_file(&conn, id, "hunter2");
+    assert!(matches!(result, Err(Error::FileExpired)));
+    assert!(!encrypted_path.exists());
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM password_locked_files WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!exists);
+}
+
+#[test]
+fn require_future_expires_utc_rejects_the_past() {
+    let conn = db::open_in_memory().expect("schema should apply");
+    let past = parse_expires_utc("2000-01-01 00:00").expect("valid expiry");
+    assert!(matches!(
+        require_future_expires_utc(&conn, &past),
+        Err(Error::ExpiresAtInPast)
+    ));
+    let future = parse_expires_utc("2099-12-31 23:59").expect("valid expiry");
+    require_future_expires_utc(&conn, &future).expect("future expiry should be accepted");
+}
+
+#[test]
+fn unlock_before_expiry_leaves_ciphertext() {
+    let conn = db::open_in_memory().expect("schema should apply");
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let source_path = dir.path().join("secret.txt");
+    let encrypted_path = dir.path().join("secret.txt.kqenc");
+    fs::write(&source_path, b"the quorum has been reached").unwrap();
+
+    let expires_at = parse_expires_utc("2099-12-31 23:59").expect("valid expiry");
+    let id = lock_file_until(
+        &conn,
+        &source_path,
+        &encrypted_path,
+        "hunter2",
+        Some(&expires_at),
+    )
+    .expect("lock_file_until should succeed");
+
+    let plaintext = unlock_file(&conn, id, "hunter2").expect("unlock before expiry");
+    assert_eq!(plaintext, b"the quorum has been reached");
+    assert!(encrypted_path.exists());
+}

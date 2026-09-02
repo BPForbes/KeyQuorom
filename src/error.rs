@@ -11,6 +11,9 @@ pub enum Error {
     ShareExpired,
     ShareRevoked,
     ShareExhausted,
+    InvalidExpiresAt,
+    ExpiresAtInPast,
+    FileExpired,
     IntegrityCheckFailed,
     QuorumNotMet,
     InvalidQuorumThreshold,
@@ -67,6 +70,13 @@ impl fmt::Display for Error {
             Error::ShareExpired => write!(f, "share link has expired"),
             Error::ShareRevoked => write!(f, "share link has been revoked"),
             Error::ShareExhausted => write!(f, "share link has reached its use limit"),
+            Error::InvalidExpiresAt => {
+                write!(f, "expiry must be yyyy-mm-dd hh:mm (UTC)")
+            }
+            Error::ExpiresAtInPast => write!(f, "expiry must be a future UTC time"),
+            Error::FileExpired => {
+                write!(f, "file has expired and has been removed from disk")
+            }
             Error::IntegrityCheckFailed => write!(f, "decrypted content failed integrity check"),
             Error::QuorumNotMet => write!(f, "not enough valid shares to reconstruct this key"),
             Error::InvalidQuorumThreshold => {
