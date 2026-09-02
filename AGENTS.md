@@ -37,14 +37,19 @@ key; official clients challenge `POST /provider-identity` and disconnect if
 the certificate, signature, expiry, capabilities, or revocation check fails.
 `host root generate` is allowed only when this machine has a tunnel address
 in `--network` / `KEYQUORUM_ROOT_NETWORKS` (a presence check, not a root of
-trust). Do not document `host` in README or other customer-facing docs — buyers get
+trust). Official `kql_…` minting is `host api-root generate` and requires
+the signed cert, a provider-root-signed `provider-policy.kqpolicy`, a
+`--network-id` that already appears in that policy, and a hardware
+proof-of-possession. Caller `--network` CIDRs are not production
+authority. `host serve` does not bootstrap an API root. Do not document
+`host` in README or other customer-facing docs — buyers get
 a URL and an API key and use `keyquorum loadkey` / `relay push` /
 `relay pull`. Default `cargo build` produces `keyquorum` without that
 subcommand. `keyquorum loadkey` authenticates the relay, then calls
 `POST /keycheck` (no auth) and stores that hash plus a sealed bearer in the
 personal SQLite file. Later commands re-check the hash and inject the
-bearer. Never commit bearers, `.kqpb` files, `*.kqcert`, `*.kqrl`, provider
-root keys, or the relay database.
+bearer. Never commit bearers, `.kqpb` files, `*.kqcert`, `*.kqrl`,
+`*.kqpolicy`, provider root keys, or the relay database.
 
 ## Setup / build / test
 
@@ -78,8 +83,7 @@ files, so treat it as security-sensitive:
 - Never commit private keys, tokens, `.env` files, secrets, or plaintext copies of
   protected/test files. See `.gitignore` for excluded patterns (`*.key`, `*.pem`,
   `*.secret`, `*.token`, `*.kqkey`, `*.kqpb`, `*.kqbn`, `*.kqcert`, `*.kqrl`,
-  `secrets/`, `keys/`, `provider-secrets/`,
-  `test-keys/`, etc.).
+  `*.kqpolicy`, `secrets/`, `keys/`, `provider-secrets/`, `test-keys/`, etc.).
 - Take extra care with code touching key derivation, encryption/decryption, or
   quorum/threshold logic — bugs there are security bugs, not just correctness bugs.
 

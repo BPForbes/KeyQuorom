@@ -4,16 +4,23 @@
 //!
 //! `--features provider` compiles these commands; it does not authorize a
 //! host. `serve` requires a KeyQuorum-signed `provider.kqcert` and the
-//! matching relay private key. `root generate` is allowed only on a
-//! configured VPN tunnel (`--network` / `KEYQUORUM_ROOT_NETWORKS`). The
-//! `kql_…` issuer remains host-local API-key administration, not proof of
-//! KeyQuorum authorization.
+//! matching relay private key. It does not mint the `kql_…` API root.
+//! Official API-root minting is `api-root generate`: cert, signed
+//! `provider-policy.kqpolicy`, Corporate Network id, and hardware
+//! proof-of-possession. Caller `--network` CIDRs are a ceremony/dev
+//! presence check for `root generate` only — they are not production
+//! authority.
 
 use clap::Subcommand;
 use keyquorum::db;
 use keyquorum::error::{Error, Result};
-use keyquorum::keys;
+use keyquorum::keys::{self, KeyType};
 use keyquorum::locked_files;
+use keyquorum::provider::authorize::{self, ApiRootRequest};
+use keyquorum::provider::hardware_auth::{self, HardwareAuthority, ProviderChallenge};
+use keyquorum::provider::policy::{
+    self, CorporateNetwork, HardwareAuthorityEntry, NetworkMode, NewPolicy, PERM_API_ROOT_GENERATE,
+};
 use keyquorum::provider::{self, NewCertificate, KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY};
 use keyquorum::relay::{self, ApiKeyScope, AppState, NewApiKey, ProviderIdentity};
 use std::net::SocketAddr;
@@ -95,6 +102,16 @@ pub enum HostCommand {
         #[command(subcommand)]
         command: RootCommand,
     },
+    /// Issue a provider-root-signed hardware/network policy.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    /// Official `kql_…` API-root minting.
+    ApiRoot {
+        #[command(subcommand)]
+        command: ApiRootCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,6 +121,72 @@ pub enum RootCommand {
         #[arg(long)]
         public_key_out: PathBuf,
         /// Seller VPN CIDR (repeatable). Example: 10.8.0.0/24
+        #[arg(long = "network")]
+        networks: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PolicyCommand {
+    /// Write `provider-policy.kqpolicy` signed by the offline provider root.
+    Issue {
+        #[arg(long)]
+        root_key: Option<PathBuf>,
+        #[arg(long)]
+        relay_public_key: PathBuf,
+        #[arg(long)]
+        provider_id: String,
+        #[arg(long)]
+        policy_id: String,
+        #[arg(long)]
+        issued_at: Option<String>,
+        #[arg(long)]
+        expires_at: String,
+        #[arg(long, default_value = "provider")]
+        capabilities: String,
+        /// hex(SHA-256(pubkey)) of an authorized signing token (repeatable)
+        #[arg(long = "hardware-fingerprint", required = true)]
+        hardware_fingerprints: Vec<String>,
+        #[arg(long = "revoked-hardware")]
+        revoked_hardware: Vec<String>,
+        /// `id:cidr[,cidr…]` (repeatable). Example: corp-vpn:10.8.0.0/24
+        #[arg(long = "corporate-network", required = true)]
+        corporate_networks: Vec<String>,
+        #[arg(long, default_value = "vpn")]
+        network_mode: String,
+        #[arg(long, default_value_t = 1)]
+        hardware_threshold: u8,
+        #[arg(long = "permission", default_value = "api-root.generate")]
+        permissions: Vec<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ApiRootCommand {
+    /// Mint the licensee issuer after all provider gates succeed.
+    Generate {
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        #[arg(long)]
+        relay_key: Option<PathBuf>,
+        #[arg(long)]
+        krl: Option<PathBuf>,
+        /// Signed policy (or KEYQUORUM_PROVIDER_POLICY)
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Selects a Corporate Network already listed in the signed policy.
+        #[arg(long)]
+        network_id: String,
+        /// File-based stand-in for the hardware signing key (tests/dev).
+        #[arg(long)]
+        hardware_key: Option<PathBuf>,
+        #[arg(long)]
+        hardware_public_key: Option<PathBuf>,
+        #[arg(long)]
+        hardware_signature: Option<String>,
+        /// Rejected: caller CIDRs are not production authority.
         #[arg(long = "network")]
         networks: Vec<String>,
     },
@@ -203,6 +286,12 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
             run_keys(&conn, command)
         }
         HostCommand::Root { command } => run_root(command),
+        HostCommand::Policy { command } => run_policy(command),
+        HostCommand::ApiRoot { command } => {
+            let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
+            let conn = relay::open(db_path)?;
+            run_api_root(&conn, command)
+        }
     }
 }
 
@@ -229,20 +318,10 @@ fn require_licensee(conn: &rusqlite::Connection, explicit: Option<String>) -> Re
 }
 
 fn authorize_mint(conn: &rusqlite::Connection, licensee_key: Option<String>) -> Result<()> {
-    let supplied = licensee_key.filter(|s| !s.is_empty()).or_else(|| {
-        match std::env::var("KEYQUORUM_LICENSEE_KEY") {
-            Ok(key) if !key.is_empty() => Some(key),
-            _ => None,
-        }
-    });
-    if let Some(issuer) = relay::authorize_licensee_or_bootstrap(conn, supplied.as_deref())? {
-        print_new_licensee(&issuer);
-        return Ok(());
+    if !relay::licensee_issuer_exists(conn)? {
+        return Err(Error::ApiRootMissing);
     }
-    if supplied.is_none() {
-        require_licensee(conn, None)?;
-    }
-    Ok(())
+    require_licensee(conn, licensee_key)
 }
 
 fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
@@ -321,6 +400,277 @@ fn run_root(command: RootCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_policy(command: PolicyCommand) -> Result<()> {
+    match command {
+        PolicyCommand::Issue {
+            root_key,
+            relay_public_key,
+            provider_id,
+            policy_id,
+            issued_at,
+            expires_at,
+            capabilities,
+            hardware_fingerprints,
+            revoked_hardware,
+            corporate_networks,
+            network_mode,
+            hardware_threshold,
+            permissions,
+            out,
+        } => run_policy_issue(
+            root_key,
+            &relay_public_key,
+            &provider_id,
+            &policy_id,
+            issued_at,
+            &expires_at,
+            &capabilities,
+            &hardware_fingerprints,
+            &revoked_hardware,
+            &corporate_networks,
+            &network_mode,
+            hardware_threshold,
+            &permissions,
+            &out,
+        ),
+    }
+}
+
+fn run_api_root(conn: &rusqlite::Connection, command: ApiRootCommand) -> Result<()> {
+    match command {
+        ApiRootCommand::Generate {
+            cert,
+            relay_key,
+            krl,
+            policy,
+            network_id,
+            hardware_key,
+            hardware_public_key,
+            hardware_signature,
+            networks,
+        } => run_api_root_generate(
+            conn,
+            cert,
+            relay_key,
+            krl,
+            policy,
+            &network_id,
+            hardware_key,
+            hardware_public_key,
+            hardware_signature,
+            &networks,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_policy_issue(
+    root_key: Option<PathBuf>,
+    relay_public_key: &Path,
+    provider_id: &str,
+    policy_id: &str,
+    issued_at: Option<String>,
+    expires_at: &str,
+    capabilities: &str,
+    hardware_fingerprints: &[String],
+    revoked_hardware: &[String],
+    corporate_networks: &[String],
+    network_mode: &str,
+    hardware_threshold: u8,
+    permissions: &[String],
+    out: &Path,
+) -> Result<()> {
+    let root = read_root_key(root_key)?;
+    let relay_public = read_key_array_32(relay_public_key)?;
+    let issued_at = match issued_at.filter(|s| !s.is_empty()) {
+        Some(value) => value,
+        None => provider::system_now_utc()?,
+    };
+    let capabilities = provider::parse_capabilities(capabilities)?;
+    let mode = NetworkMode::parse(network_mode)?;
+    let hardware = collect_hardware(hardware_fingerprints, revoked_hardware)?;
+    let networks = collect_networks(corporate_networks, mode)?;
+    let bytes = policy::issue_policy(
+        &root,
+        &NewPolicy {
+            provider_id,
+            policy_id,
+            relay_public_key: &relay_public,
+            issued_at: &issued_at,
+            expires_at,
+            capabilities,
+            hardware_threshold,
+            hardware: &hardware,
+            networks: &networks,
+            permissions,
+        },
+    )?;
+    locked_files::write_owner_only(out, &bytes)?;
+    eprintln!("Wrote provider policy to {}", out.display());
+    Ok(())
+}
+
+fn collect_hardware(
+    fingerprints: &[String],
+    revoked: &[String],
+) -> Result<Vec<HardwareAuthorityEntry>> {
+    let revoked: std::collections::HashSet<String> = revoked
+        .iter()
+        .map(|fp| policy::normalize_fingerprint(fp))
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    let mut out = Vec::new();
+    for raw in fingerprints {
+        let fingerprint = policy::normalize_fingerprint(raw)?;
+        let is_revoked = revoked.contains(&fingerprint);
+        out.push(HardwareAuthorityEntry {
+            fingerprint,
+            key_type: KeyType::Signing,
+            authority: HardwareAuthority::ProviderApiRoot,
+            revoked: is_revoked,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_networks(specs: &[String], mode: NetworkMode) -> Result<Vec<CorporateNetwork>> {
+    let mut out = Vec::new();
+    for spec in specs {
+        let (network_id, cidrs) = spec.split_once(':').ok_or(Error::InvalidProviderPolicy)?;
+        let cidrs = cidrs
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if network_id.is_empty() || cidrs.is_empty() {
+            return Err(Error::InvalidProviderPolicy);
+        }
+        out.push(CorporateNetwork {
+            network_id: network_id.to_string(),
+            mode,
+            cidrs,
+            ssid: None,
+            bssid_mac: None,
+            gateway_mac: None,
+            verifier_public_key: None,
+        });
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_api_root_generate(
+    conn: &rusqlite::Connection,
+    cert: Option<PathBuf>,
+    relay_key: Option<PathBuf>,
+    krl: Option<PathBuf>,
+    policy: Option<PathBuf>,
+    network_id: &str,
+    hardware_key: Option<PathBuf>,
+    hardware_public_key: Option<PathBuf>,
+    hardware_signature: Option<String>,
+    networks: &[String],
+) -> Result<()> {
+    let identity = load_serve_identity(cert, relay_key, krl)?;
+    let policy_path =
+        path_or_env(policy, "KEYQUORUM_PROVIDER_POLICY").ok_or(Error::InvalidProviderPolicy)?;
+    let policy_bytes = std::fs::read(&policy_path)?;
+    let now = provider::system_now_utc()?;
+    let cert = provider::parse_certificate(&identity.certificate)?;
+    let nonce = *keyquorum::crypto::random_key();
+    let (hardware_public_key, hardware_signature) = hardware_proof(
+        &cert,
+        network_id,
+        &now,
+        &nonce,
+        hardware_key,
+        hardware_public_key,
+        hardware_signature,
+    )?;
+    let local_addrs = provider::root_network::list_local_addresses()?;
+    let revoked = std::collections::HashSet::new();
+    let outcome = authorize::authorize_api_root_generation(&ApiRootRequest {
+        root_public_key: &KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
+        certificate: &identity.certificate,
+        relay_private_key: &identity.relay_private_key,
+        policy: &policy_bytes,
+        now_utc: &now,
+        revoked: &revoked,
+        network_id,
+        local_addrs: &local_addrs,
+        caller_networks: networks,
+        hardware_public_key: &hardware_public_key,
+        hardware_signature: &hardware_signature,
+        timestamp: &now,
+        nonce: &nonce,
+    });
+    match outcome {
+        Ok(authorized) => {
+            let issuer = relay::create_licensee_issuer_if_empty(conn);
+            let success = issuer.is_ok();
+            let _ = relay::record_provider_auth_event(
+                conn,
+                PERM_API_ROOT_GENERATE,
+                Some(&authorized.certificate.provider_id),
+                Some(&authorized.network_id),
+                Some(&authorized.hardware_fingerprint),
+                success,
+            );
+            let issuer = issuer?;
+            print_new_licensee(&issuer);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = relay::record_provider_auth_event(
+                conn,
+                PERM_API_ROOT_GENERATE,
+                Some(&cert.provider_id),
+                Some(network_id),
+                None,
+                false,
+            );
+            Err(err)
+        }
+    }
+}
+
+fn hardware_proof(
+    cert: &provider::Certificate,
+    network_id: &str,
+    timestamp: &str,
+    nonce: &[u8; 32],
+    hardware_key: Option<PathBuf>,
+    hardware_public_key: Option<PathBuf>,
+    hardware_signature: Option<String>,
+) -> Result<([u8; 32], [u8; 64])> {
+    if let Some(path) = hardware_key {
+        let secret = read_key_array_32(&path)?;
+        let public = ed25519_dalek::SigningKey::from_bytes(&secret)
+            .verifying_key()
+            .to_bytes();
+        let challenge = ProviderChallenge {
+            provider_id: &cert.provider_id,
+            relay_id: &cert.relay_public_key,
+            network_policy_id: network_id,
+            timestamp,
+            nonce,
+            required_authority: HardwareAuthority::ProviderApiRoot,
+        };
+        let signature = hardware_auth::sign_provider_hardware(&secret, &challenge)?;
+        return Ok((public, signature));
+    }
+    let public_path = hardware_public_key.ok_or(Error::ProviderHardwareDenied)?;
+    let signature_hex = hardware_signature.ok_or(Error::ProviderHardwareDenied)?;
+    let public = read_key_array_32(&public_path)?;
+    let signature = parse_signature_hex(&signature_hex)?;
+    Ok((public, signature))
+}
+
+fn parse_signature_hex(value: &str) -> Result<[u8; 64]> {
+    let bytes = hex::decode(value.trim()).map_err(|_| Error::ProviderHardwareDenied)?;
+    bytes.try_into().map_err(|_| Error::ProviderHardwareDenied)
 }
 
 fn run_identity(command: IdentityCommand) -> Result<()> {
@@ -469,8 +819,8 @@ async fn serve(
     let identity = load_serve_identity(cert, relay_key, krl)?;
     let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
     let conn = relay::open(db_path)?;
-    if let Some(issuer) = relay::bootstrap_licensee_if_empty(&conn)? {
-        print_new_licensee(&issuer);
+    if !relay::licensee_issuer_exists(&conn)? {
+        eprintln!("API root is not present; customer keys cannot be minted until api-root generate succeeds");
     }
 
     let addr: SocketAddr = bind

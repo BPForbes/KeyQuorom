@@ -16,8 +16,9 @@ mod server;
 
 pub use api_key::{
     authenticate, authenticate_licensee, authorize_licensee_or_bootstrap,
-    bootstrap_licensee_if_empty, check_hash, check_token, create as create_api_key, hash_bearer,
-    list as list_api_keys, revoke as revoke_api_key, rotate as rotate_api_key, ApiKeyInfo,
+    bootstrap_licensee_if_empty, check_hash, check_token, create as create_api_key,
+    create_licensee_issuer_if_empty, hash_bearer, licensee_issuer_exists, list as list_api_keys,
+    record_provider_auth_event, revoke as revoke_api_key, rotate as rotate_api_key, ApiKeyInfo,
     ApiKeyScope, AuthedKey, CreatedApiKey, CreatedLicensee, KeyCheck, NewApiKey,
 };
 pub use client::{

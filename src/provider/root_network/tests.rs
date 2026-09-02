@@ -60,3 +60,82 @@ fn only_tunnel_addresses_in_the_cidr_authorize() {
     assert!(!authorized_on_tunnel(&nets, &other));
     assert!(!authorized_on_tunnel(&[], &ok));
 }
+
+#[test]
+fn signed_vpn_entry_requires_tunnel_and_rejects_caller_cidrs() {
+    use crate::keys::{self, KeyType};
+    use crate::provider::hardware_auth::HardwareAuthority;
+    use crate::provider::policy::{
+        issue_policy, verify_policy, CorporateNetwork, HardwareAuthorityEntry, NetworkMode,
+        NewPolicy, PERM_API_ROOT_GENERATE,
+    };
+    use crate::provider::{generate_relay_identity, CAP_PROVIDER};
+
+    let (root_sk, root_pk) = keys::generate_signing_keypair();
+    let (_, relay_pk) = generate_relay_identity();
+    let bytes = issue_policy(
+        &root_sk,
+        &NewPolicy {
+            provider_id: "Acme",
+            policy_id: "p1",
+            relay_public_key: &relay_pk,
+            issued_at: "2026-01-01 00:00:00",
+            expires_at: "2027-01-01 00:00:00",
+            capabilities: CAP_PROVIDER,
+            hardware_threshold: 1,
+            hardware: &[HardwareAuthorityEntry {
+                fingerprint: keys::fingerprint(&relay_pk),
+                key_type: KeyType::Signing,
+                authority: HardwareAuthority::ProviderApiRoot,
+                revoked: false,
+            }],
+            networks: &[CorporateNetwork {
+                network_id: "corp-vpn".into(),
+                mode: NetworkMode::Vpn,
+                cidrs: vec!["10.8.0.0/24".into()],
+                ssid: None,
+                bssid_mac: None,
+                gateway_mac: None,
+                verifier_public_key: None,
+            }],
+            permissions: &[PERM_API_ROOT_GENERATE.to_string()],
+        },
+    )
+    .unwrap();
+    let policy = verify_policy(&root_pk, &bytes, "2026-09-02 12:00:00").unwrap();
+    let ok = [LocalAddress {
+        iface: "wg0".into(),
+        addr: "10.8.0.2".parse::<IpAddr>().unwrap(),
+        is_tunnel: true,
+    }];
+    authorize_corporate_network(
+        NetworkAuthority::Signed {
+            policy: &policy,
+            network_id: "corp-vpn",
+        },
+        &ok,
+    )
+    .unwrap();
+    let lan = [LocalAddress {
+        iface: "eth0".into(),
+        addr: "10.8.0.2".parse::<IpAddr>().unwrap(),
+        is_tunnel: false,
+    }];
+    assert!(matches!(
+        authorize_corporate_network(
+            NetworkAuthority::Signed {
+                policy: &policy,
+                network_id: "corp-vpn",
+            },
+            &lan,
+        ),
+        Err(Error::RootNetworkRequired)
+    ));
+    assert!(matches!(
+        authorize_corporate_network(
+            NetworkAuthority::CallerCidr(parse_network_list("10.8.0.0/24").unwrap()),
+            &ok,
+        ),
+        Err(Error::CallerNetworkNotAuthoritative)
+    ));
+}

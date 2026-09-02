@@ -52,3 +52,17 @@ CREATE TABLE IF NOT EXISTS org_tree_docs (
     document      TEXT NOT NULL,
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Privileged provider-auth attempts. Never store bearers, private keys,
+-- challenge nonces, or other reusable secrets.
+CREATE TABLE IF NOT EXISTS provider_auth_events (
+    id                      INTEGER PRIMARY KEY,
+    operation               TEXT NOT NULL,
+    provider_id             TEXT,
+    network_id              TEXT,
+    hardware_fingerprints   TEXT,
+    success                 INTEGER NOT NULL CHECK (success IN (0, 1)),
+    attempted_at            TEXT NOT NULL DEFAULT (
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+);

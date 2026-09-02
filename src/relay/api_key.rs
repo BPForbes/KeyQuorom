@@ -371,10 +371,16 @@ pub fn check_hash(conn: &Connection, key_hash: &str) -> Result<KeyCheck> {
     Ok(row.unwrap_or_else(KeyCheck::invalid))
 }
 
+pub fn licensee_issuer_exists(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))?;
+    Ok(n > 0)
+}
+
 /// Authenticate a supplied licensee key, or mint the issuer when none exists.
 ///
 /// A supplied key is never ignored in favor of a fresh bootstrap, so a
 /// mistyped `--db` path cannot mint against a new empty issuer store.
+/// Official hosts must not call this; they mint through `api-root generate`.
 pub fn authorize_licensee_or_bootstrap(
     conn: &Connection,
     supplied: Option<&str>,
@@ -389,20 +395,51 @@ pub fn authorize_licensee_or_bootstrap(
     bootstrap_licensee_if_empty(conn)
 }
 
-/// Mints the one-time licensee issuer when none exists. HTTP never sees this
-/// token; it is required by host-local `keys create|rotate`.
-pub fn bootstrap_licensee_if_empty(conn: &Connection) -> Result<Option<CreatedLicensee>> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))?;
-    if n == 0 {
-        let (token, token_hash) = generate_prefixed_bearer(LICENSEE_PREFIX);
-        conn.execute(
-            "INSERT INTO licensee_issuer (id, key_hash) VALUES (1, ?1)",
-            params![token_hash],
-        )?;
-        Ok(Some(CreatedLicensee { token }))
-    } else {
-        Ok(None)
+/// Mints the official API-root once. Fails if an issuer already exists.
+pub fn create_licensee_issuer_if_empty(conn: &Connection) -> Result<CreatedLicensee> {
+    if licensee_issuer_exists(conn)? {
+        return Err(Error::ApiRootAlreadyExists);
     }
+    let (token, token_hash) = generate_prefixed_bearer(LICENSEE_PREFIX);
+    conn.execute(
+        "INSERT INTO licensee_issuer (id, key_hash) VALUES (1, ?1)",
+        params![token_hash],
+    )?;
+    Ok(CreatedLicensee { token })
+}
+
+/// Test helper around `create_licensee_issuer_if_empty`. Official `host serve`
+/// does not call this.
+pub fn bootstrap_licensee_if_empty(conn: &Connection) -> Result<Option<CreatedLicensee>> {
+    match create_licensee_issuer_if_empty(conn) {
+        Ok(created) => Ok(Some(created)),
+        Err(Error::ApiRootAlreadyExists) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Record a privileged provider-auth attempt. Never store secrets.
+pub fn record_provider_auth_event(
+    conn: &Connection,
+    operation: &str,
+    provider_id: Option<&str>,
+    network_id: Option<&str>,
+    hardware_fingerprints: Option<&str>,
+    success: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO provider_auth_events
+         (operation, provider_id, network_id, hardware_fingerprints, success)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            operation,
+            provider_id,
+            network_id,
+            hardware_fingerprints,
+            i64::from(success)
+        ],
+    )?;
+    Ok(())
 }
 
 /// Confirms the caller holds the licensee issuer. Does not stamp API-key use.

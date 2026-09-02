@@ -66,6 +66,14 @@ pub enum Error {
     ProviderIdentityMissing,
     InvalidRootNetwork,
     RootNetworkRequired,
+    InvalidProviderPolicy,
+    ProviderPolicyExpired,
+    ProviderNetworkModeUnsupported,
+    CallerNetworkNotAuthoritative,
+    ProviderHardwareDenied,
+    ProviderHardwareRevoked,
+    ApiRootMissing,
+    ApiRootAlreadyExists,
 }
 
 impl fmt::Display for Error {
@@ -230,6 +238,36 @@ impl fmt::Display for Error {
                 f,
                 "provider root keys can only be generated on an authorized VPN tunnel"
             ),
+            Error::InvalidProviderPolicy => {
+                write!(f, "provider policy is missing or invalid")
+            }
+            Error::ProviderPolicyExpired => write!(f, "provider policy has expired"),
+            Error::ProviderNetworkModeUnsupported => {
+                write!(
+                    f,
+                    "this Corporate Network mode is not authorized in the VPN-only MVP"
+                )
+            }
+            Error::CallerNetworkNotAuthoritative => write!(
+                f,
+                "caller-supplied --network CIDRs are not production authority; select a signed --network-id"
+            ),
+            Error::ProviderHardwareDenied => {
+                write!(
+                    f,
+                    "provider hardware is missing, unauthorized, or failed the possession challenge"
+                )
+            }
+            Error::ProviderHardwareRevoked => {
+                write!(f, "provider hardware has been revoked")
+            }
+            Error::ApiRootMissing => write!(
+                f,
+                "API root has not been generated; use host api-root generate"
+            ),
+            Error::ApiRootAlreadyExists => {
+                write!(f, "API root already exists on this mailbox")
+            }
         }
     }
 }

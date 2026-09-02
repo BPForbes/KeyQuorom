@@ -1,11 +1,12 @@
-//! Local VPN/tunnel presence check for seller-root generation.
+//! Local VPN/tunnel presence check.
 //!
 //! This is a presence gate, not a cryptographic root of trust. Official
 //! clients still verify `provider.kqcert` against the compiled-in public
-//! key. A customer who is not on the configured tunnel cannot generate
-//! a KeyQuorum root through `host root generate`.
+//! key. Production API-root minting matches a provider-root-signed
+//! Corporate Network; caller `--network` CIDRs are not that authority.
 
 use crate::error::{Error, Result};
+use crate::provider::policy::{CorporateNetwork, NetworkMode, ProviderPolicy};
 use std::ffi::CStr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -182,6 +183,48 @@ pub fn require_authorized_tunnel(networks: &[Network]) -> Result<()> {
         return Err(Error::RootNetworkRequired);
     }
     Ok(())
+}
+
+/// Production API-root minting selects a signed Corporate Network.
+/// Caller CIDRs remain a ceremony/dev path for `host root generate` only.
+pub enum NetworkAuthority<'a> {
+    Signed {
+        policy: &'a ProviderPolicy,
+        network_id: &'a str,
+    },
+    CallerCidr(Vec<Network>),
+}
+
+pub fn authorize_corporate_network(
+    authority: NetworkAuthority<'_>,
+    addrs: &[LocalAddress],
+) -> Result<()> {
+    match authority {
+        NetworkAuthority::CallerCidr(_) => Err(Error::CallerNetworkNotAuthoritative),
+        NetworkAuthority::Signed { policy, network_id } => {
+            require_signed_network_presence(policy.corporate_network(network_id)?, addrs)
+        }
+    }
+}
+
+pub fn require_signed_network_presence(
+    network: &CorporateNetwork,
+    addrs: &[LocalAddress],
+) -> Result<()> {
+    match network.mode {
+        NetworkMode::Vpn => {
+            let parsed = network
+                .cidrs
+                .iter()
+                .map(|cidr| parse_network(cidr))
+                .collect::<Result<Vec<_>>>()?;
+            if !authorized_on_tunnel(&parsed, addrs) {
+                return Err(Error::RootNetworkRequired);
+            }
+            Ok(())
+        }
+        NetworkMode::Wifi | NetworkMode::Ethernet => Err(Error::ProviderNetworkModeUnsupported),
+    }
 }
 
 pub fn list_local_addresses() -> Result<Vec<LocalAddress>> {

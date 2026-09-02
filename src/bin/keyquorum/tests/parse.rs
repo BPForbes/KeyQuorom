@@ -532,6 +532,44 @@ fn provider_host_identity_and_certify_parse() {
         "10.8.0.0/24",
     ])
     .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "policy",
+        "issue",
+        "--relay-public-key",
+        "relay.pub",
+        "--provider-id",
+        "acme",
+        "--policy-id",
+        "KQP-POL-1",
+        "--expires-at",
+        "2027-09-02 00:00:00",
+        "--hardware-fingerprint",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--corporate-network",
+        "corp-vpn:10.8.0.0/24",
+        "--out",
+        "provider.kqpolicy",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "api-root",
+        "generate",
+        "--cert",
+        "provider.kqcert",
+        "--relay-key",
+        "relay.key",
+        "--policy",
+        "provider.kqpolicy",
+        "--network-id",
+        "corp-vpn",
+        "--hardware-key",
+        "provider-hw.key",
+    ])
+    .is_ok());
 }
 
 #[cfg(feature = "provider")]

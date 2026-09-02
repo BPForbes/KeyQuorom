@@ -46,6 +46,7 @@ build/
 *.kqbn
 *.kqcert
 *.kqrl
+*.kqpolicy
 secrets/
 keys/
 test-keys/

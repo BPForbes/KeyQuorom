@@ -401,6 +401,9 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
+pub mod authorize;
+pub mod hardware_auth;
+pub mod policy;
 pub mod root_network;
 
 #[cfg(test)]
