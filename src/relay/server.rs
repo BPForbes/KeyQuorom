@@ -7,10 +7,8 @@ use super::client::{
 };
 use super::mailbox;
 use super::org_tree;
-use super::register::{self, RegisterRequest, RegisterResponse};
 use crate::error::Error;
 use crate::key_tree::{PublicEdge, PublicNode, PublicTree};
-use crate::provider::policy::ProviderPolicy;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -42,7 +40,6 @@ pub struct ProviderIdentity {
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     identity: Option<Arc<ProviderIdentity>>,
-    policy: Option<Arc<ProviderPolicy>>,
 }
 
 impl AppState {
@@ -50,7 +47,6 @@ impl AppState {
         Self {
             db: Arc::new(Mutex::new(conn)),
             identity: None,
-            policy: None,
         }
     }
 
@@ -58,28 +54,11 @@ impl AppState {
         Self {
             db: Arc::new(Mutex::new(conn)),
             identity: Some(Arc::new(identity)),
-            policy: None,
-        }
-    }
-
-    pub fn with_identity_and_policy(
-        conn: Connection,
-        identity: ProviderIdentity,
-        policy: ProviderPolicy,
-    ) -> Self {
-        Self {
-            db: Arc::new(Mutex::new(conn)),
-            identity: Some(Arc::new(identity)),
-            policy: Some(Arc::new(policy)),
         }
     }
 
     pub fn identity(&self) -> Option<Arc<ProviderIdentity>> {
         self.identity.clone()
-    }
-
-    pub fn policy(&self) -> Option<Arc<ProviderPolicy>> {
-        self.policy.clone()
     }
 }
 
@@ -141,9 +120,7 @@ impl From<Error> for ApiError {
             Error::InvalidApiKey | Error::ApiKeyExpired | Error::ApiKeyRevoked => {
                 Self::unauthorized()
             }
-            Error::ApiKeyScopeDenied
-            | Error::ProviderHardwareDenied
-            | Error::ProviderHardwareRevoked => Self {
+            Error::ApiKeyScopeDenied => Self {
                 status: StatusCode::FORBIDDEN,
                 message: "forbidden".to_string(),
             },
@@ -162,18 +139,11 @@ impl From<Error> for ApiError {
                 status: StatusCode::BAD_REQUEST,
                 message: err.to_string(),
             },
-            Error::ApiKeyNotFound
-            | Error::TreeNotFound
-            | Error::NodeNotFound
-            | Error::UnknownProvider => Self {
+            Error::ApiKeyNotFound | Error::TreeNotFound | Error::NodeNotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 message: err.to_string(),
             },
-            Error::ProviderIdentityMissing
-            | Error::ProviderPolicyMissing
-            | Error::InvalidProviderPolicy
-            | Error::ProviderPolicyExpired
-            | Error::RelayIdentityMismatch => Self {
+            Error::ProviderIdentityMissing => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: err.to_string(),
             },
@@ -278,7 +248,6 @@ impl Modify for SecurityAddon {
     paths(
         health,
         post_keycheck,
-        post_register,
         post_inbox,
         get_inbox,
         list_keys,
@@ -292,8 +261,6 @@ impl Modify for SecurityAddon {
             HealthResponse,
             KeyCheckRequest,
             KeyCheckResponse,
-            RegisterRequest,
-            RegisterResponse,
             InboxAccepted,
             InboxEnvelope,
             InboxList,
@@ -310,7 +277,7 @@ impl Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
-        (name = "api-keys", description = "List and revoke API keys; register is service-provider hardware only"),
+        (name = "api-keys", description = "List and revoke API keys"),
         (name = "trees", description = "Canonical public split-tree topology"),
         (name = "provider", description = "KeyQuorum-signed relay identity")
     )
@@ -392,44 +359,6 @@ async fn post_keycheck(
         _ => return Err(Error::InvalidApiKeyRequest.into()),
     };
     Ok(Json(keycheck_response(check)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/{provider_id}/register",
-    tag = "api-keys",
-    params(("provider_id" = String, Path, description = "Certified provider group id")),
-    request_body = RegisterRequest,
-    responses(
-        (status = 201, description = "Minted bearer plus KeyQuorum-signed receipt", body = RegisterResponse),
-        (status = 400, description = "Malformed proof or unsupported scope", body = ErrorBody),
-        (status = 403, description = "Hardware is not a listed service provider", body = ErrorBody),
-        (status = 404, description = "Provider id does not match this host", body = ErrorBody),
-        (status = 503, description = "Host has no provider identity or policy", body = ErrorBody)
-    )
-)]
-async fn post_register(
-    State(state): State<AppState>,
-    Path(provider_id): Path<String>,
-    Json(body): Json<RegisterRequest>,
-) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
-    let identity = state.identity().ok_or(Error::ProviderIdentityMissing)?;
-    let policy = state.policy().ok_or(Error::ProviderPolicyMissing)?;
-    let cert = crate::provider::parse_certificate(&identity.certificate)?;
-    let relay_key = identity.relay_private_key.clone();
-    let registered = with_conn(&state, move |conn| {
-        register::register(
-            conn,
-            &provider_id,
-            &cert.provider_id,
-            &cert.relay_public_key,
-            &relay_key,
-            &policy,
-            &body,
-        )
-    })
-    .await?;
-    Ok((StatusCode::CREATED, Json(registered)))
 }
 
 #[utoipa::path(
@@ -674,7 +603,6 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/keycheck", post(post_keycheck))
         .route("/provider-identity", post(post_provider_identity))
-        .route("/api/v1/{provider_id}/register", post(post_register))
         .route("/inbox", post(post_inbox).get(get_inbox))
         .route("/api-keys", get(list_keys))
         .route("/api-keys/{id}/revoke", post(revoke_key))

@@ -40,33 +40,3 @@ pub(crate) fn issued_identity_with_caps(expires_at: &str, capabilities: u32) -> 
 pub(crate) fn empty_revoked() -> HashSet<String> {
     HashSet::new()
 }
-
-pub(crate) fn listed_provider_policy(
-    provider_id: &str,
-    relay_public: [u8; 32],
-    hardware_fingerprints: &[&str],
-) -> crate::provider::policy::ProviderPolicy {
-    use crate::keys::KeyType;
-    use crate::provider::hardware_auth::HardwareAuthority;
-    use crate::provider::policy::{HardwareAuthorityEntry, ProviderPolicy};
-    ProviderPolicy {
-        provider_id: provider_id.to_string(),
-        policy_id: "KQP-POL-TEST".into(),
-        relay_public_key: relay_public,
-        issued_at: "2026-01-01 00:00:00".into(),
-        expires_at: "2027-09-02 00:00:00".into(),
-        capabilities: CAP_PROVIDER,
-        hardware_threshold: 1,
-        hardware: hardware_fingerprints
-            .iter()
-            .map(|fp| HardwareAuthorityEntry {
-                fingerprint: fp.to_string(),
-                key_type: KeyType::Signing,
-                authority: HardwareAuthority::ProviderApiRoot,
-                revoked: false,
-            })
-            .collect(),
-        networks: Vec::new(),
-        permissions: vec!["api-root.generate".into()],
-    }
-}

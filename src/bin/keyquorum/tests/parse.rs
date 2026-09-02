@@ -603,7 +603,17 @@ fn provider_host_identity_and_certify_parse() {
         "--hardware-key",
         "hw.key",
     ])
-    .is_ok());
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "keys",
+        "create",
+        "--scope",
+        "inbox.push",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from(["keyquorum", "host", "keys", "rotate", "--id", "1"]).is_err());
 }
 
 #[cfg(feature = "provider")]

@@ -11,7 +11,6 @@ mod api_key;
 mod client;
 mod mailbox;
 mod org_tree;
-mod register;
 #[cfg(feature = "provider")]
 mod server;
 
@@ -24,9 +23,9 @@ pub use api_key::{
 pub use client::{
     authenticate_provider, check_key, check_key_hash, fetch_tree_context, publish_tree,
     pull as pull_inbox, push as push_inbox, push_with_trees as push_inbox_with_trees,
-    push_with_trees_until as push_inbox_with_trees_until, register as register_api_key,
-    validate_relay_url, InboxAccepted, InboxEnvelope, InboxList, InboxPush, KeyCheckRequest,
-    KeyCheckResponse, ProviderIdentityRequest, ProviderIdentityResponse,
+    push_with_trees_until as push_inbox_with_trees_until, validate_relay_url, InboxAccepted,
+    InboxEnvelope, InboxList, InboxPush, KeyCheckRequest, KeyCheckResponse,
+    ProviderIdentityRequest, ProviderIdentityResponse,
 };
 pub use mailbox::{
     list_after, purge_expired as purge_expired_envelopes, store, store_until, MailboxPage,
@@ -35,12 +34,6 @@ pub use mailbox::{
 pub use org_tree::{
     context_for_fingerprint, contexts_for_fingerprint, get_public_tree, list_public_trees,
     merge_public_tree, put_public_tree, slices_for_fingerprint,
-};
-pub use register::{
-    list_for_hardware as list_registrations_for_hardware,
-    list_for_provider as list_registrations_for_provider, receipt_preimage, register,
-    register_preimage, sign_register_proof, verify_receipt, verify_register_proof, RegisterRequest,
-    RegisterResponse, Registration, API_VERSION,
 };
 #[cfg(feature = "provider")]
 pub use server::{router, AppState, ProviderIdentity, MAX_ENVELOPE_BYTES};

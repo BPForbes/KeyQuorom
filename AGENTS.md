@@ -26,12 +26,8 @@ returns a sliced copy that the personal SQLite file translates. A personal SQLit
 file should keep only the subgraph that person needs (own lineage, siblings,
 descendants, and established-bridge peers plus those peers' ancestors). API keys
 are shown once; the relay persists only `hex(SHA-256(raw))`. Customer API keys
-are minted only by a service provider. `POST /api/v1/{provider_id}/register`
-is not API-key protected; the caller must prove possession of hardware
-listed in this host's KeyQuorum-signed provider policy. The path provider
-id is the group; the hardware public key and fingerprint identify which
-service provider registered and when. The KeyQuorum relay identity key
-signs that binding. Official clients still only talk to a relay that proves
+are issued out of band; HTTP cannot create or rotate bearers. Official
+clients still only talk to a relay that proves
 a KeyQuorum-root-signed cert. The mailbox host is a **hidden**
 `keyquorum host` subcommand, compiled only with `--features provider`.
 That feature is a build capability, not authorization. A trusted relay also

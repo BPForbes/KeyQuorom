@@ -4,10 +4,7 @@
 //!
 //! `--features provider` compiles these commands; it does not authorize a
 //! host. `serve` requires a KeyQuorum-signed `provider.kqcert` and the
-//! matching relay private key. Customer API keys are minted only by a
-//! service provider: `POST /api/v1/{provider_id}/register` after a
-//! possession proof from hardware listed in the signed provider policy.
-//! The KeyQuorum relay identity key signs the receipt.
+//! matching relay private key. API keys are not minted here.
 
 use clap::Subcommand;
 use keyquorum::db;
@@ -17,7 +14,7 @@ use keyquorum::locked_files;
 use keyquorum::provider::hardware_auth::HardwareAuthority;
 use keyquorum::provider::policy::{self, HardwareAuthorityEntry, NewPolicy};
 use keyquorum::provider::{self, NewCertificate, KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY};
-use keyquorum::relay::{self, ApiKeyScope, AppState, NewApiKey, ProviderIdentity};
+use keyquorum::relay::{self, AppState, ProviderIdentity};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -41,9 +38,6 @@ pub enum HostCommand {
         /// Optional signed revocation list (or KEYQUORUM_PROVIDER_KRL)
         #[arg(long)]
         krl: Option<PathBuf>,
-        /// Signed policy listing service-provider hardware (or KEYQUORUM_PROVIDER_POLICY)
-        #[arg(long)]
-        policy: Option<PathBuf>,
         /// Personal/org SQLite to scan for date-based TTL files. Defaults
         /// to the global `--db` when that file already exists.
         #[arg(long)]
@@ -90,7 +84,7 @@ pub enum HostCommand {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Mint, list, rotate, or revoke API keys on this host (not over HTTP)
+    /// List or revoke API keys on this host (not over HTTP)
     Keys {
         #[command(subcommand)]
         command: KeysCommand,
@@ -158,24 +152,8 @@ pub enum IdentityCommand {
 
 #[derive(Subcommand)]
 pub enum KeysCommand {
-    Create {
-        #[arg(long)]
-        scope: String,
-        /// Required for inbox.pull: hex SHA-256 of the recipient X25519 public key
-        #[arg(long)]
-        fingerprint: Option<String>,
-        #[arg(long)]
-        label: Option<String>,
-        #[arg(long)]
-        ttl_seconds: Option<i64>,
-    },
     List,
-    Revoke {
-        id: i64,
-    },
-    Rotate {
-        id: i64,
-    },
+    Revoke { id: i64 },
 }
 
 pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()> {
@@ -185,7 +163,6 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
             cert,
             relay_key,
             krl,
-            policy,
             scan_db,
             scan_interval_seconds,
         } => {
@@ -200,7 +177,6 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
                     cert,
                     relay_key,
                     krl,
-                    policy,
                     scan_db,
                     scan_interval_seconds,
                 ))
@@ -245,31 +221,6 @@ pub fn run(mailbox_db: &Path, org_db: &Path, command: HostCommand) -> Result<()>
 
 fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
     match command {
-        KeysCommand::Create {
-            scope,
-            fingerprint,
-            label,
-            ttl_seconds,
-        } => {
-            let created = relay::create_api_key(
-                conn,
-                &NewApiKey {
-                    scope: ApiKeyScope::parse(&scope)?,
-                    recipient_fingerprint: fingerprint,
-                    label,
-                    ttl_seconds,
-                },
-            )?;
-            println!("Created API key {}", created.info.id);
-            println!("scope: {}", created.info.scope);
-            if let Some(fp) = &created.info.recipient_fingerprint {
-                println!("fingerprint: {fp}");
-            }
-            if let Some(expires) = &created.info.expires_at {
-                println!("expires: {expires}");
-            }
-            println!("token (shown once): {}", created.token);
-        }
         KeysCommand::List => {
             let keys = relay::list_api_keys(conn)?;
             if keys.is_empty() {
@@ -290,11 +241,6 @@ fn run_keys(conn: &rusqlite::Connection, command: KeysCommand) -> Result<()> {
         KeysCommand::Revoke { id } => {
             relay::revoke_api_key(conn, id)?;
             println!("Revoked API key {id}");
-        }
-        KeysCommand::Rotate { id } => {
-            let created = relay::rotate_api_key(conn, id)?;
-            println!("Rotated API key {id} -> {}", created.info.id);
-            println!("token (shown once): {}", created.token);
         }
     }
     Ok(())
@@ -539,38 +485,12 @@ fn load_serve_identity(
     })
 }
 
-fn load_serve_policy(
-    policy: Option<PathBuf>,
-    cert: &provider::Certificate,
-) -> Result<Option<policy::ProviderPolicy>> {
-    let Some(path) = path_or_env(policy, "KEYQUORUM_PROVIDER_POLICY") else {
-        return Ok(None);
-    };
-    let bytes = std::fs::read(&path)?;
-    let now = provider::system_now_utc()?;
-    let loaded = policy::verify_policy(&KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY, &bytes, &now)?;
-    if loaded.provider_id != cert.provider_id {
-        return Err(Error::InvalidProviderPolicy);
-    }
-    if loaded.relay_public_key != cert.relay_public_key {
-        return Err(Error::RelayIdentityMismatch);
-    }
-    eprintln!(
-        "provider policy {} lists {} hardware token(s)",
-        loaded.policy_id,
-        loaded.hardware.len()
-    );
-    Ok(Some(loaded))
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn serve(
     mailbox_db: &Path,
     bind: &str,
     cert: Option<PathBuf>,
     relay_key: Option<PathBuf>,
     krl: Option<PathBuf>,
-    policy: Option<PathBuf>,
     scan_db: Option<PathBuf>,
     scan_interval_seconds: u64,
 ) -> Result<()> {
@@ -579,8 +499,6 @@ async fn serve(
         .init();
 
     let identity = load_serve_identity(cert, relay_key, krl)?;
-    let parsed = provider::parse_certificate(&identity.certificate)?;
-    let policy = load_serve_policy(policy, &parsed)?;
     let db_path = mailbox_db.to_str().ok_or(Error::InvalidPath)?;
     let conn = relay::open(db_path)?;
 
@@ -595,10 +513,7 @@ async fn serve(
         eprintln!("TTL file scan: {}", path.display());
     }
 
-    let state = match policy {
-        Some(policy) => AppState::with_identity_and_policy(conn, identity, policy),
-        None => AppState::with_identity(conn, identity),
-    };
+    let state = AppState::with_identity(conn, identity);
     spawn_ttl_scan(state.db.clone(), scan_db, scan_interval_seconds);
 
     axum::serve(listener, relay::router(state))

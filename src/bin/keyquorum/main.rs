@@ -659,23 +659,6 @@ enum RelayCommand {
         #[arg(long, default_value_t = 100)]
         limit: i64,
     },
-    /// Mint a relay API key by proving possession of a hardware signing key
-    Register {
-        /// Relay base URL (or KEYQUORUM_RELAY_URL)
-        #[arg(long)]
-        url: Option<String>,
-        /// Provider group id (must match the host certificate)
-        #[arg(long)]
-        provider_id: String,
-        /// Hardware signing private key file
-        #[arg(long)]
-        hardware_key: PathBuf,
-        /// `inbox.push` (default) or `inbox.pull`
-        #[arg(long)]
-        scope: Option<String>,
-        #[arg(long)]
-        label: Option<String>,
-    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1896,52 +1879,6 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
             if let Some(cursor) = listed.next_after {
                 println!("More envelopes remain; pass --after {cursor} to continue");
             }
-        }
-        RelayCommand::Register {
-            url,
-            provider_id,
-            hardware_key,
-            scope,
-            label,
-        } => {
-            let url = if let Some(url) = url.filter(|s| !s.is_empty()) {
-                db::relay_credential::normalize_url(&url)
-            } else {
-                match std::env::var("KEYQUORUM_RELAY_URL") {
-                    Ok(url) if !url.is_empty() => db::relay_credential::normalize_url(&url),
-                    _ => {
-                        return Err(Error::RelayRequest(
-                            "relay URL required (--url or KEYQUORUM_RELAY_URL)".into(),
-                        ))
-                    }
-                }
-            };
-            relay::validate_relay_url(&url)?;
-            let cert = authenticate_official_relay(&url)?;
-            if cert.provider_id != provider_id {
-                return Err(Error::UnknownProvider);
-            }
-            let secret = read_key_array_32(&hardware_key)?;
-            let (public, signature) = relay::sign_register_proof(&secret, &provider_id)?;
-            let receipt = relay::register_api_key(
-                &url,
-                &provider_id,
-                &relay::RegisterRequest {
-                    public_key: hex::encode(public),
-                    signature: hex::encode(signature),
-                    scope,
-                    label,
-                },
-            )?;
-            let key_hash = relay::hash_bearer(&receipt.token)?;
-            relay::verify_receipt(&cert.relay_public_key, &receipt, &key_hash, &public)?;
-            let check = relay::check_key(&url, &receipt.token)?;
-            persist_checked_key(&conn, &url, &receipt.token, &check)?;
-            println!("Registered API key {} ({})", receipt.id, receipt.scope);
-            println!("provider: {}", receipt.provider_id);
-            println!("hardware: {}", receipt.hardware_fingerprint);
-            println!("registered: {}", receipt.registered_at);
-            println!("token (shown once): {}", receipt.token);
         }
     }
     Ok(())
