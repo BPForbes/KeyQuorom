@@ -456,7 +456,7 @@ async fn register_client_mints_without_a_bearer() {
         let url = url.clone();
         let provider_id = provider_id.clone();
         tokio::task::spawn_blocking(move || {
-            register(
+            relay::register_api_key(
                 &url,
                 &provider_id,
                 &RegisterRequest {
@@ -469,7 +469,7 @@ async fn register_client_mints_without_a_bearer() {
         })
         .await
         .expect("join")
-        .expect("register");
+        .expect("register")
     };
     assert!(receipt.token.starts_with("kq_"));
     assert_eq!(receipt.hardware_fingerprint, keys::fingerprint(&hw_pk));
