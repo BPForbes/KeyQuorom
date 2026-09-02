@@ -119,3 +119,37 @@ fn issue_rejects_empty_hardware_or_networks() {
     .unwrap_err();
     assert!(matches!(err, Error::InvalidProviderPolicy));
 }
+
+#[test]
+fn wifi_policy_does_not_require_a_cidr() {
+    let (root_sk, root_pk) = keys::generate_signing_keypair();
+    let (_, relay_pk) = generate_relay_identity();
+    let fp = keys::fingerprint(&relay_pk);
+    let bytes = issue_policy(
+        &root_sk,
+        &NewPolicy {
+            provider_id: "Acme Security Services",
+            policy_id: "KQP-POL-WIFI",
+            relay_public_key: &relay_pk,
+            issued_at: "2026-01-01 00:00:00",
+            expires_at: "2027-09-02 00:00:00",
+            capabilities: CAP_PROVIDER,
+            hardware_threshold: 1,
+            hardware: &[sample_hardware(&fp, false)],
+            networks: &[CorporateNetwork {
+                network_id: "corp-wifi".into(),
+                mode: NetworkMode::Wifi,
+                cidrs: Vec::new(),
+                ssid: Some("Office".into()),
+                bssid_mac: None,
+                gateway_mac: None,
+                verifier_public_key: None,
+            }],
+            permissions: &[PERM_API_ROOT_GENERATE.to_string()],
+        },
+    )
+    .expect("wifi policy");
+    let policy = verify_policy(&root_pk, &bytes, "2026-09-02 12:00:00").expect("verify");
+    assert_eq!(policy.networks[0].ssid.as_deref(), Some("Office"));
+    assert!(policy.networks[0].cidrs.is_empty());
+}

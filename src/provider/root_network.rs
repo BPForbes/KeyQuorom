@@ -24,6 +24,7 @@ pub struct LocalAddress {
     pub iface: String,
     pub addr: IpAddr,
     pub is_tunnel: bool,
+    pub is_wifi: bool,
 }
 
 pub fn parse_network(spec: &str) -> Result<Network> {
@@ -198,11 +199,12 @@ pub enum NetworkAuthority<'a> {
 pub fn authorize_corporate_network(
     authority: NetworkAuthority<'_>,
     addrs: &[LocalAddress],
+    wifi: &[crate::provider::network::WifiLink],
 ) -> Result<()> {
     match authority {
         NetworkAuthority::CallerCidr(_) => Err(Error::CallerNetworkNotAuthoritative),
         NetworkAuthority::Signed { policy, network_id } => {
-            require_signed_network_presence(policy.corporate_network(network_id)?, addrs)
+            require_signed_network_presence(policy.corporate_network(network_id)?, addrs, wifi)
         }
     }
 }
@@ -210,6 +212,7 @@ pub fn authorize_corporate_network(
 pub fn require_signed_network_presence(
     network: &CorporateNetwork,
     addrs: &[LocalAddress],
+    wifi: &[crate::provider::network::WifiLink],
 ) -> Result<()> {
     match network.mode {
         NetworkMode::Vpn => {
@@ -218,12 +221,47 @@ pub fn require_signed_network_presence(
                 .iter()
                 .map(|cidr| parse_network(cidr))
                 .collect::<Result<Vec<_>>>()?;
-            if !authorized_on_tunnel(&parsed, addrs) {
+            if parsed.is_empty() || !authorized_on_tunnel(&parsed, addrs) {
                 return Err(Error::RootNetworkRequired);
             }
             Ok(())
         }
-        NetworkMode::Wifi | NetworkMode::Ethernet => Err(Error::ProviderNetworkModeUnsupported),
+        NetworkMode::Wifi => {
+            if crate::provider::network::wifi_authorized(network, wifi, addrs)? {
+                Ok(())
+            } else {
+                Err(Error::RootNetworkRequired)
+            }
+        }
+        NetworkMode::Ethernet => Err(Error::ProviderNetworkModeUnsupported),
+    }
+}
+
+/// Ceremony gate for `host root generate`. Caller CIDRs or SSIDs are a
+/// presence check only — they are not production API-root authority.
+pub fn require_root_ceremony(networks: &[Network], ssids: &[String]) -> Result<()> {
+    if networks.is_empty() && ssids.is_empty() {
+        return Err(Error::RootNetworkRequired);
+    }
+    if !networks.is_empty() && authorized_on_tunnel(networks, &list_local_addresses()?) {
+        return Ok(());
+    }
+    if !ssids.is_empty()
+        && crate::provider::network::associated_with_any_ssid(
+            ssids,
+            &crate::provider::network::list_wifi_links()?,
+        )
+    {
+        return Ok(());
+    }
+    Err(Error::RootNetworkRequired)
+}
+
+pub fn optional_networks_from_cli_or_env(cli: &[String]) -> Result<Vec<Network>> {
+    match networks_from_cli_or_env(cli) {
+        Ok(networks) => Ok(networks),
+        Err(Error::RootNetworkRequired) => Ok(Vec::new()),
+        Err(err) => Err(err),
     }
 }
 
@@ -247,10 +285,13 @@ unsafe fn list_local_addresses_getifaddrs() -> Result<Vec<LocalAddress>> {
                     .to_string_lossy()
                     .into_owned();
                 let is_tunnel = is_tunnel_name(&name) || sysfs_is_tunnel(&name);
+                let is_wifi = crate::provider::network::is_wifi_name(&name)
+                    || crate::provider::network::sysfs_is_wifi(&name);
                 out.push(LocalAddress {
                     iface: name,
                     addr,
                     is_tunnel,
+                    is_wifi,
                 });
             }
         }

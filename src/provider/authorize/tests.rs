@@ -2,6 +2,7 @@ use super::*;
 use crate::error::Error;
 use crate::keys::{self, KeyType};
 use crate::provider::hardware_auth::{self, HardwareAuthority, ProviderChallenge};
+use crate::provider::network::WifiLink;
 use crate::provider::policy::{
     issue_policy, CorporateNetwork, HardwareAuthorityEntry, NetworkMode, NewPolicy,
     PERM_API_ROOT_GENERATE,
@@ -23,6 +24,7 @@ fn tunnel(addr: &str) -> LocalAddress {
         iface: "wg0".into(),
         addr: addr.parse::<IpAddr>().unwrap(),
         is_tunnel: true,
+        is_wifi: false,
     }
 }
 
@@ -31,6 +33,24 @@ fn lan(addr: &str) -> LocalAddress {
         iface: "eth0".into(),
         addr: addr.parse::<IpAddr>().unwrap(),
         is_tunnel: false,
+        is_wifi: false,
+    }
+}
+
+fn wifi(addr: &str) -> LocalAddress {
+    LocalAddress {
+        iface: "wlan0".into(),
+        addr: addr.parse::<IpAddr>().unwrap(),
+        is_tunnel: false,
+        is_wifi: true,
+    }
+}
+
+fn wifi_link(ssid: &str) -> WifiLink {
+    WifiLink {
+        iface: "wlan0".into(),
+        ssid: ssid.into(),
+        bssid: Some("aa:bb:cc:dd:ee:ff".into()),
     }
 }
 
@@ -145,6 +165,7 @@ fn request<'a>(
         revoked: empty_revoked(),
         network_id,
         local_addrs: addrs,
+        wifi_links: &[],
         caller_networks,
         hardware_public_key: hardware_public,
         hardware_signature: signature,
@@ -251,6 +272,7 @@ fn caller_supplied_cidr_is_not_production_authority() {
                 crate::provider::root_network::parse_network_list("10.8.0.0/24").unwrap(),
             ),
             &addrs,
+            &[],
         ),
         Err(Error::CallerNetworkNotAuthoritative)
     ));
@@ -492,5 +514,51 @@ fn multiple_corporate_networks_are_or_while_hardware_stays_mandatory() {
             &customer_pk,
         )),
         Err(Error::ProviderHardwareDenied)
+    ));
+}
+
+fn wifi_net(id: &str, ssid: &str) -> CorporateNetwork {
+    CorporateNetwork {
+        network_id: id.into(),
+        mode: NetworkMode::Wifi,
+        cidrs: Vec::new(),
+        ssid: Some(ssid.into()),
+        bssid_mac: None,
+        gateway_mac: None,
+        verifier_public_key: None,
+    }
+}
+
+#[test]
+fn wifi_ssid_authorizes_without_a_fixed_ip_or_tunnel() {
+    let (hw_sk, hw_pk) = keys::generate_signing_keypair();
+    let entry = provider_hw(&keys::fingerprint(&hw_pk));
+    let mut fix = fixture(&[wifi_net("corp-wifi", "Office")], &[entry]);
+    fix.hardware_private = hw_sk;
+    fix.hardware_public = hw_pk;
+    let (signature, nonce) = sign_for(&fix, "corp-wifi");
+    let addrs = [wifi("192.168.47.19")];
+    let links = [wifi_link("Office")];
+    let mut req = request(
+        &fix,
+        "corp-wifi",
+        &addrs,
+        &[],
+        &signature,
+        &nonce,
+        &fix.hardware_public,
+    );
+    req.wifi_links = &links;
+    authorize_api_root_generation(&req).expect("wifi office");
+
+    let other_ip = [wifi("10.1.2.3")];
+    req.local_addrs = &other_ip;
+    authorize_api_root_generation(&req).expect("dhcp moved");
+
+    let guest = [wifi_link("Guest")];
+    req.wifi_links = &guest;
+    assert!(matches!(
+        authorize_api_root_generation(&req),
+        Err(Error::RootNetworkRequired)
     ));
 }

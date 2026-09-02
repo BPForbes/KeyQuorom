@@ -44,18 +44,21 @@ fn only_tunnel_addresses_in_the_cidr_authorize() {
         iface: "wg0".into(),
         addr: "10.8.0.2".parse::<IpAddr>().unwrap(),
         is_tunnel: true,
+        is_wifi: false,
     }];
     assert!(authorized_on_tunnel(&nets, &ok));
     let lan = [LocalAddress {
         iface: "eth0".into(),
         addr: "10.8.0.2".parse::<IpAddr>().unwrap(),
         is_tunnel: false,
+        is_wifi: false,
     }];
     assert!(!authorized_on_tunnel(&nets, &lan));
     let other = [LocalAddress {
         iface: "wg0".into(),
         addr: "192.168.1.9".parse::<IpAddr>().unwrap(),
         is_tunnel: true,
+        is_wifi: false,
     }];
     assert!(!authorized_on_tunnel(&nets, &other));
     assert!(!authorized_on_tunnel(&[], &ok));
@@ -107,6 +110,7 @@ fn signed_vpn_entry_requires_tunnel_and_rejects_caller_cidrs() {
         iface: "wg0".into(),
         addr: "10.8.0.2".parse::<IpAddr>().unwrap(),
         is_tunnel: true,
+        is_wifi: false,
     }];
     authorize_corporate_network(
         NetworkAuthority::Signed {
@@ -114,12 +118,14 @@ fn signed_vpn_entry_requires_tunnel_and_rejects_caller_cidrs() {
             network_id: "corp-vpn",
         },
         &ok,
+        &[],
     )
     .unwrap();
     let lan = [LocalAddress {
         iface: "eth0".into(),
         addr: "10.8.0.2".parse::<IpAddr>().unwrap(),
         is_tunnel: false,
+        is_wifi: false,
     }];
     assert!(matches!(
         authorize_corporate_network(
@@ -128,6 +134,7 @@ fn signed_vpn_entry_requires_tunnel_and_rejects_caller_cidrs() {
                 network_id: "corp-vpn",
             },
             &lan,
+            &[],
         ),
         Err(Error::RootNetworkRequired)
     ));
@@ -135,6 +142,7 @@ fn signed_vpn_entry_requires_tunnel_and_rejects_caller_cidrs() {
         authorize_corporate_network(
             NetworkAuthority::CallerCidr(parse_network_list("10.8.0.0/24").unwrap()),
             &ok,
+            &[],
         ),
         Err(Error::CallerNetworkNotAuthoritative)
     ));

@@ -200,10 +200,29 @@ fn encode_policy_body(spec: &NewPolicy<'_>) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn encode_network(body: &mut Vec<u8>, network: &CorporateNetwork) -> Result<()> {
-    if network.cidrs.is_empty() {
-        return Err(Error::InvalidProviderPolicy);
+fn validate_network(network: &CorporateNetwork) -> Result<()> {
+    match network.mode {
+        NetworkMode::Vpn => {
+            if network.cidrs.is_empty() {
+                return Err(Error::InvalidProviderPolicy);
+            }
+        }
+        NetworkMode::Wifi => {
+            if network.ssid.as_deref().is_none_or(str::is_empty) {
+                return Err(Error::InvalidProviderPolicy);
+            }
+        }
+        NetworkMode::Ethernet => {
+            if network.cidrs.is_empty() {
+                return Err(Error::InvalidProviderPolicy);
+            }
+        }
     }
+    Ok(())
+}
+
+fn encode_network(body: &mut Vec<u8>, network: &CorporateNetwork) -> Result<()> {
+    validate_network(network)?;
     put_str(body, &network.network_id)?;
     body.push(network.mode.to_u8());
     put_u16(body, network.cidrs.len())?;
@@ -317,9 +336,6 @@ fn decode_network(body: &[u8], offset: &mut usize) -> Result<CorporateNetwork> {
     for _ in 0..cidr_count {
         cidrs.push(take_str(body, offset)?);
     }
-    if cidrs.is_empty() {
-        return Err(Error::InvalidProviderPolicy);
-    }
     let ssid = take_opt_str(body, offset)?;
     let bssid_mac = take_opt_str(body, offset)?;
     let gateway_mac = take_opt_str(body, offset)?;
@@ -338,7 +354,7 @@ fn decode_network(body: &[u8], offset: &mut usize) -> Result<CorporateNetwork> {
         }
         _ => return Err(Error::InvalidProviderPolicy),
     };
-    Ok(CorporateNetwork {
+    let network = CorporateNetwork {
         network_id,
         mode,
         cidrs,
@@ -346,7 +362,9 @@ fn decode_network(body: &[u8], offset: &mut usize) -> Result<CorporateNetwork> {
         bssid_mac,
         gateway_mac,
         verifier_public_key,
-    })
+    };
+    validate_network(&network)?;
+    Ok(network)
 }
 
 fn key_type_to_u8(key_type: KeyType) -> Result<u8> {
@@ -386,7 +404,7 @@ fn put_str(out: &mut Vec<u8>, value: &str) -> Result<()> {
 
 fn put_opt_str(out: &mut Vec<u8>, value: Option<&str>) -> Result<()> {
     match value {
-        Some(value) if !value.is_empty() => put_str(out, value),
+        Some(value) if !value.is_empty() => put_len_bytes(out, value.as_bytes()),
         _ => put_len_bytes(out, &[]),
     }
 }
@@ -424,9 +442,6 @@ fn take_opt_str(buf: &[u8], offset: &mut usize) -> Result<Option<String>> {
         return Ok(None);
     }
     let value = std::str::from_utf8(bytes).map_err(|_| Error::InvalidProviderPolicy)?;
-    if !value.is_ascii() {
-        return Err(Error::InvalidProviderPolicy);
-    }
     Ok(Some(value.to_string()))
 }
 

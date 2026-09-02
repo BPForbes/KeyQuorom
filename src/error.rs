@@ -236,7 +236,7 @@ impl fmt::Display for Error {
             Error::InvalidRootNetwork => write!(f, "root-network CIDR is malformed"),
             Error::RootNetworkRequired => write!(
                 f,
-                "provider root keys can only be generated on an authorized VPN tunnel"
+                "this operation requires an authorized Corporate Wi-Fi or VPN presence"
             ),
             Error::InvalidProviderPolicy => {
                 write!(f, "provider policy is missing or invalid")
@@ -245,7 +245,7 @@ impl fmt::Display for Error {
             Error::ProviderNetworkModeUnsupported => {
                 write!(
                     f,
-                    "this Corporate Network mode is not authorized in the VPN-only MVP"
+                    "this Corporate Network mode is not implemented yet"
                 )
             }
             Error::CallerNetworkNotAuthoritative => write!(

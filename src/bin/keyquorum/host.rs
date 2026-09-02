@@ -7,9 +7,9 @@
 //! matching relay private key. It does not mint the `kql_…` API root.
 //! Official API-root minting is `api-root generate`: cert, signed
 //! `provider-policy.kqpolicy`, Corporate Network id, and hardware
-//! proof-of-possession. Caller `--network` CIDRs are a ceremony/dev
-//! presence check for `root generate` only — they are not production
-//! authority.
+//! proof-of-possession. Caller `--network` / `--ssid` values are a
+//! ceremony/dev presence check for `root generate` only — they are not
+//! production authority. Production networks come from the signed policy.
 
 use clap::Subcommand;
 use keyquorum::db;
@@ -116,13 +116,16 @@ pub enum HostCommand {
 
 #[derive(Subcommand)]
 pub enum RootCommand {
-    /// Print the root private key once. Requires --network or KEYQUORUM_ROOT_NETWORKS.
+    /// Print the root private key once. Requires a live VPN CIDR or Wi-Fi SSID.
     Generate {
         #[arg(long)]
         public_key_out: PathBuf,
-        /// Seller VPN CIDR (repeatable). Example: 10.8.0.0/24
+        /// Seller VPN CIDR (repeatable). Ceremony only; not production authority.
         #[arg(long = "network")]
         networks: Vec<String>,
+        /// Seller Wi-Fi SSID (repeatable, or KEYQUORUM_ROOT_SSIDS). Ceremony only.
+        #[arg(long = "ssid")]
+        ssids: Vec<String>,
     },
 }
 
@@ -149,11 +152,16 @@ pub enum PolicyCommand {
         hardware_fingerprints: Vec<String>,
         #[arg(long = "revoked-hardware")]
         revoked_hardware: Vec<String>,
-        /// `id:cidr[,cidr…]` (repeatable). Example: corp-vpn:10.8.0.0/24
+        /// `id` or `id:cidr[,cidr…]` (repeatable). Wi-Fi may omit the CIDR.
         #[arg(long = "corporate-network", required = true)]
         corporate_networks: Vec<String>,
         #[arg(long, default_value = "vpn")]
         network_mode: String,
+        /// Required when `--network-mode wifi`. Not compiled into the binary.
+        #[arg(long)]
+        ssid: Option<String>,
+        #[arg(long)]
+        bssid: Option<String>,
         #[arg(long, default_value_t = 1)]
         hardware_threshold: u8,
         #[arg(long = "permission", default_value = "api-root.generate")]
@@ -389,9 +397,11 @@ fn run_root(command: RootCommand) -> Result<()> {
         RootCommand::Generate {
             public_key_out,
             networks,
+            ssids,
         } => {
-            let networks = provider::root_network::networks_from_cli_or_env(&networks)?;
-            provider::root_network::require_authorized_tunnel(&networks)?;
+            let networks = provider::root_network::optional_networks_from_cli_or_env(&networks)?;
+            let ssids = provider::network::ssids_from_cli_or_env(&ssids);
+            provider::root_network::require_root_ceremony(&networks, &ssids)?;
             let (secret, public) = provider::generate_relay_identity();
             locked_files::write_owner_only(&public_key_out, hex::encode(public).as_bytes())?;
             println!("{}", hex::encode(*secret));
@@ -416,6 +426,8 @@ fn run_policy(command: PolicyCommand) -> Result<()> {
             revoked_hardware,
             corporate_networks,
             network_mode,
+            ssid,
+            bssid,
             hardware_threshold,
             permissions,
             out,
@@ -431,6 +443,8 @@ fn run_policy(command: PolicyCommand) -> Result<()> {
             &revoked_hardware,
             &corporate_networks,
             &network_mode,
+            ssid,
+            bssid,
             hardware_threshold,
             &permissions,
             &out,
@@ -478,6 +492,8 @@ fn run_policy_issue(
     revoked_hardware: &[String],
     corporate_networks: &[String],
     network_mode: &str,
+    ssid: Option<String>,
+    bssid: Option<String>,
     hardware_threshold: u8,
     permissions: &[String],
     out: &Path,
@@ -491,7 +507,7 @@ fn run_policy_issue(
     let capabilities = provider::parse_capabilities(capabilities)?;
     let mode = NetworkMode::parse(network_mode)?;
     let hardware = collect_hardware(hardware_fingerprints, revoked_hardware)?;
-    let networks = collect_networks(corporate_networks, mode)?;
+    let networks = collect_networks(corporate_networks, mode, ssid, bssid)?;
     let bytes = policy::issue_policy(
         &root,
         &NewPolicy {
@@ -534,25 +550,45 @@ fn collect_hardware(
     Ok(out)
 }
 
-fn collect_networks(specs: &[String], mode: NetworkMode) -> Result<Vec<CorporateNetwork>> {
+fn collect_networks(
+    specs: &[String],
+    mode: NetworkMode,
+    ssid: Option<String>,
+    bssid: Option<String>,
+) -> Result<Vec<CorporateNetwork>> {
+    let ssid = ssid.filter(|s| !s.is_empty());
+    let bssid = match bssid.filter(|s| !s.is_empty()) {
+        Some(value) => Some(provider::network::normalize_bssid(&value)?),
+        None => None,
+    };
     let mut out = Vec::new();
     for spec in specs {
-        let (network_id, cidrs) = spec.split_once(':').ok_or(Error::InvalidProviderPolicy)?;
-        let cidrs = cidrs
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if network_id.is_empty() || cidrs.is_empty() {
+        let (network_id, cidrs) = match spec.split_once(':') {
+            Some((id, rest)) => (
+                id,
+                rest.split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ),
+            None => (spec.as_str(), Vec::new()),
+        };
+        if network_id.is_empty() {
+            return Err(Error::InvalidProviderPolicy);
+        }
+        if mode == NetworkMode::Vpn && cidrs.is_empty() {
+            return Err(Error::InvalidProviderPolicy);
+        }
+        if mode == NetworkMode::Wifi && ssid.is_none() {
             return Err(Error::InvalidProviderPolicy);
         }
         out.push(CorporateNetwork {
             network_id: network_id.to_string(),
             mode,
             cidrs,
-            ssid: None,
-            bssid_mac: None,
+            ssid: ssid.clone(),
+            bssid_mac: bssid.clone(),
             gateway_mac: None,
             verifier_public_key: None,
         });
@@ -590,6 +626,7 @@ fn run_api_root_generate(
         hardware_signature,
     )?;
     let local_addrs = provider::root_network::list_local_addresses()?;
+    let wifi_links = provider::network::list_wifi_links()?;
     let revoked = std::collections::HashSet::new();
     let outcome = authorize::authorize_api_root_generation(&ApiRootRequest {
         root_public_key: &KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
@@ -600,6 +637,7 @@ fn run_api_root_generate(
         revoked: &revoked,
         network_id,
         local_addrs: &local_addrs,
+        wifi_links: &wifi_links,
         caller_networks: networks,
         hardware_public_key: &hardware_public_key,
         hardware_signature: &hardware_signature,
