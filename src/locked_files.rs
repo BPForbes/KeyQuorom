@@ -116,7 +116,11 @@ pub fn parse_expires_utc(value: &str) -> Result<String> {
     let day = parse_fixed_digits(date_parts[2], 2).ok_or(Error::InvalidExpiresAt)?;
     let hour = parse_fixed_digits(time_parts[0], 2).ok_or(Error::InvalidExpiresAt)?;
     let minute = parse_fixed_digits(time_parts[1], 2).ok_or(Error::InvalidExpiresAt)?;
-    if year == 0 || month < 1 || month > 12 || hour > 23 || minute > 59 {
+    if year == 0
+        || !(1..=12).contains(&month)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+    {
         return Err(Error::InvalidExpiresAt);
     }
     if day < 1 || day > days_in_month(year, month) {
@@ -213,7 +217,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 }
 
 fn is_leap_year(year: u32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 /// Writes `contents` to a newly created file at `path`, owner-only (0600)
