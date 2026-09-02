@@ -15,8 +15,8 @@ use keyquorum::key_tree::{NodeSpec, TreeNodeSummary};
 use keyquorum::keys::KeyType;
 use keyquorum::pin::ResourceType;
 use keyquorum::{
-    db, export, key_tree, keys, locked_files, pin, private_bridge, quorum, relay, sharing, signing,
-    vault,
+    db, export, key_tree, keys, locked_files, pin, private_bridge, provider, quorum, relay,
+    sharing, signing, vault,
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeSet, HashMap};
@@ -275,7 +275,7 @@ enum Command {
         #[arg(long)]
         url: Option<String>,
     },
-    /// Provider mailbox host. Hidden from --help; not a customer command.
+    /// Provider mailbox host (capability build). Hidden from --help.
     #[cfg(feature = "provider")]
     #[command(hide = true)]
     Host {
@@ -499,6 +499,10 @@ struct AccessPasswordArgs {
     /// PIN and it's prompted for automatically — this flag is unused there.
     #[arg(long, conflicts_with_all = ["id", "output"])]
     pin: bool,
+    /// state 0 only: UTC expiry as `yyyy-mm-dd hh:mm`. After this instant,
+    /// an unlock attempt deletes the ciphertext from disk.
+    #[arg(long, conflicts_with_all = ["id", "output"], value_parser = parse_expires_arg)]
+    expires: Option<String>,
 }
 
 #[derive(Args)]
@@ -590,8 +594,13 @@ enum ShareCommand {
     /// Create a share link for a password-locked file
     CreateFile {
         file_id: i64,
-        #[arg(long, default_value_t = 3600, value_parser = parse_positive_i64)]
-        ttl_seconds: i64,
+        /// Relative lifetime from now. Default 3600 when `--expires` is omitted.
+        #[arg(long, value_parser = parse_positive_i64)]
+        ttl_seconds: Option<i64>,
+        /// UTC expiry as `yyyy-mm-dd hh:mm`. After this instant, redeem or
+        /// unlock deletes the ciphertext from disk.
+        #[arg(long, value_parser = parse_expires_arg)]
+        expires: Option<String>,
         #[arg(long, value_parser = parse_positive_i64)]
         max_uses: Option<i64>,
         #[arg(long)]
@@ -623,6 +632,10 @@ enum RelayCommand {
         /// Push-scope API key (or a key from `loadkey`, or KEYQUORUM_RELAY_API_KEY)
         #[arg(long)]
         api_key: Option<String>,
+        /// UTC expiry as `yyyy-mm-dd hh:mm`. After this instant the mailbox
+        /// host scan (and inbox pull) delete the envelope.
+        #[arg(long, value_parser = parse_expires_arg)]
+        expires: Option<String>,
     },
     /// Download envelopes and the public-tree slice for this pull key
     Pull {
@@ -700,7 +713,7 @@ fn run(db_path: &Path, command: Command) -> Result<()> {
         Command::Host {
             mailbox_db,
             command,
-        } => return host::run(&mailbox_db, command),
+        } => return host::run(&mailbox_db, db_path, command),
         _ => {}
     }
 
@@ -1449,15 +1462,32 @@ fn run_access_password(conn: &Connection, args: AccessPasswordArgs) -> Result<()
             let source = require(args.source, "source");
             let encrypted_path = require(args.encrypted_path, "encrypted-path");
             let password = prompt_secret("Lock password: ")?;
-            let id = locked_files::lock_file(conn, &source, &encrypted_path, &password)?;
+            let expires_at = match args.expires {
+                Some(expires_at) => {
+                    locked_files::require_future_expires_utc(conn, &expires_at)?;
+                    Some(expires_at)
+                }
+                None => None,
+            };
+            let id = locked_files::lock_file_until(
+                conn,
+                &source,
+                &encrypted_path,
+                &password,
+                expires_at.as_deref(),
+            )?;
             if args.pin {
                 let pin_value = prompt_secret("Set a 4-digit PIN: ")?;
                 set_default_pin(conn, ResourceType::LockedFile, id, &pin_value)?;
             }
             println!("Locked file {id}");
+            if let Some(expires_at) = expires_at {
+                println!("Expires at: {expires_at} UTC");
+            }
         }
         1 => {
             let id = require(args.id, "id");
+            locked_files::purge_if_expired(conn, id)?;
             if pin::verification_required(conn, ResourceType::LockedFile, id)? {
                 let pin_value = prompt_secret("PIN: ")?;
                 pin::verify_pin(conn, ResourceType::LockedFile, id, &pin_value)?;
@@ -1593,6 +1623,25 @@ fn persist_checked_key(
     )
 }
 
+/// Official clients verify a KeyQuorum-signed provider certificate before
+/// sending a bearer. A modified relay cannot skip this check.
+fn authenticate_official_relay(url: &str) -> Result<provider::Certificate> {
+    let now = provider::system_now_utc()?;
+    let krl_path = std::env::var("KEYQUORUM_PROVIDER_KRL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let revoked = provider::load_revocation_list(
+        &provider::KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
+        krl_path.as_deref().map(Path::new),
+    )?;
+    relay::authenticate_provider(
+        url,
+        &provider::KEYQUORUM_PROVIDER_ROOT_PUBLIC_KEY,
+        &now,
+        &revoked,
+    )
+}
+
 fn resolve_relay_url(
     conn: &Connection,
     explicit: Option<String>,
@@ -1636,6 +1685,7 @@ fn resolve_relay_auth(
     required: relay::ApiKeyScope,
 ) -> Result<(String, String)> {
     let url = resolve_relay_url(conn, explicit_url, required)?;
+    authenticate_official_relay(&url)?;
     let provided = explicit_key.filter(|s| !s.is_empty()).or_else(|| {
         match std::env::var("KEYQUORUM_RELAY_API_KEY") {
             Ok(key) if !key.is_empty() => Some(key),
@@ -1691,6 +1741,7 @@ fn run_loadkey(db_path: &Path, api_key: Option<String>, url: Option<String>) -> 
         }
     };
     relay::validate_relay_url(&url)?;
+    authenticate_official_relay(&url)?;
     let token = match api_key.filter(|s| !s.is_empty()) {
         Some(token) => token,
         None => prompt_secret("Relay API key: ")?,
@@ -1710,7 +1761,15 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
     let db_path_str = db_path.to_str().ok_or(Error::InvalidPath)?;
     let conn = db::open(db_path_str)?;
     match command {
-        RelayCommand::Push { dir, url, api_key } => {
+        RelayCommand::Push {
+            dir,
+            url,
+            api_key,
+            expires,
+        } => {
+            if let Some(expires) = expires.as_deref() {
+                locked_files::require_future_expires_utc(&conn, expires)?;
+            }
             let (url, api_key) =
                 resolve_relay_auth(&conn, url, api_key, relay::ApiKeyScope::InboxPush)?;
             let trees = export_local_public_trees(&conn)?;
@@ -1723,10 +1782,18 @@ fn run_relay(db_path: &Path, command: RelayCommand) -> Result<()> {
                     continue;
                 }
                 let bytes = fs::read(&path)?;
-                let accepted = if trees.is_empty() || uploaded > 0 {
-                    relay::push_inbox(&url, &api_key, &bytes)?
+                let attach_trees = !trees.is_empty() && uploaded == 0;
+                let accepted = if expires.is_some() || attach_trees {
+                    let trees = if attach_trees { trees.as_slice() } else { &[] };
+                    relay::push_inbox_with_trees_until(
+                        &url,
+                        &api_key,
+                        &bytes,
+                        trees,
+                        expires.as_deref(),
+                    )?
                 } else {
-                    relay::push_inbox_with_trees(&url, &api_key, &bytes, &trees)?
+                    relay::push_inbox(&url, &api_key, &bytes)?
                 };
                 println!(
                     "{} -> id {} ({})",
@@ -1856,11 +1923,26 @@ fn run_share(conn: &Connection, command: ShareCommand) -> Result<()> {
         ShareCommand::CreateFile {
             file_id,
             ttl_seconds,
+            expires,
             max_uses,
             pin: set_pin_flag,
             pin_required_every_use,
         } => {
-            let share = sharing::create_file_share(conn, file_id, ttl_seconds, max_uses)?;
+            if ttl_seconds.is_some() && expires.is_some() {
+                fatal_usage_error("use --expires or --ttl-seconds, not both");
+            }
+            let share = match expires {
+                Some(raw) => {
+                    locked_files::require_future_expires_utc(conn, &raw)?;
+                    sharing::create_file_share_until(conn, file_id, &raw, max_uses)?
+                }
+                None => sharing::create_file_share(
+                    conn,
+                    file_id,
+                    ttl_seconds.unwrap_or(3600),
+                    max_uses,
+                )?,
+            };
             if set_pin_flag {
                 let pin_value = prompt_secret("Set a 4-digit PIN for this share: ")?;
                 pin::set_pin(
@@ -1886,6 +1968,7 @@ fn run_share(conn: &Connection, command: ShareCommand) -> Result<()> {
         }
         ShareCommand::RedeemFile => {
             let token = prompt_secret("File share token: ")?;
+            sharing::purge_expired_file_share(conn, &token)?;
             let share_id = sharing::file_share_id_for_token(conn, &token)?;
             if pin::verification_required(conn, ResourceType::FileShare, share_id)? {
                 let pin_value = prompt_secret("PIN: ")?;
@@ -2641,6 +2724,10 @@ fn parse_positive_i64(value: &str) -> std::result::Result<i64, String> {
     } else {
         Err("must be greater than zero".to_owned())
     }
+}
+
+fn parse_expires_arg(value: &str) -> std::result::Result<String, String> {
+    locked_files::parse_expires_utc(value).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]

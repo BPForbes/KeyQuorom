@@ -5,9 +5,8 @@
 -- (the full org context). Pushing envelopes updates those documents.
 -- Personal devices translate a sliced copy into local SQLite.
 
--- One issuer credential for the KeyQuorum licensee. Customer API keys are
--- minted only with this secret via host-local `keys` on the mailbox; HTTP cannot
--- create or rotate bearers. The table stores `hex(SHA-256(raw))` only.
+-- Legacy single-row issuer table. New mailboxes leave this empty.
+-- API keys are not minted over HTTP.
 CREATE TABLE IF NOT EXISTS licensee_issuer (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     key_hash    TEXT NOT NULL,
@@ -36,6 +35,9 @@ CREATE TABLE IF NOT EXISTS mailbox (
     envelope                BLOB NOT NULL,
     content_hash            TEXT NOT NULL,
     created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- UTC cutoff `YYYY-MM-DD HH:MM:00`. NULL means the envelope does not expire.
+    -- The host scan (and inbox pull) delete expired rows so they cannot be fetched.
+    expires_at              TEXT,
     UNIQUE (recipient_fingerprint, content_hash)
 );
 
@@ -48,4 +50,18 @@ CREATE TABLE IF NOT EXISTS org_tree_docs (
     generation    INTEGER NOT NULL CHECK (generation > 0),
     document      TEXT NOT NULL,
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- Privileged provider-auth attempts. Never store bearers, private keys,
+-- challenge nonces, or other reusable secrets.
+CREATE TABLE IF NOT EXISTS provider_auth_events (
+    id                      INTEGER PRIMARY KEY,
+    operation               TEXT NOT NULL,
+    provider_id             TEXT,
+    network_id              TEXT,
+    hardware_fingerprints   TEXT,
+    success                 INTEGER NOT NULL CHECK (success IN (0, 1)),
+    attempted_at            TEXT NOT NULL DEFAULT (
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
 );

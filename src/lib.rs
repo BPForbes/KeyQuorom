@@ -7,6 +7,7 @@ pub mod keys;
 pub mod locked_files;
 pub mod pin;
 pub mod private_bridge;
+pub mod provider;
 pub mod pss;
 pub mod quorum;
 pub mod relay;

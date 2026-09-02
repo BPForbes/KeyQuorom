@@ -12,9 +12,49 @@ fn share_options_reject_unusable_limits() {
             "0",
         ],
         ["keyquorum", "share", "create-file", "1", "--max-uses", "-1"],
+        [
+            "keyquorum",
+            "share",
+            "create-file",
+            "1",
+            "--expires",
+            "2026-12-31",
+        ],
+        [
+            "keyquorum",
+            "share",
+            "create-file",
+            "1",
+            "--expires",
+            "2026-13-01 00:00",
+        ],
     ] {
         assert!(Cli::try_parse_from(args).is_err());
     }
+
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "share",
+        "create-file",
+        "1",
+        "--expires",
+        "2026-12-31 23:59",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "access",
+        "password",
+        "--state",
+        "0",
+        "--source",
+        "secret.txt",
+        "--encrypted-path",
+        "secret.txt.kqenc",
+        "--expires",
+        "2026-12-31 23:59",
+    ])
+    .is_ok());
 }
 
 #[test]
@@ -415,6 +455,165 @@ fn provider_host_keys_list_parses() {
         "127.0.0.1:0",
     ])
     .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "serve",
+        "--scan-db",
+        "org.sqlite",
+        "--scan-interval-seconds",
+        "15",
+    ])
+    .is_ok());
+    assert!(
+        Cli::try_parse_from(["keyquorum", "host", "serve", "--scan-interval-seconds", "0",])
+            .is_err()
+    );
+}
+
+#[cfg(feature = "provider")]
+#[test]
+fn provider_host_identity_and_certify_parse() {
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "identity",
+        "generate",
+        "--public-key-out",
+        "relay.pub",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "certify",
+        "--relay-public-key",
+        "relay.pub",
+        "--provider-id",
+        "acme",
+        "--serial",
+        "KQP-1",
+        "--expires-at",
+        "2027-09-02 00:00:00",
+        "--out",
+        "provider.kqcert",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "krl",
+        "--serial",
+        "KQP-1",
+        "--out",
+        "revocations.kqrl",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "serve",
+        "--cert",
+        "provider.kqcert",
+        "--relay-key",
+        "relay.key",
+        "--krl",
+        "revocations.kqrl",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "root",
+        "generate",
+        "--public-key-out",
+        "provider-root.pub",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "root",
+        "generate",
+        "--public-key-out",
+        "provider-root.pub",
+        "--network",
+        "10.8.0.0/24",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "root",
+        "generate",
+        "--public-key-out",
+        "provider-root.pub",
+        "--ssid",
+        "Office",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "policy",
+        "issue",
+        "--relay-public-key",
+        "relay.pub",
+        "--provider-id",
+        "acme",
+        "--policy-id",
+        "KQP-POL-1",
+        "--expires-at",
+        "2027-09-02 00:00:00",
+        "--hardware-fingerprint",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--out",
+        "provider.kqpolicy",
+    ])
+    .is_ok());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "policy",
+        "issue",
+        "--relay-public-key",
+        "relay.pub",
+        "--provider-id",
+        "acme",
+        "--policy-id",
+        "KQP-POL-1",
+        "--expires-at",
+        "2027-09-02 00:00:00",
+        "--hardware-fingerprint",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--corporate-network",
+        "corp-vpn:10.8.0.0/24",
+        "--out",
+        "provider.kqpolicy",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "relay",
+        "register",
+        "--url",
+        "http://127.0.0.1:8787",
+        "--provider-id",
+        "acme",
+        "--hardware-key",
+        "hw.key",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "keyquorum",
+        "host",
+        "keys",
+        "create",
+        "--scope",
+        "inbox.push",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from(["keyquorum", "host", "keys", "rotate", "--id", "1"]).is_err());
 }
 
 #[cfg(feature = "provider")]

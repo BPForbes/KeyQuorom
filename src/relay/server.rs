@@ -3,7 +3,7 @@
 use super::api_key::{self, ApiKeyInfo, ApiKeyScope};
 use super::client::{
     ErrorBody, InboxAccepted, InboxEnvelope, InboxList, InboxPush, KeyCheckRequest,
-    KeyCheckResponse,
+    KeyCheckResponse, ProviderIdentityRequest, ProviderIdentityResponse,
 };
 use super::mailbox;
 use super::org_tree;
@@ -26,19 +26,39 @@ use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
+use zeroize::Zeroizing;
 
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
+
+/// Live provider identity presented on `POST /provider-identity`.
+pub struct ProviderIdentity {
+    pub certificate: Vec<u8>,
+    pub relay_private_key: Zeroizing<[u8; 32]>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    identity: Option<Arc<ProviderIdentity>>,
 }
 
 impl AppState {
     pub fn new(conn: Connection) -> Self {
         Self {
             db: Arc::new(Mutex::new(conn)),
+            identity: None,
         }
+    }
+
+    pub fn with_identity(conn: Connection, identity: ProviderIdentity) -> Self {
+        Self {
+            db: Arc::new(Mutex::new(conn)),
+            identity: Some(Arc::new(identity)),
+        }
+    }
+
+    pub fn identity(&self) -> Option<Arc<ProviderIdentity>> {
+        self.identity.clone()
     }
 }
 
@@ -108,14 +128,23 @@ impl From<Error> for ApiError {
             | Error::InvalidInboxPage
             | Error::InvalidBridgePackage
             | Error::InvalidPublicKey
+            | Error::SignatureVerificationFailed
             | Error::InvalidTreeSpec
             | Error::DuplicateNodeLabel
-            | Error::InvalidBridge => Self {
+            | Error::InvalidBridge
+            | Error::InvalidProviderChallenge
+            | Error::InvalidExpiresAt
+            | Error::ExpiresAtInPast
+            | Error::WrongKeyType => Self {
                 status: StatusCode::BAD_REQUEST,
                 message: err.to_string(),
             },
             Error::ApiKeyNotFound | Error::TreeNotFound | Error::NodeNotFound => Self {
                 status: StatusCode::NOT_FOUND,
+                message: err.to_string(),
+            },
+            Error::ProviderIdentityMissing => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
                 message: err.to_string(),
             },
             Error::BundleFieldTooLarge => Self {
@@ -224,7 +253,8 @@ impl Modify for SecurityAddon {
         list_keys,
         revoke_key,
         put_tree,
-        get_tree_context
+        get_tree_context,
+        post_provider_identity
     ),
     components(
         schemas(
@@ -239,14 +269,17 @@ impl Modify for SecurityAddon {
             ApiKeyView,
             PublicTree,
             PublicNode,
-            PublicEdge
+            PublicEdge,
+            ProviderIdentityRequest,
+            ProviderIdentityResponse
         )
     ),
     modifiers(&SecurityAddon),
     tags(
         (name = "inbox", description = "Opaque .kqpb envelope mailbox"),
-        (name = "api-keys", description = "List and revoke API keys; minting is licensee-only on the host"),
-        (name = "trees", description = "Canonical public split-tree topology")
+        (name = "api-keys", description = "List and revoke API keys"),
+        (name = "trees", description = "Canonical public split-tree topology"),
+        (name = "provider", description = "KeyQuorum-signed relay identity")
     )
 )]
 struct ApiDoc;
@@ -259,6 +292,35 @@ struct ApiDoc;
 )]
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+#[utoipa::path(
+    post,
+    path = "/provider-identity",
+    tag = "provider",
+    request_body = ProviderIdentityRequest,
+    responses(
+        (status = 200, description = "Certificate plus signature over the challenge", body = ProviderIdentityResponse),
+        (status = 400, description = "Challenge is not 32 bytes", body = ErrorBody),
+        (status = 503, description = "Host has no provider identity", body = ErrorBody)
+    )
+)]
+async fn post_provider_identity(
+    State(state): State<AppState>,
+    Json(body): Json<ProviderIdentityRequest>,
+) -> Result<Json<ProviderIdentityResponse>, ApiError> {
+    let identity = state
+        .identity
+        .clone()
+        .ok_or(Error::ProviderIdentityMissing)?;
+    let challenge = STANDARD
+        .decode(body.challenge.as_bytes())
+        .map_err(|_| Error::InvalidProviderChallenge)?;
+    let signature = crate::provider::sign_challenge(&identity.relay_private_key, &challenge)?;
+    Ok(Json(ProviderIdentityResponse {
+        certificate: STANDARD.encode(&identity.certificate),
+        signature: STANDARD.encode(signature),
+    }))
 }
 
 fn keycheck_response(check: api_key::KeyCheck) -> KeyCheckResponse {
@@ -320,17 +382,20 @@ async fn post_inbox(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<InboxAccepted>), ApiError> {
-    let (envelope, trees) = parse_inbox_body(&headers, &body)?;
-    if envelope.len() > MAX_ENVELOPE_BYTES {
+    let parsed = parse_inbox_body(&headers, &body)?;
+    if parsed.envelope.len() > MAX_ENVELOPE_BYTES {
         return Err(Error::BundleFieldTooLarge.into());
     }
     let (id, fingerprint, duplicate) = with_conn(&state, move |conn| {
         api_key::authenticate(conn, &token, ApiKeyScope::InboxPush)?;
         crate::db::with_immediate_transaction(conn, || {
-            for tree in &trees {
+            if let Some(expires_at) = parsed.expires_at.as_deref() {
+                crate::locked_files::require_future_expires_utc(conn, expires_at)?;
+            }
+            for tree in &parsed.trees {
                 org_tree::merge_public_tree(conn, tree)?;
             }
-            mailbox::store(conn, &envelope)
+            mailbox::store_until(conn, &parsed.envelope, parsed.expires_at.as_deref())
         })
     })
     .await?;
@@ -348,10 +413,13 @@ async fn post_inbox(
     ))
 }
 
-fn parse_inbox_body(
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<(Vec<u8>, Vec<PublicTree>), ApiError> {
+struct ParsedInbox {
+    envelope: Vec<u8>,
+    trees: Vec<PublicTree>,
+    expires_at: Option<String>,
+}
+
+fn parse_inbox_body(headers: &HeaderMap, body: &[u8]) -> Result<ParsedInbox, ApiError> {
     let is_json = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -363,13 +431,25 @@ fn parse_inbox_body(
                 .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"))
         });
     if !is_json {
-        return Ok((body.to_vec(), Vec::new()));
+        return Ok(ParsedInbox {
+            envelope: body.to_vec(),
+            trees: Vec::new(),
+            expires_at: None,
+        });
     }
     let push: InboxPush = serde_json::from_slice(body).map_err(|_| Error::InvalidBridgePackage)?;
+    let expires_at = match push.expires_at {
+        Some(raw) => Some(crate::locked_files::parse_expires_utc(&raw)?),
+        None => None,
+    };
     let envelope = STANDARD
         .decode(push.bytes.as_bytes())
         .map_err(|_| Error::InvalidBridgePackage)?;
-    Ok((envelope, push.trees))
+    Ok(ParsedInbox {
+        envelope,
+        trees: push.trees,
+        expires_at,
+    })
 }
 
 #[utoipa::path(
@@ -522,6 +602,7 @@ pub fn router(state: AppState) -> Router {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
         .route("/keycheck", post(post_keycheck))
+        .route("/provider-identity", post(post_provider_identity))
         .route("/inbox", post(post_inbox).get(get_inbox))
         .route("/api-keys", get(list_keys))
         .route("/api-keys/{id}/revoke", post(revoke_key))

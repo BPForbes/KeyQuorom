@@ -150,7 +150,10 @@ CREATE TABLE IF NOT EXISTS password_locked_files (
     encrypted_path    TEXT NOT NULL UNIQUE,
     kdf_salt          BLOB NOT NULL,
     nonce             BLOB NOT NULL,
-    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- UTC cutoff `YYYY-MM-DD HH:MM:00`. NULL means the file does not expire.
+    -- A late unlock or share redemption deletes the ciphertext from disk.
+    expires_at        TEXT
 );
 
 -- Time-limited, revocable share links. Only a hash of each share's bearer

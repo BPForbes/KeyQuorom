@@ -1,7 +1,8 @@
 use super::super::test_helpers::*;
-use super::{router, AppState, MAX_ENVELOPE_BYTES};
+use super::{router, AppState, ProviderIdentity, MAX_ENVELOPE_BYTES};
 use crate::key_tree::PublicTree;
 use crate::keys;
+use crate::provider::test_helpers::issued_identity;
 use crate::relay::{self, ApiKeyScope, NewApiKey};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -47,6 +48,11 @@ async fn router_health_and_openapi_are_public() {
     assert!(json["paths"]["/api-keys"].is_object());
     assert!(json["paths"]["/keycheck"].is_object());
     assert!(json["paths"]["/keycheck"]["post"].get("security").is_none());
+    assert!(json["paths"]["/api/v1/{provider_id}/register"].is_null());
+    assert!(json["paths"]["/provider-identity"].is_object());
+    assert!(json["paths"]["/provider-identity"]["post"]
+        .get("security")
+        .is_none());
     assert!(json["components"]["securitySchemes"]["api_key"].is_object());
 }
 
@@ -262,6 +268,7 @@ async fn push_rolls_back_trees_and_envelope_when_a_later_tree_is_invalid() {
     let body = serde_json::to_vec(&relay::InboxPush {
         bytes: STANDARD.encode(&envelope),
         trees: vec![good, cyclic],
+        expires_at: None,
     })
     .unwrap();
     let app = router(AppState::new(conn));
@@ -545,4 +552,144 @@ async fn keycheck_route_is_public() {
         .unwrap();
     assert_eq!(unknown.status(), StatusCode::OK);
     assert_eq!(body_json(unknown).await["valid"], false);
+}
+
+#[tokio::test]
+async fn inbox_pull_drops_expired_envelopes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, fingerprint) = sample_envelope();
+    relay::store_until(&conn, &envelope, Some("2099-12-31 23:59:00")).expect("store");
+    conn.execute(
+        "UPDATE mailbox SET expires_at = datetime('now', '-1 minutes')",
+        [],
+    )
+    .expect("expire");
+    let pull = pull_key(&conn, &fingerprint);
+    let app = router(AppState::new(conn));
+    let got = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {pull}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let json = body_json(got).await;
+    assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn inbox_push_rejects_a_past_expires() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, _) = sample_envelope();
+    let push = push_key(&conn);
+    let app = router(AppState::new(conn));
+    let body = serde_json::to_vec(&relay::InboxPush {
+        bytes: STANDARD.encode(&envelope),
+        trees: vec![],
+        expires_at: Some("2000-01-01 00:00:00".into()),
+    })
+    .unwrap();
+    let denied = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/inbox")
+                .header("Authorization", format!("Bearer {push}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn provider_identity_is_unavailable_without_configured_identity() {
+    let conn = relay::open_in_memory().expect("schema");
+    let app = router(AppState::new(conn));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/provider-identity")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn provider_identity_signs_a_valid_challenge() {
+    let issued = issued_identity("2027-09-02 00:00:00");
+    let conn = relay::open_in_memory().expect("schema");
+    let app = router(AppState::with_identity(
+        conn,
+        ProviderIdentity {
+            certificate: issued.certificate.clone(),
+            relay_private_key: issued.relay_private.clone(),
+        },
+    ));
+    let challenge = crate::provider::random_challenge();
+    let body = serde_json::json!({
+        "challenge": STANDARD.encode(challenge)
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/provider-identity")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    let cert = STANDARD
+        .decode(json["certificate"].as_str().expect("cert"))
+        .expect("cert b64");
+    let signature: [u8; 64] = STANDARD
+        .decode(json["signature"].as_str().expect("sig"))
+        .expect("sig b64")
+        .try_into()
+        .expect("64");
+    let parsed = crate::provider::parse_certificate(&cert).expect("parse");
+    crate::provider::verify_challenge(&parsed, &challenge, &signature).expect("sig");
+}
+
+#[tokio::test]
+async fn provider_identity_rejects_a_short_challenge() {
+    let issued = issued_identity("2027-09-02 00:00:00");
+    let conn = relay::open_in_memory().expect("schema");
+    let app = router(AppState::with_identity(
+        conn,
+        ProviderIdentity {
+            certificate: issued.certificate,
+            relay_private_key: issued.relay_private,
+        },
+    ));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/provider-identity")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"challenge":"AAAA"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

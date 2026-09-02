@@ -11,6 +11,9 @@ pub enum Error {
     ShareExpired,
     ShareRevoked,
     ShareExhausted,
+    InvalidExpiresAt,
+    ExpiresAtInPast,
+    FileExpired,
     IntegrityCheckFailed,
     QuorumNotMet,
     InvalidQuorumThreshold,
@@ -48,11 +51,27 @@ pub enum Error {
     ApiKeyScopeDenied,
     ApiKeyNotFound,
     InvalidLicenseeKey,
+    UnknownProvider,
     OrganizationDatabase,
     InvalidInboxPage,
     RelayRequest(String),
     TreeNotFound,
     StalePublicTree,
+    InvalidProviderCertificate,
+    ProviderCertificateRevoked,
+    ProviderCertificateExpired,
+    ProviderCapabilityDenied,
+    RelayIdentityMismatch,
+    InvalidProviderChallenge,
+    UntrustedRelay,
+    ProviderIdentityMissing,
+    ProviderPolicyMissing,
+    InvalidProviderPolicy,
+    ProviderPolicyExpired,
+    ProviderHardwareDenied,
+    ProviderHardwareRevoked,
+    ApiRootMissing,
+    ApiRootAlreadyExists,
 }
 
 impl fmt::Display for Error {
@@ -67,6 +86,13 @@ impl fmt::Display for Error {
             Error::ShareExpired => write!(f, "share link has expired"),
             Error::ShareRevoked => write!(f, "share link has been revoked"),
             Error::ShareExhausted => write!(f, "share link has reached its use limit"),
+            Error::InvalidExpiresAt => {
+                write!(f, "expiry must be yyyy-mm-dd hh:mm (UTC)")
+            }
+            Error::ExpiresAtInPast => write!(f, "expiry must be a future UTC time"),
+            Error::FileExpired => {
+                write!(f, "file has expired and has been removed from disk")
+            }
             Error::IntegrityCheckFailed => write!(f, "decrypted content failed integrity check"),
             Error::QuorumNotMet => write!(f, "not enough valid shares to reconstruct this key"),
             Error::InvalidQuorumThreshold => {
@@ -163,6 +189,7 @@ impl fmt::Display for Error {
                     "invalid licensee key; only the licensee can mint or rotate API keys"
                 )
             }
+            Error::UnknownProvider => write!(f, "provider id does not match this mailbox"),
             Error::OrganizationDatabase => write!(
                 f,
                 "this SQLite file is an organization database; the mailbox needs a separate database"
@@ -177,6 +204,59 @@ impl fmt::Display for Error {
                     f,
                     "public tree generation is older than the copy already stored"
                 )
+            }
+            Error::InvalidProviderCertificate => {
+                write!(f, "provider certificate is missing or invalid")
+            }
+            Error::ProviderCertificateRevoked => {
+                write!(f, "provider certificate has been revoked")
+            }
+            Error::ProviderCertificateExpired => write!(f, "provider certificate has expired"),
+            Error::ProviderCapabilityDenied => {
+                write!(f, "provider certificate lacks required capabilities")
+            }
+            Error::RelayIdentityMismatch => {
+                write!(
+                    f,
+                    "relay private key does not match the provider certificate"
+                )
+            }
+            Error::InvalidProviderChallenge => write!(f, "provider identity challenge is invalid"),
+            Error::UntrustedRelay => write!(
+                f,
+                "relay did not present a trusted KeyQuorum provider identity"
+            ),
+            Error::ProviderIdentityMissing => {
+                write!(
+                    f,
+                    "mailbox host is not configured with a provider identity"
+                )
+            }
+            Error::ProviderPolicyMissing => {
+                write!(
+                    f,
+                    "mailbox host is not configured with a provider policy"
+                )
+            }
+            Error::InvalidProviderPolicy => {
+                write!(f, "provider policy is missing or invalid")
+            }
+            Error::ProviderPolicyExpired => write!(f, "provider policy has expired"),
+            Error::ProviderHardwareDenied => {
+                write!(
+                    f,
+                    "provider hardware is missing, unauthorized, or failed the possession challenge"
+                )
+            }
+            Error::ProviderHardwareRevoked => {
+                write!(f, "provider hardware has been revoked")
+            }
+            Error::ApiRootMissing => write!(
+                f,
+                "API root has not been generated"
+            ),
+            Error::ApiRootAlreadyExists => {
+                write!(f, "API root already exists on this mailbox")
             }
         }
     }

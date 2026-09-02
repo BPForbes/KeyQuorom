@@ -172,6 +172,49 @@ fn mailbox_list_after_pages_and_rejects_invalid_limits() {
 }
 
 #[test]
+fn mailbox_scan_deletes_expired_envelopes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (live, fingerprint) = sample_envelope();
+    relay::store_until(&conn, &live, Some("2099-12-31 23:59:00")).expect("store live");
+    let (_sk, pk) = keys::generate_encryption_keypair();
+    let dead = fake_kqpb(pk, b"stale");
+    let dead_fp = keys::fingerprint(&pk);
+    relay::store_until(&conn, &dead, Some("2099-12-31 23:59:00")).expect("store dead");
+    conn.execute(
+        "UPDATE mailbox SET expires_at = datetime('now', '-1 minutes')
+         WHERE recipient_fingerprint = ?1",
+        rusqlite::params![dead_fp],
+    )
+    .expect("stamp past expiry");
+
+    let purged = relay::purge_expired_envelopes(&conn).expect("scan");
+    assert_eq!(purged, 1);
+    let live_page = relay::list_after(&conn, &fingerprint, None, None).expect("list live");
+    assert_eq!(live_page.envelopes.len(), 1);
+    let dead_page = relay::list_after(&conn, &dead_fp, None, None).expect("list dead");
+    assert!(dead_page.envelopes.is_empty());
+}
+
+#[test]
+fn mailbox_list_hides_expired_envelopes() {
+    let conn = relay::open_in_memory().expect("schema");
+    let (envelope, fingerprint) = sample_envelope();
+    relay::store_until(&conn, &envelope, Some("2099-12-31 23:59:00")).expect("store");
+    conn.execute(
+        "UPDATE mailbox SET expires_at = datetime('now', '-1 minutes')",
+        [],
+    )
+    .expect("stamp past expiry");
+
+    let listed = relay::list_after(&conn, &fingerprint, None, None).expect("list");
+    assert!(listed.envelopes.is_empty());
+    let remaining: i64 = conn
+        .query_row("SELECT count(*) FROM mailbox", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
 fn mailbox_rejects_truncated_and_wrong_magic() {
     let conn = relay::open_in_memory().expect("schema");
     assert!(matches!(
@@ -185,50 +228,40 @@ fn mailbox_rejects_truncated_and_wrong_magic() {
 }
 
 #[test]
-fn bootstrap_licensee_only_when_empty() {
+fn provider_auth_audit_has_no_secrets() {
     let conn = relay::open_in_memory().expect("schema");
-    let first = relay::bootstrap_licensee_if_empty(&conn)
-        .expect("bootstrap")
-        .expect("created");
-    assert!(first.token.starts_with("kql_"));
-    assert!(relay::bootstrap_licensee_if_empty(&conn)
-        .expect("second")
-        .is_none());
-    relay::authenticate_licensee(&conn, &first.token).expect("licensee works");
-    assert!(matches!(
-        relay::authenticate_licensee(&conn, "kq_notarealtokenvalue0123456789ABCD"),
-        Err(Error::InvalidLicenseeKey)
-    ));
-}
-
-#[test]
-fn supplied_licensee_key_does_not_bootstrap_an_empty_issuer_store() {
-    let conn = relay::open_in_memory().expect("schema");
-    assert!(matches!(
-        relay::authorize_licensee_or_bootstrap(
-            &conn,
-            Some("kql_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-        ),
-        Err(Error::InvalidLicenseeKey)
-    ));
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))
-        .expect("count");
-    assert_eq!(n, 0);
-    assert!(matches!(
-        relay::authorize_licensee_or_bootstrap(&conn, Some("")),
-        Err(Error::InvalidLicenseeKey)
-    ));
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM licensee_issuer", [], |row| row.get(0))
-        .expect("count after empty");
-    assert_eq!(n, 0);
-    let created = relay::authorize_licensee_or_bootstrap(&conn, None)
-        .expect("bootstrap")
-        .expect("created");
-    let again = relay::authorize_licensee_or_bootstrap(&conn, Some(&created.token))
-        .expect("supplied key authenticates");
-    assert!(again.is_none());
+    let created = relay::create_api_key(
+        &conn,
+        &relay::NewApiKey {
+            scope: relay::ApiKeyScope::InboxPush,
+            recipient_fingerprint: None,
+            label: Some("desk".into()),
+            ttl_seconds: None,
+        },
+    )
+    .expect("mint");
+    relay::record_provider_auth_event(&conn, "register", Some("Acme"), None, Some("abcd"), true)
+        .expect("audit");
+    let (op, success, fingerprint): (String, i64, String) = conn
+        .query_row(
+            "SELECT operation, success, hardware_fingerprints FROM provider_auth_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("row");
+    assert_eq!(op, "register");
+    assert_eq!(success, 1);
+    assert_eq!(fingerprint, "abcd");
+    let token_hits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM provider_auth_events
+             WHERE operation = ?1 OR provider_id = ?1 OR network_id = ?1
+                OR hardware_fingerprints = ?1",
+            [created.token.as_str()],
+            |row| row.get(0),
+        )
+        .expect("token search");
+    assert_eq!(token_hits, 0);
 }
 
 #[test]
