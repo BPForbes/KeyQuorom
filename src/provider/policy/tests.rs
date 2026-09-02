@@ -98,7 +98,7 @@ fn sqlite_style_tamper_cannot_invent_policy_fields() {
 }
 
 #[test]
-fn issue_rejects_empty_hardware_or_networks() {
+fn issue_rejects_empty_hardware() {
     let (root_sk, _) = keys::generate_signing_keypair();
     let (_, relay_pk) = generate_relay_identity();
     let err = issue_policy(
@@ -112,7 +112,7 @@ fn issue_rejects_empty_hardware_or_networks() {
             capabilities: CAP_PROVIDER,
             hardware_threshold: 1,
             hardware: &[],
-            networks: &[sample_network("corp-vpn", "10.8.0.0/24")],
+            networks: &[],
             permissions: &[PERM_API_ROOT_GENERATE.to_string()],
         },
     )
@@ -121,7 +121,7 @@ fn issue_rejects_empty_hardware_or_networks() {
 }
 
 #[test]
-fn wifi_policy_does_not_require_a_cidr() {
+fn issue_allows_empty_networks() {
     let (root_sk, root_pk) = keys::generate_signing_keypair();
     let (_, relay_pk) = generate_relay_identity();
     let fp = keys::fingerprint(&relay_pk);
@@ -129,27 +129,18 @@ fn wifi_policy_does_not_require_a_cidr() {
         &root_sk,
         &NewPolicy {
             provider_id: "Acme Security Services",
-            policy_id: "KQP-POL-WIFI",
+            policy_id: "KQP-POL-1",
             relay_public_key: &relay_pk,
             issued_at: "2026-01-01 00:00:00",
             expires_at: "2027-09-02 00:00:00",
             capabilities: CAP_PROVIDER,
             hardware_threshold: 1,
             hardware: &[sample_hardware(&fp, false)],
-            networks: &[CorporateNetwork {
-                network_id: "corp-wifi".into(),
-                mode: NetworkMode::Wifi,
-                cidrs: Vec::new(),
-                ssid: Some("Office".into()),
-                bssid_mac: None,
-                gateway_mac: None,
-                verifier_public_key: None,
-            }],
+            networks: &[],
             permissions: &[PERM_API_ROOT_GENERATE.to_string()],
         },
     )
-    .expect("wifi policy");
+    .expect("empty networks");
     let policy = verify_policy(&root_pk, &bytes, "2026-09-02 12:00:00").expect("verify");
-    assert_eq!(policy.networks[0].ssid.as_deref(), Some("Office"));
-    assert!(policy.networks[0].cidrs.is_empty());
+    assert!(policy.networks.is_empty());
 }

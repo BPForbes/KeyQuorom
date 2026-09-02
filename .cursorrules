@@ -32,12 +32,7 @@ That feature is a build capability, not authorization. A trusted relay also
 requires a KeyQuorum-signed `provider.kqcert` and the matching relay
 private key; official clients challenge `POST /provider-identity` and
 disconnect if the certificate, signature, expiry, capabilities, or
-revocation check fails. `host root generate` is allowed only when this
-machine is on a configured VPN tunnel (`--network` /
-`KEYQUORUM_ROOT_NETWORKS`) or associated Corporate Wi-Fi (`--ssid` /
-`KEYQUORUM_ROOT_SSIDS`). That is a presence check, not a root of trust, and
-those caller values are not compiled in. Caller `--network` CIDRs and
-`--ssid` values are not production authority. Do not document
+revocation check fails. Do not document
 `host` in README or other customer-facing docs — buyers get
 a URL and an API key and use `keyquorum loadkey` / `relay push` /
 `relay pull`. Default `cargo build` produces `keyquorum` without that

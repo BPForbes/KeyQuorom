@@ -2,8 +2,7 @@ use super::*;
 use crate::error::Error;
 use crate::keys::{self, KeyType};
 use crate::provider::policy::{
-    issue_policy, verify_policy, CorporateNetwork, HardwareAuthorityEntry, NetworkMode, NewPolicy,
-    PERM_API_ROOT_GENERATE,
+    issue_policy, verify_policy, HardwareAuthorityEntry, NewPolicy, PERM_API_ROOT_GENERATE,
 };
 use crate::provider::{generate_relay_identity, CAP_PROVIDER};
 
@@ -24,15 +23,7 @@ fn policy_with(
             capabilities: CAP_PROVIDER,
             hardware_threshold: 1,
             hardware,
-            networks: &[CorporateNetwork {
-                network_id: "corp-vpn".into(),
-                mode: NetworkMode::Vpn,
-                cidrs: vec!["10.8.0.0/24".into()],
-                ssid: None,
-                bssid_mac: None,
-                gateway_mac: None,
-                verifier_public_key: None,
-            }],
+            networks: &[],
             permissions: &[PERM_API_ROOT_GENERATE.to_string()],
         },
     )
@@ -48,7 +39,6 @@ fn challenge<'a>(
     ProviderChallenge {
         provider_id,
         relay_id,
-        network_policy_id: "corp-vpn",
         timestamp: "2026-09-02 12:00:00",
         nonce,
         required_authority: HardwareAuthority::ProviderApiRoot,

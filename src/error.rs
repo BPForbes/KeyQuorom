@@ -66,12 +66,8 @@ pub enum Error {
     UntrustedRelay,
     ProviderIdentityMissing,
     ProviderPolicyMissing,
-    InvalidRootNetwork,
-    RootNetworkRequired,
     InvalidProviderPolicy,
     ProviderPolicyExpired,
-    ProviderNetworkModeUnsupported,
-    CallerNetworkNotAuthoritative,
     ProviderHardwareDenied,
     ProviderHardwareRevoked,
     ApiRootMissing,
@@ -242,25 +238,10 @@ impl fmt::Display for Error {
                     "mailbox host is not configured with a provider policy"
                 )
             }
-            Error::InvalidRootNetwork => write!(f, "root-network CIDR is malformed"),
-            Error::RootNetworkRequired => write!(
-                f,
-                "this operation requires an authorized Corporate Wi-Fi or VPN presence"
-            ),
             Error::InvalidProviderPolicy => {
                 write!(f, "provider policy is missing or invalid")
             }
             Error::ProviderPolicyExpired => write!(f, "provider policy has expired"),
-            Error::ProviderNetworkModeUnsupported => {
-                write!(
-                    f,
-                    "this Corporate Network mode is not implemented yet"
-                )
-            }
-            Error::CallerNetworkNotAuthoritative => write!(
-                f,
-                "caller-supplied --network CIDRs are not production authority; select a signed --network-id"
-            ),
             Error::ProviderHardwareDenied => {
                 write!(
                     f,

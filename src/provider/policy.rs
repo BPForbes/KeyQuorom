@@ -1,9 +1,9 @@
-//! Provider-root-signed hardware and Corporate Network policy.
+//! Provider-root-signed hardware policy.
 //!
-//! Production CIDRs and provider hardware fingerprints live in this
-//! artifact, not in caller `--network` flags or SQLite rows. Official
-//! clients still pin the compiled-in root public key; this file only
-//! authorizes which networks and tokens the seller may use.
+//! Provider hardware fingerprints live in this artifact, not in SQLite
+//! rows. Official clients still pin the compiled-in root public key.
+//! The binary format can still decode an unused leftover `networks`
+//! list from older files; new policies issue with that list empty.
 
 use crate::error::{Error, Result};
 use crate::keys::KeyType;
@@ -139,7 +139,7 @@ impl ProviderPolicy {
         self.networks
             .iter()
             .find(|network| network.network_id == network_id)
-            .ok_or(Error::RootNetworkRequired)
+            .ok_or(Error::InvalidProviderPolicy)
     }
 
     pub fn has_permission(&self, permission: &str) -> bool {
@@ -168,7 +168,7 @@ fn policy_preimage(body: &[u8]) -> [u8; 32] {
 }
 
 fn encode_policy_body(spec: &NewPolicy<'_>) -> Result<Vec<u8>> {
-    if spec.hardware.is_empty() || spec.networks.is_empty() || spec.permissions.is_empty() {
+    if spec.hardware.is_empty() || spec.permissions.is_empty() {
         return Err(Error::InvalidProviderPolicy);
     }
     if spec.hardware_threshold == 0 || usize::from(spec.hardware_threshold) > spec.hardware.len() {
@@ -303,7 +303,6 @@ fn parse_policy_body(bytes: &[u8]) -> Result<(ProviderPolicy, Vec<u8>)> {
     }
     if offset != body.len()
         || hardware.is_empty()
-        || networks.is_empty()
         || permissions.is_empty()
         || hardware_threshold == 0
         || usize::from(hardware_threshold) > hardware.len()

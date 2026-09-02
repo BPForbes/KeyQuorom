@@ -48,9 +48,7 @@ pub(crate) fn listed_provider_policy(
 ) -> crate::provider::policy::ProviderPolicy {
     use crate::keys::KeyType;
     use crate::provider::hardware_auth::HardwareAuthority;
-    use crate::provider::policy::{
-        CorporateNetwork, HardwareAuthorityEntry, NetworkMode, ProviderPolicy,
-    };
+    use crate::provider::policy::{HardwareAuthorityEntry, ProviderPolicy};
     ProviderPolicy {
         provider_id: provider_id.to_string(),
         policy_id: "KQP-POL-TEST".into(),
@@ -68,15 +66,7 @@ pub(crate) fn listed_provider_policy(
                 revoked: false,
             })
             .collect(),
-        networks: vec![CorporateNetwork {
-            network_id: "corp-vpn".into(),
-            mode: NetworkMode::Vpn,
-            cidrs: vec!["10.8.0.0/24".into()],
-            ssid: None,
-            bssid_mac: None,
-            gateway_mac: None,
-            verifier_public_key: None,
-        }],
+        networks: Vec::new(),
         permissions: vec!["api-root.generate".into()],
     }
 }

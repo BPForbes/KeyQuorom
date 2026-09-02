@@ -57,7 +57,6 @@ pub struct AuthorizedHardware {
 pub struct ProviderChallenge<'a> {
     pub provider_id: &'a str,
     pub relay_id: &'a [u8; 32],
-    pub network_policy_id: &'a str,
     pub timestamp: &'a str,
     pub nonce: &'a [u8; 32],
     pub required_authority: HardwareAuthority,
@@ -69,8 +68,6 @@ pub fn api_root_preimage(challenge: &ProviderChallenge<'_>) -> Result<[u8; 32]> 
     }
     if !challenge.provider_id.is_ascii()
         || challenge.provider_id.is_empty()
-        || !challenge.network_policy_id.is_ascii()
-        || challenge.network_policy_id.is_empty()
         || !challenge.timestamp.is_ascii()
         || challenge.timestamp.is_empty()
     {
@@ -80,7 +77,6 @@ pub fn api_root_preimage(challenge: &ProviderChallenge<'_>) -> Result<[u8; 32]> 
     hasher.update(API_ROOT_DOMAIN);
     put_len(&mut hasher, challenge.provider_id.as_bytes())?;
     hasher.update(challenge.relay_id);
-    put_len(&mut hasher, challenge.network_policy_id.as_bytes())?;
     put_len(&mut hasher, challenge.timestamp.as_bytes())?;
     hasher.update(challenge.nonce);
     Ok(hasher.finalize().into())
